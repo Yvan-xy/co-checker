@@ -72,6 +72,21 @@ class PreprocessTraceTest(unittest.TestCase):
         parsed = list(yaml.safe_load_all(output.getvalue()))
         self.assertEqual(parsed, documents)
 
+    def test_write_trace_indents_event_list_items(self) -> None:
+        documents = [
+            {
+                "status": "committed",
+                "start_ts": 1,
+                "commit_ts": 2,
+                "events": [{"seq": 1, "op": "R"}],
+            }
+        ]
+        output = io.StringIO()
+
+        preprocess_trace.write_trace(documents, output)
+
+        self.assertIn("events:\n  - seq: 1\n    op: R\n", output.getvalue())
+
     def test_normalizes_session_ids_per_trace(self) -> None:
         documents = [
             {

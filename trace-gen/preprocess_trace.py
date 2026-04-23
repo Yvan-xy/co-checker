@@ -31,6 +31,13 @@ class TracePreprocessError(ValueError):
     """Raised when an input trace document is malformed."""
 
 
+class TraceDumper(yaml.SafeDumper):
+    """YAML dumper that indents nested block sequences under mapping keys."""
+
+    def increase_indent(self, flow: bool = False, indentless: bool = False) -> None:
+        return super().increase_indent(flow, False)
+
+
 @dataclass(frozen=True)
 class CommittedTransaction:
     original_index: int
@@ -84,9 +91,10 @@ def preprocess_documents(documents: Iterable[dict[str, Any]]) -> list[dict[str, 
 
 def write_trace(documents: Iterable[dict[str, Any]], output_file: TextIO) -> None:
     """Write transactions as a YAML document stream."""
-    yaml.safe_dump_all(
+    yaml.dump_all(
         list(documents),
         output_file,
+        Dumper=TraceDumper,
         explicit_start=True,
         sort_keys=False,
         default_flow_style=False,
