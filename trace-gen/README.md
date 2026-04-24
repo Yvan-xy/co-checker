@@ -23,7 +23,7 @@ Override paths when needed:
 TIDB_REPO=/path/to/tidb ./trace-gen/generate.sh /path/to/output/traces
 ```
 
-The generator temporarily copies `co_checker_tracegen_test.go` into TiDB's
+The generator temporarily copies `checker_tracegen_test.go` into TiDB's
 `pkg/session/test/txn` package, runs real TiDB `testkit` workloads with
 `TIDB_TXN_TRACE_ENABLE=1`, removes the temporary test file on exit, and
 preprocesses the generated traces in place so the final YAML files contain only
@@ -43,5 +43,8 @@ The preprocessor reads the YAML document stream emitted by TiDB, keeps only
 transactions with `status: "committed"`, a valid `commit_ts`, and a `session_id`,
 then drops the `status` field from the checker-ready output because all remaining
 transactions are committed. Older trace documents without a `status` field are
-kept only if they have a valid `commit_ts` and `session_id`. Any `session_id`
-values are remapped to a dense per-file range starting at `1`.
+kept only if they have a valid `commit_ts` and `session_id`. It also removes
+same-transaction local-buffer probe reads (`op: R`, `source: mem_buffer`) and
+drops remaining `source` metadata because the checker validates global snapshot
+visibility. Any `session_id` values are remapped to a dense per-file range
+starting at `1`.

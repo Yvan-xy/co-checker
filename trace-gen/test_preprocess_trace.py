@@ -123,6 +123,50 @@ class PreprocessTraceTest(unittest.TestCase):
 
         self.assertEqual([doc["session_id"] for doc in result], [1, 2, 2])
 
+    def test_filters_mem_buffer_reads_and_drops_source_metadata(self) -> None:
+        documents = [
+            {
+                "session_id": 1,
+                "status": "committed",
+                "start_ts": 1,
+                "commit_ts": 2,
+                "events": [
+                    {"seq": 1, "op": "W", "key_hex": "6b31"},
+                    {
+                        "seq": 2,
+                        "op": "R",
+                        "key_hex": "6b31",
+                        "miss": True,
+                        "source": "mem_buffer",
+                    },
+                    {
+                        "seq": 3,
+                        "op": "R",
+                        "key_hex": "6b31",
+                        "value_hex": "7631",
+                        "source": "snapshot",
+                    },
+                    {
+                        "seq": 4,
+                        "op": "W",
+                        "key_hex": "6b32",
+                        "source": "mem_buffer",
+                    },
+                ],
+            }
+        ]
+
+        result = preprocess_trace.preprocess_documents(documents)
+
+        self.assertEqual(
+            result[0]["events"],
+            [
+                {"seq": 1, "op": "W", "key_hex": "6b31"},
+                {"seq": 3, "op": "R", "key_hex": "6b31", "value_hex": "7631"},
+                {"seq": 4, "op": "W", "key_hex": "6b32"},
+            ],
+        )
+
     def test_in_place_preprocess_preserves_file_mode(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "trace.yaml"

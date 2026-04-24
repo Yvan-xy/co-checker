@@ -46,14 +46,14 @@ legacy_trace_paths=(
 )
 rm -f "${trace_paths[@]}" "${legacy_trace_paths[@]}"
 
-tmp_test="${tidb_repo}/pkg/session/test/txn/co_checker_tracegen_test.go"
+tmp_test="${tidb_repo}/pkg/session/test/txn/checker_tracegen_test.go"
 
 cleanup() {
 	rm -f "${tmp_test}"
 }
 trap cleanup EXIT INT TERM
 
-cp "${script_dir}/co_checker_tracegen_test.go" "${tmp_test}"
+cp "${script_dir}/checker_tracegen_test.go" "${tmp_test}"
 
 (
 	cd "${tidb_repo}/pkg/session/test/txn"

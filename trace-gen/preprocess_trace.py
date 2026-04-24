@@ -81,6 +81,7 @@ def preprocess_documents(documents: Iterable[dict[str, Any]]) -> list[dict[str, 
             continue
         normalized_document = dict(document)
         normalized_document.pop("status", None)
+        _normalize_events(normalized_document)
         committed.append(
             CommittedTransaction(
                 original_index=original_index,
@@ -93,6 +94,28 @@ def preprocess_documents(documents: Iterable[dict[str, Any]]) -> list[dict[str, 
     sorted_documents = [txn.document for txn in committed]
     _normalize_session_ids(sorted_documents)
     return sorted_documents
+
+
+def _normalize_events(document: dict[str, Any]) -> None:
+    """Drop local-buffer probe reads and checker-irrelevant source metadata."""
+    events = document.get("events")
+    if not isinstance(events, list):
+        return
+
+    normalized_events: list[Any] = []
+    for event in events:
+        if not isinstance(event, dict):
+            normalized_events.append(event)
+            continue
+
+        if event.get("op") == "R" and event.get("source") == "mem_buffer":
+            continue
+
+        normalized_event = dict(event)
+        normalized_event.pop("source", None)
+        normalized_events.append(normalized_event)
+
+    document["events"] = normalized_events
 
 
 def write_trace(documents: Iterable[dict[str, Any]], output_file: TextIO) -> None:
