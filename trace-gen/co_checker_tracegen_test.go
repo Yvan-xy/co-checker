@@ -22,10 +22,11 @@ func TestCoCheckerTraceGen(t *testing.T) {
 	require.NotEmpty(t, outputDir, "set CO_CHECKER_TRACE_OUTPUT_DIR")
 	require.NoError(t, os.MkdirAll(outputDir, 0o755))
 
-	runTraceScenario(t, outputDir, "small-basic", generateSmallBasicTrace)
-	runTraceScenario(t, outputDir, "small-delete-miss", generateSmallDeleteMissTrace)
-	runTraceScenario(t, outputDir, "small-two-session-mutual", generateSmallTwoSessionMutualTrace)
-	runTraceScenario(t, outputDir, "medium-mixed", generateMediumMixedTrace)
+	runTraceScenario(t, outputDir, "1s-3t-7e-basic", generateSmallBasicTrace)
+	runTraceScenario(t, outputDir, "1s-3t-5e-delete-miss", generateSmallDeleteMissTrace)
+	runTraceScenario(t, outputDir, "2s-4t-10e-mutual", generateSmallTwoSessionMutualTrace)
+	runTraceScenario(t, outputDir, "2s-10t-28e", generate2Session10Transaction28EventTrace)
+	runTraceScenario(t, outputDir, "2s-12t-67e-mixed", generateMediumMixedTrace)
 }
 
 func runTraceScenario(t *testing.T, outputDir, name string, workload func(t *testing.T, tracePath string)) {
@@ -146,6 +147,54 @@ func generateSmallTwoSessionMutualTrace(t *testing.T, tracePath string) {
 	tk1.MustQuery("select v from shared_vars where id = 1").Check(testkit.Rows("11"))
 	tk1.MustQuery("select v from shared_vars where id = 2").Check(testkit.Rows("21"))
 	tk1.MustExec("commit")
+
+	assertTraceContains(t, tracePath, fmt.Sprintf("session_id: %d", session1))
+	assertTraceContains(t, tracePath, fmt.Sprintf("session_id: %d", session2))
+	assertTraceContains(t, tracePath, `source: "snapshot"`)
+}
+
+func generate2Session10Transaction28EventTrace(t *testing.T, tracePath string) {
+	tk1, tk2, _ := newTraceKit(t)
+	tk1.MustExec("create table param_vars(id int primary key, v int)")
+	enableTrace(t, tracePath)
+
+	tk1.MustExec("begin")
+	tk1.MustExec("insert into param_vars values (1, 100), (2, 200)")
+	tk1.MustExec("commit")
+
+	session1 := tk1.Session().GetSessionVars().ConnectionID
+	session2 := tk2.Session().GetSessionVars().ConnectionID
+	require.NotZero(t, session1)
+	require.NotZero(t, session2)
+	require.NotEqual(t, session1, session2)
+
+	v1 := 100
+	v2 := 200
+	for txnIndex := 0; txnIndex < 8; txnIndex++ {
+		tk := tk1
+		writeID := 1
+		if txnIndex%2 == 1 {
+			tk = tk2
+			writeID = 2
+		}
+
+		tk.MustExec("begin")
+		tk.MustQuery("select v from param_vars where id = 1").Check(testkit.Rows(fmt.Sprintf("%d", v1)))
+		tk.MustQuery("select v from param_vars where id = 2").Check(testkit.Rows(fmt.Sprintf("%d", v2)))
+		tk.MustExec(fmt.Sprintf("update param_vars set v = v + 1 where id = %d", writeID))
+		tk.MustExec("commit")
+
+		if writeID == 1 {
+			v1++
+		} else {
+			v2++
+		}
+	}
+
+	tk2.MustExec("begin")
+	tk2.MustQuery("select v from param_vars where id = 1").Check(testkit.Rows(fmt.Sprintf("%d", v1)))
+	tk2.MustQuery("select v from param_vars where id = 2").Check(testkit.Rows(fmt.Sprintf("%d", v2)))
+	tk2.MustExec("commit")
 
 	assertTraceContains(t, tracePath, fmt.Sprintf("session_id: %d", session1))
 	assertTraceContains(t, tracePath, fmt.Sprintf("session_id: %d", session2))

@@ -48,12 +48,19 @@ class PreprocessTraceTest(unittest.TestCase):
                 "commit_ts": 200,
                 "events": [],
             },
+            {
+                "status": "committed",
+                "start_ts": 103,
+                "commit_ts": 50,
+                "events": [],
+            },
         ]
 
         result = preprocess_trace.preprocess_documents(documents)
 
         self.assertEqual([doc["commit_ts"] for doc in result], [100, 200, 300])
-        self.assertNotIn("rolled_back", [doc.get("status") for doc in result])
+        self.assertTrue(all("status" not in doc for doc in result))
+        self.assertTrue(all("session_id" in doc for doc in result))
 
     def test_rejects_committed_transaction_without_commit_ts(self) -> None:
         with self.assertRaises(preprocess_trace.TracePreprocessError):
@@ -63,7 +70,7 @@ class PreprocessTraceTest(unittest.TestCase):
 
     def test_write_trace_outputs_parseable_yaml_stream(self) -> None:
         documents = [
-            {"status": "committed", "start_ts": 1, "commit_ts": 2, "events": []}
+            {"session_id": 1, "start_ts": 1, "commit_ts": 2, "events": []}
         ]
         output = io.StringIO()
 
@@ -75,7 +82,7 @@ class PreprocessTraceTest(unittest.TestCase):
     def test_write_trace_indents_event_list_items(self) -> None:
         documents = [
             {
-                "status": "committed",
+                "session_id": 1,
                 "start_ts": 1,
                 "commit_ts": 2,
                 "events": [{"seq": 1, "op": "R"}],
@@ -122,6 +129,7 @@ class PreprocessTraceTest(unittest.TestCase):
             path.write_text(
                 """\
 ---
+session_id: 10
 status: committed
 start_ts: 1
 commit_ts: 2

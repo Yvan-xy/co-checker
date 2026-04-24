@@ -67,19 +67,25 @@ def preprocess_documents(documents: Iterable[dict[str, Any]]) -> list[dict[str, 
 
     Current traces mark committed transactions with `status: "committed"`.
     Older traces may not have `status`; those are treated as committed only
-    when they contain a valid `commit_ts`. Session IDs are normalized per trace
-    to a dense range starting at 1 because TiDB connection IDs are process-wide.
+    when they contain a valid `commit_ts` and a `session_id`. Sessionless docs
+    are internal TiDB transactions and are not part of the application trace.
+    Session IDs are normalized per trace to a dense range starting at 1 because
+    TiDB connection IDs are process-wide.
     """
     committed: list[CommittedTransaction] = []
     for original_index, document in enumerate(documents):
         commit_ts = _committed_commit_ts(document, original_index + 1)
         if commit_ts is None:
             continue
+        if "session_id" not in document:
+            continue
+        normalized_document = dict(document)
+        normalized_document.pop("status", None)
         committed.append(
             CommittedTransaction(
                 original_index=original_index,
                 commit_ts=commit_ts,
-                document=document,
+                document=normalized_document,
             )
         )
 

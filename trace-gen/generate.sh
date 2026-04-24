@@ -32,12 +32,19 @@ fi
 
 mkdir -p "${output_dir}"
 trace_paths=(
+	"${output_dir}/1s-3t-7e-basic.yaml"
+	"${output_dir}/1s-3t-5e-delete-miss.yaml"
+	"${output_dir}/2s-4t-10e-mutual.yaml"
+	"${output_dir}/2s-10t-28e.yaml"
+	"${output_dir}/2s-12t-67e-mixed.yaml"
+)
+legacy_trace_paths=(
 	"${output_dir}/small-basic.yaml"
 	"${output_dir}/small-delete-miss.yaml"
 	"${output_dir}/small-two-session-mutual.yaml"
 	"${output_dir}/medium-mixed.yaml"
 )
-rm -f "${trace_paths[@]}"
+rm -f "${trace_paths[@]}" "${legacy_trace_paths[@]}"
 
 tmp_test="${tidb_repo}/pkg/session/test/txn/co_checker_tracegen_test.go"
 

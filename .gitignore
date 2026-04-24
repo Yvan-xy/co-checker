@@ -1,2 +1,7 @@
 ./traces/
 *.yaml
+build/
+*.pyc
+__pycache__/
+*.log
+*.tmp
