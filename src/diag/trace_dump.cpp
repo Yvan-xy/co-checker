@@ -1,4 +1,4 @@
-#include "co_checker/diag/trace_dump.h"
+#include "common/diag/trace_dump.h"
 
 #include <algorithm>
 #include <iomanip>
@@ -8,122 +8,109 @@
 #include <utility>
 #include <vector>
 
-namespace co_checker {
+namespace common {
 
-const char* to_string(Severity severity) {
-    switch (severity) {
-        case Severity::Info:
-            return "info";
-        case Severity::Warning:
-            return "warning";
-        case Severity::Error:
-            return "error";
-    }
-    return "unknown";
+const char *to_string(Severity severity) {
+  switch (severity) {
+  case Severity::Info:
+    return "info";
+  case Severity::Warning:
+    return "warning";
+  case Severity::Error:
+    return "error";
+  }
+  return "unknown";
 }
 
-const char* to_string(CheckStatus status) {
-    switch (status) {
-        case CheckStatus::Pass:
-            return "pass";
-        case CheckStatus::Fail:
-            return "fail";
-        case CheckStatus::Inconclusive:
-            return "inconclusive";
-    }
-    return "unknown";
+void print_diagnostic(std::ostream &os, const Diagnostic &diagnostic) {
+  os << to_string(diagnostic.severity) << ": ";
+  if (!diagnostic.checker.empty()) {
+    os << diagnostic.checker << ": ";
+  }
+  if (!diagnostic.code.empty()) {
+    os << diagnostic.code << ": ";
+  }
+  os << diagnostic.message;
+
+  if (diagnostic.txn_id.has_value()) {
+    os << " txn=" << *diagnostic.txn_id;
+  }
+  if (diagnostic.event_id.has_value()) {
+    os << " event=" << *diagnostic.event_id;
+  }
+  if (diagnostic.event_seq.has_value()) {
+    os << " seq=" << *diagnostic.event_seq;
+  }
+  if (diagnostic.key.has_value()) {
+    os << " key=" << diagnostic.key->to_hex();
+  }
+  os << '\n';
 }
 
-void print_diagnostic(std::ostream& os, const Diagnostic& diagnostic) {
-    os << to_string(diagnostic.severity) << ": ";
-    if (!diagnostic.checker.empty()) {
-        os << diagnostic.checker << ": ";
-    }
-    if (!diagnostic.code.empty()) {
-        os << diagnostic.code << ": ";
-    }
-    os << diagnostic.message;
+void print_diagnostics(std::ostream &os, const DiagnosticList &diagnostics) {
+  for (const auto &diagnostic : diagnostics) {
+    print_diagnostic(os, diagnostic);
+  }
+}
 
-    if (diagnostic.txn_id.has_value()) {
-        os << " txn=" << *diagnostic.txn_id;
-    }
-    if (diagnostic.event_id.has_value()) {
-        os << " event=" << *diagnostic.event_id;
-    }
-    if (diagnostic.event_seq.has_value()) {
-        os << " seq=" << *diagnostic.event_seq;
-    }
-    if (diagnostic.key.has_value()) {
-        os << " key=" << diagnostic.key->to_hex();
+void dump_parsed_trace(std::ostream &os, const Trace &trace) {
+  os << "transactions:\n";
+  for (const auto &txn : trace.transactions) {
+    os << "  - id: " << txn.id << '\n';
+    os << "    session_id: " << txn.session_id << '\n';
+    os << "    start_ts: " << txn.start_ts << '\n';
+    os << "    commit_ts: " << txn.commit_ts << '\n';
+    os << "    event_ids:";
+    for (const auto event_id : txn.event_ids) {
+      os << ' ' << event_id;
     }
     os << '\n';
+  }
+
+  os << "events:\n";
+  for (const auto &event : trace.events) {
+    os << "  - id: " << event.id << '\n';
+    os << "    txn_id: " << event.txn_id << '\n';
+    os << "    seq: " << event.seq << '\n';
+    os << "    op: " << (event.op == EventOp::Read ? "R" : "W") << '\n';
+    os << "    key_hex: " << event.key.to_hex() << '\n';
+    if (event.value.has_value()) {
+      os << "    value_hex: " << event.value->to_hex() << '\n';
+    }
+    if (event.is_delete) {
+      os << "    delete: true\n";
+    }
+    if (event.is_miss) {
+      os << "    miss: true\n";
+    }
+  }
 }
 
-void print_diagnostics(std::ostream& os, const DiagnosticList& diagnostics) {
-    for (const auto& diagnostic : diagnostics) {
-        print_diagnostic(os, diagnostic);
+void dump_versions(std::ostream &os, const TraceIndex &index) {
+  std::vector<std::pair<std::string, const std::vector<Version> *>> keys;
+  keys.reserve(index.versions_by_key.size());
+  for (const auto &[key, versions] : index.versions_by_key) {
+    keys.emplace_back(key.to_hex(), &versions);
+  }
+  std::sort(keys.begin(), keys.end(), [](const auto &lhs, const auto &rhs) {
+    return lhs.first < rhs.first;
+  });
+
+  os << "versions:\n";
+  for (const auto &[key_hex, versions] : keys) {
+    os << "  - key_hex: " << key_hex << '\n';
+    os << "    versions:\n";
+    for (const auto &version : *versions) {
+      os << "      - writer: " << version.writer << '\n';
+      os << "        write_event: " << version.write_event << '\n';
+      os << "        commit_ts: " << version.commit_ts << '\n';
+      if (version.is_delete) {
+        os << "        delete: true\n";
+      } else if (version.value.has_value()) {
+        os << "        value_hex: " << version.value->to_hex() << '\n';
+      }
     }
+  }
 }
 
-void dump_parsed_trace(std::ostream& os, const Trace& trace) {
-    os << "transactions:\n";
-    for (const auto& txn : trace.transactions) {
-        os << "  - id: " << txn.id << '\n';
-        os << "    session_id: " << txn.session_id << '\n';
-        os << "    start_ts: " << txn.start_ts << '\n';
-        os << "    commit_ts: " << txn.commit_ts << '\n';
-        os << "    event_ids:";
-        for (const auto event_id : txn.event_ids) {
-            os << ' ' << event_id;
-        }
-        os << '\n';
-    }
-
-    os << "events:\n";
-    for (const auto& event : trace.events) {
-        os << "  - id: " << event.id << '\n';
-        os << "    txn_id: " << event.txn_id << '\n';
-        os << "    seq: " << event.seq << '\n';
-        os << "    op: " << (event.op == EventOp::Read ? "R" : "W") << '\n';
-        os << "    key_hex: " << event.key.to_hex() << '\n';
-        if (event.value.has_value()) {
-            os << "    value_hex: " << event.value->to_hex() << '\n';
-        }
-        if (event.is_delete) {
-            os << "    delete: true\n";
-        }
-        if (event.is_miss) {
-            os << "    miss: true\n";
-        }
-    }
-}
-
-void dump_versions(std::ostream& os, const TraceIndex& index) {
-    std::vector<std::pair<std::string, const std::vector<Version>*>> keys;
-    keys.reserve(index.versions_by_key.size());
-    for (const auto& [key, versions] : index.versions_by_key) {
-        keys.emplace_back(key.to_hex(), &versions);
-    }
-    std::sort(keys.begin(), keys.end(),
-              [](const auto& lhs, const auto& rhs) {
-                  return lhs.first < rhs.first;
-              });
-
-    os << "versions:\n";
-    for (const auto& [key_hex, versions] : keys) {
-        os << "  - key_hex: " << key_hex << '\n';
-        os << "    versions:\n";
-        for (const auto& version : *versions) {
-            os << "      - writer: " << version.writer << '\n';
-            os << "        write_event: " << version.write_event << '\n';
-            os << "        commit_ts: " << version.commit_ts << '\n';
-            if (version.is_delete) {
-                os << "        delete: true\n";
-            } else if (version.value.has_value()) {
-                os << "        value_hex: " << version.value->to_hex() << '\n';
-            }
-        }
-    }
-}
-
-}  // namespace co_checker
+} // namespace common

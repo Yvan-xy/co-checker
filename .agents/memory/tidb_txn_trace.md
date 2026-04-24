@@ -41,9 +41,9 @@ Important caveats for the checker:
 - No explicit begin, commit, or abort event records exist.
 - Full transaction rollback emits a `status: "rolled_back"` document. Commit errors still discard the trace buffer without emitting a document.
 - The trace has no per-event timestamp, read timestamp, or observed MVCC version commit timestamp.
-- Snapshot visibility must be inferred from transaction `start_ts`, transaction `commit_ts`, event `source`, and decoded key/value content.
-- Preprocessed committed traces can still contain `source: "mem_buffer"` reads. These are same-transaction local-buffer probes and should not be checked against only the latest committed version at `start_ts`; the checker model must preserve `source` or preprocess/filter these reads before strict snapshot-read validation.
-- Statement rollback/savepoint rollback does not roll back already appended trace events, so committed transaction traces may include speculative events from failed statements, `ROLLBACK TO SAVEPOINT`, FK cascade rollback, or internal retry paths.
+- Snapshot visibility must be inferred from transaction `start_ts`, transaction `commit_ts`, and decoded key/value content.
+- Project decision: ignore `source: "snapshot"|"mem_buffer"` in checker semantics even though TiDB still emits it for debugging.
+- Trace buffering now follows mem-buffer staging and explicit MemDB checkpoints, so statement rollback, `ROLLBACK TO SAVEPOINT`, and FK cascade savepoint rollback remove rolled-back events from later committed transaction traces.
 - Range/coprocessor reads may be missing unless they pass through instrumented `kv.Snapshot` or txn Get/BatchGet/Iterator paths.
 - Writes are traced when added to the transaction buffer, not when prewritten or committed.
 - Pipelined DML writes are traced when added, but pipelined mem-buffer snapshot reads are suppressed by empty retrievers/iterators.

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(co_checker VERSION 0.1.0 LANGUAGES CXX)
+project(checker VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,7 +20,8 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(yaml-cpp)
 
-add_library(co_checker
+add_library(checker
+  src/checker/check_result.cpp
   src/checker/checker_registry.cpp
   src/checker/co_snapshot_checker.cpp
   src/diag/trace_dump.cpp
@@ -29,20 +30,74 @@ add_library(co_checker
   src/trace/types.cpp
 )
 
-target_include_directories(co_checker
+target_include_directories(checker
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-target_link_libraries(co_checker
+target_link_libraries(checker
   PRIVATE
     yaml-cpp::yaml-cpp
 )
 
-target_compile_options(co_checker
+target_compile_options(checker
   PRIVATE
     -Wall -Wextra -Wpedantic
 )
+
+find_program(CLANG_FORMAT_EXECUTABLE NAMES clang-format)
+
+file(GLOB_RECURSE CHECKER_FORMAT_FILES CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/include/*.h"
+  "${CMAKE_CURRENT_SOURCE_DIR}/include/*.hpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/*.h"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/*.hpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cc"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/test/*.h"
+  "${CMAKE_CURRENT_SOURCE_DIR}/test/*.hpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/test/*.cc"
+  "${CMAKE_CURRENT_SOURCE_DIR}/test/*.cpp"
+)
+
+if(CLANG_FORMAT_EXECUTABLE)
+  add_custom_target(checker-format
+    COMMAND ${CLANG_FORMAT_EXECUTABLE} -i ${CHECKER_FORMAT_FILES}
+    COMMENT "Formatting C++ sources with clang-format"
+    VERBATIM
+  )
+
+  add_custom_target(checker-format-check
+    COMMAND ${CLANG_FORMAT_EXECUTABLE} --dry-run --Werror
+            ${CHECKER_FORMAT_FILES}
+    COMMENT "Checking C++ source formatting with clang-format"
+    VERBATIM
+  )
+else()
+  add_custom_target(checker-format
+    COMMAND ${CMAKE_COMMAND} -E echo "clang-format not found"
+    COMMAND ${CMAKE_COMMAND} -E false
+    VERBATIM
+  )
+
+  add_custom_target(checker-format-check
+    COMMAND ${CMAKE_COMMAND} -E echo "clang-format not found"
+    COMMAND ${CMAKE_COMMAND} -E false
+    VERBATIM
+  )
+endif()
+
+if(TARGET format)
+  add_dependencies(format checker-format)
+else()
+  add_custom_target(format DEPENDS checker-format)
+endif()
+
+if(TARGET format-check)
+  add_dependencies(format-check checker-format-check)
+else()
+  add_custom_target(format-check DEPENDS checker-format-check)
+endif()
 
 add_executable(co-checker
   src/cli/main.cpp
@@ -50,7 +105,7 @@ add_executable(co-checker
 
 target_link_libraries(co-checker
   PRIVATE
-    co_checker
+    checker
 )
 
 target_compile_options(co-checker
@@ -60,24 +115,24 @@ target_compile_options(co-checker
 
 include(CTest)
 if(BUILD_TESTING)
-  add_executable(co_checker_tests
+  add_executable(checker_tests
     test/test_main.cpp
   )
 
-  target_link_libraries(co_checker_tests
+  target_link_libraries(checker_tests
     PRIVATE
-      co_checker
+      checker
   )
 
-  target_compile_definitions(co_checker_tests
+  target_compile_definitions(checker_tests
     PRIVATE
       CO_CHECKER_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
   )
 
-  target_compile_options(co_checker_tests
+  target_compile_options(checker_tests
     PRIVATE
       -Wall -Wextra -Wpedantic
   )
 
-  add_test(NAME co_checker_tests COMMAND co_checker_tests)
+  add_test(NAME checker_tests COMMAND checker_tests)
 endif()

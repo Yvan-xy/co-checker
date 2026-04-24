@@ -5,11 +5,19 @@ sorted by ascending `commit_ts`, with dense per-file `session_id` values. Raw
 TiDB traces must pass through `trace-gen/preprocess_trace.py` first because raw
 documents can contain `status: "rolled_back"` and omit `commit_ts`.
 
-Important current mismatch: TiDB and the preprocessor preserve event
-`source: snapshot|mem_buffer`, but the C++ `Event` model does not store
-`source`. `co-si` therefore checks all reads as snapshot reads at `start_ts`.
-The generated `traces/2s-12t-67e-mixed.yaml` fixture contains `mem_buffer`
-reads and fails `build/co-checker --checker co-si` for that reason.
+Common checker infrastructure lives under `include/common` and
+`namespace common`: trace model/parsing/indexing, diagnostics, logger,
+and result helpers. `include/checker` is reserved for commit-order checker
+contracts and concrete checker implementations.
+
+Project decision: ignore TiDB event `source: snapshot|mem_buffer`; it should
+not be part of the core checker semantics. The preprocessor removes
+same-transaction local-buffer probe reads (`op: R`, `source: mem_buffer`) and
+drops remaining `source` metadata before checker input is produced.
+
+`TraceIndex::versions_by_key` stores one committed version per transaction/key:
+the final write or delete for that key within the transaction. Intermediate
+writes to the same key in the same transaction are intentionally ignored.
 
 Useful validation commands:
 
@@ -19,4 +27,3 @@ python3 -m unittest trace-gen/test_preprocess_trace.py
 build/co-checker --checker co-si traces/2s-4t-10e-mutual.yaml
 build/co-checker --checker co-si traces/2s-12t-67e-mixed.yaml
 ```
-
