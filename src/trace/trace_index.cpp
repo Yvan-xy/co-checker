@@ -31,8 +31,6 @@ Result<TraceIndex> TraceIndexBuilder::build(const Trace &trace) const {
       return Result<TraceIndex>::err(std::move(diagnostics));
     }
 
-    index.txns_by_session[txn.session_id].push_back(txn.id);
-
     std::unordered_map<Key, EventId, HexValueHash> final_write_by_key;
     for (const auto event_id : txn.event_ids) {
       if (event_id >= trace.events.size()) {

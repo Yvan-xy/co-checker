@@ -24,6 +24,7 @@ add_library(checker
   src/checker/check_result.cpp
   src/checker/checker_registry.cpp
   src/checker/co_snapshot_checker.cpp
+  src/checker/so_only_checker.cpp
   src/diag/trace_dump.cpp
   src/trace/trace_index.cpp
   src/trace/trace_parser.cpp

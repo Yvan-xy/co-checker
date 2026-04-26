@@ -18,7 +18,8 @@ struct CliConfig {
 };
 
 void print_usage(std::ostream &os) {
-  os << "usage: co-checker [--checker none|co-si|all] [--dump "
+  os << "usage: co-checker [--checker none|co-si-basic|co-si-so-only|all] "
+        "[--dump "
         "parsed|versions|all] "
         "<trace.yaml>\n";
 }

@@ -9,21 +9,6 @@ namespace checker {
 
 namespace {
 
-common::Diagnostic make_diagnostic(std::string code, std::string message,
-                                   const common::Transaction &txn,
-                                   const common::Event &event) {
-  common::Diagnostic diagnostic;
-  diagnostic.severity  = common::Severity::Error;
-  diagnostic.checker   = "co-si";
-  diagnostic.code      = std::move(code);
-  diagnostic.message   = std::move(message);
-  diagnostic.txn_id    = txn.id;
-  diagnostic.event_id  = event.id;
-  diagnostic.event_seq = event.seq;
-  diagnostic.key       = event.key;
-  return diagnostic;
-}
-
 const common::Version *
 find_visible_version(const std::vector<common::Version> &versions,
                      const common::Timestamp start_ts) {
@@ -40,6 +25,16 @@ find_visible_version(const std::vector<common::Version> &versions,
 }
 
 } // namespace
+
+common::Diagnostic
+CoSnapshotBasicChecker::make_diagnostic(std::string code, std::string message,
+                                        const common::Transaction &txn,
+                                        const common::Event &event) const {
+  auto diagnostic =
+      Checker::make_diagnostic(std::move(code), std::move(message), txn, event);
+  diagnostic.checker = "co-si-basic";
+  return diagnostic;
+}
 
 std::string_view CoSnapshotBasicChecker::name() const { return "co-si-basic"; }
 
