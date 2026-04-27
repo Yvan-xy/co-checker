@@ -68,3 +68,37 @@ same-transaction local-buffer probe reads (`op: R`, `source: mem_buffer`) and
 drops remaining `source` metadata because the checker validates global snapshot
 visibility. Any `session_id` values are remapped to a dense per-file range
 starting at `1`.
+
+## Generate TPC-C Traces
+
+Generate real TiDB TPC-C traces with PingCAP `go-tpc`:
+
+```bash
+./trace-gen/generate_tpcc.sh
+```
+
+The script starts the instrumented TiDB server from `../tidb` with
+`TIDB_TXN_TRACE_ENABLE=1`, waits for the SQL port, runs `go-tpc tpcc prepare`
+and `go-tpc tpcc run`, stops TiDB, and preprocesses the raw trace into
+`./traces/tpcc/`. Raw TiDB output and the TiDB log are kept under
+`./traces/tpcc/raw/`.
+
+Useful knobs:
+
+```bash
+WAREHOUSES=1 THREADS=1 RUN_TIME=5s ./trace-gen/generate_tpcc.sh
+OUTPUT_DIR=/tmp/tpcc-traces PORT=4030 STATUS_PORT=10300 ./trace-gen/generate_tpcc.sh
+```
+
+Use `THREADS` to control TPC-C client concurrency. Multi-threaded runs create
+overlapping transactions; the SO-only checker handles those by accepting older
+viable snapshots when the transaction snapshot is not the latest commit-order
+prefix.
+
+For large raw TPC-C traces, use the C++ preprocessor instead of the Python
+preprocessor:
+
+```bash
+cmake --build build --target trace-preprocess
+./build/trace-preprocess -o traces/tpcc/tpcc.yaml --rename traces/tpcc/raw/tpcc.raw.yaml
+```

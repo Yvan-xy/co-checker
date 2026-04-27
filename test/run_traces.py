@@ -54,7 +54,8 @@ def parse_args():
         metavar="PATTERN",
         help=(
             "trace selector; may be a file path, basename, or glob pattern. "
-            "Can be repeated. Defaults to all *.yaml traces."
+            "Can be repeated. Defaults to all top-level traces plus "
+            "processed TPC-C traces under traces/tpcc."
         ),
     )
     parser.add_argument(
@@ -96,11 +97,15 @@ def parse_args():
 
 
 def trace_sort_key(path):
-    return path.name
+    return (str(path.parent), path.name)
 
 
 def discover_traces(traces_dir):
-    return sorted(traces_dir.glob("*.yaml"), key=trace_sort_key)
+    traces = list(traces_dir.glob("*.yaml"))
+    tpcc_dir = traces_dir / "tpcc"
+    if tpcc_dir.is_dir():
+        traces.extend(tpcc_dir.glob("*.yaml"))
+    return sorted(traces, key=trace_sort_key)
 
 
 def matches_selector(trace, selector):

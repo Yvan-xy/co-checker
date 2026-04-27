@@ -133,6 +133,20 @@ target_compile_options(co-checker
     -Wall -Wextra -Wpedantic
 )
 
+add_executable(trace-preprocess
+  src/cli/trace_preprocess.cpp
+)
+
+target_link_libraries(trace-preprocess
+  PRIVATE
+    yaml-cpp::yaml-cpp
+)
+
+target_compile_options(trace-preprocess
+  PRIVATE
+    -Wall -Wextra -Wpedantic
+)
+
 include(CTest)
 if(BUILD_TESTING)
   add_executable(checker_tests
