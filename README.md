@@ -48,7 +48,8 @@ The `trace-gen/` directory contains the TiDB-backed trace fixture generator and
 preprocessor. It runs instrumented TiDB `testkit` workloads, writes raw YAML
 transaction traces, filters them into checker-ready committed traces, normalizes
 session IDs, and renames files using the final
-`<sessions>s-<transactions>t-<events>e[-suffix].yaml` counts.
+`<sessions>s-<transactions>t-<events>e[-suffix].yaml` counts. It also writes
+matching compact binary traces under `./bin_traces`.
 
 Regenerate the trace fixtures with:
 
@@ -56,6 +57,6 @@ Regenerate the trace fixtures with:
 ./trace-gen/generate.sh
 ```
 
-By default this expects the instrumented TiDB checkout at `../tidb` and writes
-fixtures into `./traces`. See `trace-gen/README.md` for path overrides and
-manual preprocessing commands.
+By default this expects the instrumented TiDB checkout at `../tidb`, writes YAML
+fixtures into `./traces`, and writes binary fixtures into `./bin_traces`. See
+`trace-gen/README.md` for path overrides and manual preprocessing commands.

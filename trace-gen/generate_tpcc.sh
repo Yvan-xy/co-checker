@@ -5,6 +5,7 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "${script_dir}/.." && pwd)
 tidb_repo=${TIDB_REPO:-"$(cd -- "${repo_root}/../tidb" && pwd)"}
 output_dir=${OUTPUT_DIR:-"${repo_root}/traces/tpcc"}
+bin_trace_dir=${BIN_TRACE_DIR:-"${repo_root}/bin_traces"}
 raw_dir="${output_dir}/raw"
 
 warehouses=${WAREHOUSES:-1}
@@ -49,6 +50,31 @@ if [[ ! -x "${trace_preprocess}" ]]; then
 	printf 'Build it with: cmake --build build --target trace-preprocess\n' >&2
 	exit 1
 fi
+
+trace_convert=${TRACE_CONVERT:-"${repo_root}/build/trace-convert"}
+if [[ ! -x "${trace_convert}" ]]; then
+	if [[ -f "${repo_root}/build/build.ninja" || -f "${repo_root}/build/Makefile" ]]; then
+		cmake --build "${repo_root}/build" --target trace-convert
+	fi
+fi
+if [[ ! -x "${trace_convert}" ]]; then
+	printf 'trace-convert executable not found at %s\n' "${trace_convert}" >&2
+	printf 'Build it with: cmake --build build --target trace-convert\n' >&2
+	exit 1
+fi
+
+binary_path_for_trace() {
+	local trace_path=$1
+	local relative_path
+	if [[ "${trace_path}" == "${repo_root}/traces/"* ]]; then
+		relative_path=${trace_path#"${repo_root}/traces/"}
+	elif [[ "${trace_path}" == "${output_dir}/"* ]]; then
+		relative_path=${trace_path#"${output_dir}/"}
+	else
+		relative_path=$(basename -- "${trace_path}")
+	fi
+	printf '%s/%s.trace\n' "${bin_trace_dir}" "${relative_path%.yaml}"
+}
 
 go_tpc=${GO_TPC:-}
 if [[ -z "${go_tpc}" ]]; then
@@ -134,7 +160,12 @@ trap - EXIT INT TERM
 
 printf 'Preprocessing raw trace: %s\n' "${raw_path}"
 processed_path=$("${trace_preprocess}" -o "${processed_seed}" --rename "${raw_path}")
+binary_path=$(binary_path_for_trace "${processed_path}")
+
+printf 'Converting checker trace to binary: %s\n' "${binary_path}"
+"${trace_convert}" -o "${binary_path}" "${processed_path}" >/dev/null
 
 printf 'Raw trace: %s\n' "${raw_path}"
 printf 'TiDB log: %s\n' "${log_path}"
 printf 'Checker trace: %s\n' "${processed_path}"
+printf 'Binary trace: %s\n' "${binary_path}"

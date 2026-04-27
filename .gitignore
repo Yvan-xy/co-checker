@@ -1,4 +1,5 @@
 ./traces/
+bin_traces/
 *.yaml
 build/
 *.pyc

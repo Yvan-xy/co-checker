@@ -5,6 +5,7 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "${script_dir}/.." && pwd)
 tidb_repo=${TIDB_REPO:-"$(cd -- "${repo_root}/../tidb" && pwd)"}
 output_dir=${1:-"${repo_root}/traces"}
+bin_trace_dir=${BIN_TRACE_DIR:-"${repo_root}/bin_traces"}
 
 if [[ ! -d "${tidb_repo}/pkg/session/test/txn" ]]; then
 	printf 'TiDB repo not found at %s\n' "${tidb_repo}" >&2
@@ -29,6 +30,31 @@ fi
 if [[ "${output_dir}" != /* ]]; then
 	output_dir="${PWD}/${output_dir}"
 fi
+
+trace_convert=${TRACE_CONVERT:-"${repo_root}/build/trace-convert"}
+if [[ ! -x "${trace_convert}" ]]; then
+	if [[ -f "${repo_root}/build/build.ninja" || -f "${repo_root}/build/Makefile" ]]; then
+		cmake --build "${repo_root}/build" --target trace-convert
+	fi
+fi
+if [[ ! -x "${trace_convert}" ]]; then
+	printf 'trace-convert executable not found at %s\n' "${trace_convert}" >&2
+	printf 'Build it with: cmake --build build --target trace-convert\n' >&2
+	exit 1
+fi
+
+binary_path_for_trace() {
+	local trace_path=$1
+	local relative_path
+	if [[ "${trace_path}" == "${repo_root}/traces/"* ]]; then
+		relative_path=${trace_path#"${repo_root}/traces/"}
+	elif [[ "${trace_path}" == "${output_dir}/"* ]]; then
+		relative_path=${trace_path#"${output_dir}/"}
+	else
+		relative_path=$(basename -- "${trace_path}")
+	fi
+	printf '%s/%s.trace\n' "${bin_trace_dir}" "${relative_path%.yaml}"
+}
 
 mkdir -p "${output_dir}"
 shopt -s nullglob
@@ -92,5 +118,19 @@ done
 
 printf '\nGenerated preprocessed traces:\n'
 for path in "${generated_trace_paths[@]}"; do
+	printf '  %s\n' "${path}"
+done
+
+printf '\nGenerating binary traces:\n'
+generated_binary_paths=()
+for path in "${generated_trace_paths[@]}"; do
+	binary_path=$(binary_path_for_trace "${path}")
+	"${trace_convert}" -o "${binary_path}" "${path}" >/dev/null
+	generated_binary_paths+=("${binary_path}")
+	printf '  %s -> %s\n' "${path}" "${binary_path}"
+done
+
+printf '\nGenerated binary traces:\n'
+for path in "${generated_binary_paths[@]}"; do
 	printf '  %s\n' "${path}"
 done

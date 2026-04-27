@@ -25,12 +25,14 @@ Generated fixtures:
 - `100s-502t-3800e-many-session-roundrobin.yaml`
 
 By default the script expects the instrumented TiDB checkout at `../tidb` relative
-to this repo and writes YAML files into `./traces`.
+to this repo, writes YAML files into `./traces`, and writes matching binary
+trace files into `./bin_traces`.
 
 Override paths when needed:
 
 ```bash
 TIDB_REPO=/path/to/tidb ./trace-gen/generate.sh /path/to/output/traces
+BIN_TRACE_DIR=/tmp/bin-traces ./trace-gen/generate.sh
 ```
 
 The generator temporarily copies `co_checker_tracegen_test.go` into TiDB's
@@ -41,7 +43,10 @@ committed transactions sorted by commit timestamp. The preprocessor also
 normalizes TiDB connection IDs to per-file `session_id` values starting at `1`
 and renames generated files to
 `<sessions>s-<transactions>t-<events>e[-suffix].yaml` based on the
-checker-ready trace contents.
+checker-ready trace contents. After preprocessing, each YAML trace is converted
+to a compact binary `.trace` file. Binary output mirrors the YAML path under
+`./bin_traces`: for example, `./traces/3s-5t-18e-fanout.yaml` becomes
+`./bin_traces/3s-5t-18e-fanout.trace`.
 
 ## Preprocess a Trace
 
@@ -81,13 +86,15 @@ The script starts the instrumented TiDB server from `../tidb` with
 `TIDB_TXN_TRACE_ENABLE=1`, waits for the SQL port, runs `go-tpc tpcc prepare`
 and `go-tpc tpcc run`, stops TiDB, and preprocesses the raw trace into
 `./traces/tpcc/`. Raw TiDB output and the TiDB log are kept under
-`./traces/tpcc/raw/`.
+`./traces/tpcc/raw/`. The checker-ready YAML is also converted to a binary trace
+under the matching `./bin_traces/tpcc/` path.
 
 Useful knobs:
 
 ```bash
 WAREHOUSES=1 THREADS=1 RUN_TIME=5s ./trace-gen/generate_tpcc.sh
 OUTPUT_DIR=/tmp/tpcc-traces PORT=4030 STATUS_PORT=10300 ./trace-gen/generate_tpcc.sh
+BIN_TRACE_DIR=/tmp/bin-traces ./trace-gen/generate_tpcc.sh
 ```
 
 Use `THREADS` to control TPC-C client concurrency. Multi-threaded runs create

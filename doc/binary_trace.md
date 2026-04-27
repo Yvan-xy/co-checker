@@ -108,3 +108,15 @@ build/co-checker --format bin --checker co-si-so-only traces/2s-4t-10e-mutual.tr
 
 For YAML, use `--format yaml`. The default is `--format auto`, which keeps the
 old behavior and detects binary traces by magic header.
+
+## Generated Binary Traces
+
+Trace generation scripts write normalized YAML under `./traces` and mirror the
+same relative structure under `./bin_traces`. For example:
+
+```text
+traces/tpcc/4s-879t-724729e-tpcc-1w-1th-1s.yaml
+bin_traces/tpcc/4s-879t-724729e-tpcc-1w-1th-1s.trace
+```
+
+Override the binary output root with `BIN_TRACE_DIR`.
