@@ -1,567 +1,437 @@
 # Commit-Order Consistency Checker Design
 
-## Goals
+## Purpose
 
-Build a small, testable C++ framework that reads TiDB transaction traces, converts
-them into explicit internal models, and runs one or more consistency checkers over
-that model.
+`co-checker` reads preprocessed TiDB transaction traces and checks consistency
+properties over the observed execution. The current implementation focuses on
+snapshot-isolation checks with commit order as the primary ordering relation.
 
-The framework should:
+The implementation priorities are:
 
 - Parse YAML trace streams into typed `Trace`, `Transaction`, and `Event`
-  structures.
-- Preserve commit-order semantics as the primary ordering relation.
-- Make it easy to add new checkers without changing parser or CLI code.
-- Provide structured diagnostics and optional debug dumps for parser output,
-  derived relations, and checker decisions.
-- Keep parsing, model normalization, checking, and reporting separate.
+  objects.
+- Preserve commit-order transaction ids.
+- Build reusable committed-version indexes.
+- Keep parser, index construction, checking, diagnostics, and dumps separate.
+- Keep checker output deterministic enough for tests and trace debugging.
 
-Non-goals for the first version:
+The checker currently assumes traces are already reduced to committed
+application transactions. It does not decode TiDB keys or values into SQL-level
+rows.
 
-- Decode TiDB row values into SQL rows or columns.
-- Prove every isolation level. The first target is snapshot isolation with
-  commit-order checks.
-- Support raw, unpreprocessed TiDB traces with rolled-back transactions. The
-  generator currently preprocesses traces into committed-only, commit-ordered
-  YAML.
+## Trace Input
 
-## Input Trace Contract
-
-The checker consumes a YAML document stream. Each document is one committed
-transaction after preprocessing:
+The CLI consumes a YAML document stream. Each YAML document represents one
+committed transaction:
 
 ```yaml
 ---
 session_id: 1
-start_ts: 465819165210968064
-commit_ts: 465819165210968066
+start_ts: 10
+commit_ts: 20
 events:
   - seq: 1
     op: R
-    key_hex: 7480000000000000725f728000000000000001
-    value_hex: '80000100000002010064'
+    key_hex: 01
+    value_hex: 0a
 ```
 
 Required transaction fields:
 
-- `session_id`: normalized per-trace session id starting at `1`.
-- `start_ts`: TiDB transaction snapshot/start timestamp.
-- `commit_ts`: TiDB commit timestamp. Commit order is ascending `commit_ts`.
-- `events`: list of events, possibly empty.
+- `session_id`: normalized session id.
+- `start_ts`: transaction snapshot/start timestamp.
+- `commit_ts`: commit timestamp. Transactions must appear in nondecreasing
+  commit order when `ParseOptions::require_commit_order` is true.
+- `events`: event list, possibly empty.
 
 Required event fields:
 
-- `seq`: event sequence inside the transaction.
-- `op`: `R` for read, `W` for write.
-- `key_hex`: raw TiDB KV key bytes, hex encoded.
+- `seq`: event sequence inside its transaction. It must be strictly increasing.
+- `op`: `R` for read or `W` for write.
+- `key_hex`: hex-encoded key bytes.
 
 Optional event fields:
 
-- `value_hex`: raw TiDB KV value bytes, hex encoded.
+- `value_hex`: hex-encoded value bytes.
 - `delete`: true for delete writes.
 - `miss`: true for read misses.
 
-Parser assumptions:
+Parser constraints:
 
-- Input is already filtered to committed application transactions.
-- Input is already sorted by commit order, but the parser should verify this.
-- `commit_ts` is globally unique for the initial checker. If equal commit
-  timestamps appear, the parser should reject by default unless a later mode
-  explicitly supports ties.
-- `seq` values must be strictly increasing inside each transaction.
 - `key_hex` and `value_hex` must be valid even-length hex strings.
-
-## Architecture
-
-The code should be organized around four layers:
-
-1. Parse: YAML to typed model.
-2. Normalize/index: validate invariants and build lookup indexes.
-3. Check: run checker plugins over immutable trace data.
-4. Report/dump: produce human-readable and machine-readable output.
-
-Proposed source layout:
-
-```text
-src/
-  cli/
-    main.cpp
-  trace/
-    event.h
-    transaction.h
-    trace.h
-    trace_parser.h
-    trace_parser.cpp
-    trace_validator.h
-    trace_validator.cpp
-    trace_index.h
-    trace_index.cpp
-  checker/
-    checker.h
-    checker_registry.h
-    checker_registry.cpp
-    check_result.h
-    co_snapshot_checker.h
-    co_snapshot_checker.cpp
-  diag/
-    diagnostic.h
-    logger.h
-    trace_dump.h
-    trace_dump.cpp
-    relation_dump.h
-  util/
-    hex.h
-    yaml.h
-test/
-  trace_parser_test.cpp
-  co_snapshot_checker_test.cpp
-```
+- Duplicate `commit_ts` values are rejected by default.
+- `miss` and `value_hex` cannot both be present.
+- `delete` and `value_hex` cannot both be present.
+- Read events cannot have `delete`.
+- Write events cannot have `miss`.
+- Unknown metadata fields are ignored. For example, traces may contain
+  `source: snapshot`, which is not part of the typed model.
 
 ## Core Data Model
 
-Keep the model simple and explicit. Avoid encoding checker-specific assumptions
-in parser objects.
+Primitive ids and timestamps are defined in `common/trace/types.h`:
 
 ```cpp
-using TxnId = uint32_t;
-using EventId = uint32_t;
-using SessionId = uint32_t;
-using Timestamp = uint64_t;
-using EventSeq = uint32_t;
+using TxnId = std::uint32_t;
+using EventId = std::uint32_t;
+using SessionId = std::uint32_t;
+using Timestamp = std::uint64_t;
+using EventSeq = std::uint32_t;
+```
 
-struct HexValue {
-    // Number of meaningful bytes represented by the packed words.
-    uint32_t byte_len = 0;
+`HexValue` stores decoded bytes in two inline `uint64_t` words plus
+`extra_words` for longer keys or values. `Key` and `Value` are aliases for
+`HexValue`, and equality/hashing operate on the packed representation rather
+than the original strings.
 
-    // Common case storage. These two words cover values up to 16 bytes.
-    // Words are packed in input byte order; the final partial word is padded.
-    std::array<uint64_t, 2> inline_words{};
+`common/trace/trace.h` defines:
 
-    // Used only when the hex value is longer than 16 bytes.
-    std::vector<uint64_t> extra_words;
-
-    bool operator==(const HexValue& rhs) const {
-        return byte_len == rhs.byte_len &&
-               inline_words == rhs.inline_words &&
-               extra_words == rhs.extra_words;
-    }
-
-    bool operator!=(const HexValue& rhs) const {
-        return !(*this == rhs);
-    }
-
-    std::string to_hex() const;
-};
-
-struct HexValueHash {
-    std::size_t operator()(const HexValue& value) const;
-};
-
-using Key = HexValue;
-using Value = HexValue;
-
-enum class EventOp {
-    Read,
-    Write,
-};
+```cpp
+enum class EventOp { Read, Write };
 
 struct Event {
-    EventId id;                 // dense index into Trace::events
-    TxnId txn_id;               // owning transaction
-    EventSeq seq;
-    EventOp op;
-    Key key;
-    std::optional<Value> value;
-    bool is_delete = false;
-    bool is_miss = false;
+  EventId id;
+  TxnId txn_id;
+  EventSeq seq;
+  EventOp op;
+  Key key;
+  std::optional<Value> value;
+  bool is_delete;
+  bool is_miss;
+
+  std::string to_string(std::string_view indent = "") const;
+  void print(std::ostream&, std::string_view indent = "") const;
+  void print() const; // prints to std::cout
 };
 
 struct Transaction {
-    TxnId id;                  // dense parser-assigned id, commit-order index
-    SessionId session_id;
-    Timestamp start_ts;
-    Timestamp commit_ts;
-    std::vector<EventId> event_ids; // event order inside this transaction
+  TxnId id;
+  SessionId session_id;
+  Timestamp start_ts;
+  Timestamp commit_ts;
+  std::vector<EventId> event_ids;
+
+  std::string to_string(std::string_view indent = "") const;
+  void print(std::ostream&, std::string_view indent = "") const;
+  void print() const; // prints to std::cout
 };
 
 struct Trace {
-    std::vector<Transaction> transactions; // sorted by commit_ts
-    std::vector<Event> events;             // all events, stored once
+  std::vector<Transaction> transactions;
+  std::vector<Event> events;
+
+  const Transaction& getTxn(TxnId) const;
+  const Event& getEvent(EventId) const;
 };
 ```
 
-The two inline `uint64_t` words are an optimization, not a hard size limit.
-Current traces have values that fit in 16 bytes, but some TiDB keys are longer,
-so `extra_words` is required for correctness.
+`Trace::transactions` is ordered by parsed commit order, and parser-assigned
+`TxnId` values are dense indexes into that vector. `Trace::events` owns all
+events exactly once; transactions refer to their events by `EventId`.
 
-`Trace::events` owns every event. `Transaction::event_ids` stores only stable
-ids into that global event array. This keeps event storage contiguous and avoids
-duplicating event payloads in transaction objects.
+## Snapshots
 
-Important derived indexes:
+`common/trace/snapshot.h` defines snapshot helpers used by SO-only checking and
+debugging.
+
+`Snapshot` represents materialized key/value state:
+
+```cpp
+struct Snapshot {
+  std::unordered_map<Key, Value, HexValueHash> data;
+
+  void copy_from(const Snapshot&);
+  Snapshot clone() const;
+  bool has_key(const Key&) const;
+  std::optional<Value> get(const Key&) const;
+  void put(const Key&, const Value&);
+  void erase(const Key&);
+  void set(const Key&, const std::optional<Value>&);
+
+  std::string to_string(std::string_view indent = "") const;
+  void print(std::ostream&, std::string_view indent = "") const;
+  void print() const;
+};
+```
+
+Missing keys represent absent/deleted keys. Mutation is intentionally explicit:
+there is no `operator[]` because returning `std::optional<Value>` by value makes
+assignments such as `snapshot[key] = value` silently update only a temporary.
+
+`SnapshotOpt` records observed key presence even when the value is null:
+
+```cpp
+struct SnapshotOpt {
+  std::unordered_map<Key, std::optional<Value>, HexValueHash> data;
+
+  SnapshotOpt clone() const;
+  std::optional<Value> get(const Key&) const;
+  bool has_key(const Key&) const;
+  void set(const Key&, const std::optional<Value>&);
+
+  std::string to_string(std::string_view indent = "") const;
+  void print(std::ostream&, std::string_view indent = "") const;
+  void print() const;
+};
+```
+
+This is used for transaction read sets where "the key was read and returned
+miss/null" is different from "the key was not read".
+
+`SnapshotMap<T>` and `SnapshotVectorMap<T>` are unordered-map aliases with
+deterministic print helpers. Snapshot formatting implementations live in
+`src/trace/trace.cpp`.
+
+## Trace Index
+
+`common/trace/trace_index.h` defines committed versions and lookup indexes:
 
 ```cpp
 struct Version {
-    TxnId writer;
-    EventId write_event;
-    Timestamp commit_ts;
-    Key key;
-    std::optional<Value> value;
-    bool is_delete;
+  TxnId writer;
+  EventId write_event;
+  Timestamp commit_ts;
+  Key key;
+  std::optional<Value> value;
+  bool is_delete;
 };
 
 struct TraceIndex {
-    // All committed writes per key, sorted by commit_ts.
-    std::unordered_map<Key, std::vector<Version>, HexValueHash> versions_by_key;
-
-    // Transaction lookup by id and commit timestamp.
-    std::unordered_map<Timestamp, TxnId> txn_by_commit_ts;
-
-    // Transaction ids grouped by session.
-    std::unordered_map<SessionId, std::vector<TxnId>> txns_by_session;
+  std::unordered_map<Key, std::vector<Version>, HexValueHash> versions_by_key;
+  std::unordered_map<Timestamp, TxnId> txn_by_commit_ts;
 };
 ```
 
-The parser owns syntax and type validation. The index builder owns derived
-relations and semantic validation that depends on the full trace.
+`TraceIndexBuilder` validates event ownership and event id bounds while building
+the index. For each transaction it keeps only the final write per key in that
+transaction. Deletes become committed tombstone versions.
 
-## Parser Design
+There is currently no `txns_by_session` index in `TraceIndex`; session-local
+state used by the SO-only checker is maintained in its checker context.
 
-Parser API:
+## Parser
+
+`TraceParser` returns `Result<Trace>` where errors are `DiagnosticList`:
 
 ```cpp
 struct ParseOptions {
-    bool require_commit_order = true;
-    bool reject_duplicate_commit_ts = true;
+  bool require_commit_order = true;
+  bool reject_duplicate_commit_ts = true;
 };
 
 class TraceParser {
 public:
-    explicit TraceParser(ParseOptions options);
-
-    expected<Trace, DiagnosticList> parse_file(std::string_view path) const;
-    expected<Trace, DiagnosticList> parse_stream(std::istream& input) const;
+  explicit TraceParser(ParseOptions options = {});
+  Result<Trace> parse_file(std::string_view path) const;
+  Result<Trace> parse_stream(std::istream& input) const;
 };
 ```
 
-Parser responsibilities:
+The parser uses `yaml-cpp`; YAML is not parsed by hand. Diagnostics include a
+human-readable message with document index, event index, field name, and reason
+where applicable. Diagnostics no longer carry separate stable code strings.
 
-- Read YAML document stream.
-- Validate required fields and field types.
-- Parse `key_hex` and `value_hex` into packed `HexValue` objects.
-- Validate that hex strings have even length and contain only hex digits.
-- Pack the first 16 bytes into two inline `uint64_t` words.
-- Pack bytes beyond 16 into `extra_words`.
-- Convert operation strings into enums.
-- Validate event-level constraints:
-  - `R` may have `miss`.
-  - `W` may have `delete`.
-  - `miss` and `value_hex` must not both be present.
-  - `delete` and `value_hex` should not both be present for the first version.
-  - `seq` is strictly increasing.
-- Ignore unrecognized event metadata by default, while keeping an optional strict
-  mode available for schema debugging.
-- Assign dense `TxnId` values in commit order.
-- Assign dense `EventId` values as events are appended to `Trace::events`.
-- Store each transaction's event order as `Transaction::event_ids`.
-- Validate commit order and duplicate `commit_ts`.
+## Checker Interface
 
-Parsing should produce precise diagnostics with document number, event index,
-field name, and reason. Do not silently coerce malformed fields.
-
-YAML dependency:
-
-- Use a real YAML parser. Do not parse YAML with ad hoc string logic.
-- Prefer `yaml-cpp` for C++ implementation unless the build system makes another
-  parser clearly better.
-
-## Checker Extension Interface
-
-All checkers should implement a narrow interface:
+All checkers implement `checker::Checker`:
 
 ```cpp
 struct CheckerContext {
-    const Trace& trace;
-    const TraceIndex& index;
-    Logger* logger; // nullable
+  const common::Trace& trace;
+  const common::TraceIndex& index;
+  common::Logger* logger = nullptr;
 };
 
 class Checker {
 public:
-    virtual ~Checker() = default;
-    virtual std::string_view name() const = 0;
-    virtual CheckResult run(const CheckerContext& ctx) const = 0;
+  virtual ~Checker() = default;
+  virtual std::string_view name() const = 0;
+  virtual CheckResult run(const CheckerContext& ctx) const = 0;
+
+  virtual common::Diagnostic make_diagnostic(
+      std::string message,
+      const common::Transaction& txn,
+      const common::Event& event) const;
 };
 ```
 
-Registry:
+`CheckerRegistry` owns checker instances and supports lookup by name. The
+default registry currently registers:
 
-```cpp
-class CheckerRegistry {
-public:
-    void register_checker(std::unique_ptr<Checker> checker);
-    const Checker* find(std::string_view name) const;
-    std::vector<std::string_view> names() const;
-};
-```
+- `co-si-basic`
+- `co-si-so-only`
 
-This lets the CLI run:
+## Checkers
 
-```bash
-co-checker traces/2s-10t-28e.yaml
-co-checker --checker co-si traces/2s-10t-28e.yaml
-co-checker --checker all traces/2s-10t-28e.yaml
-```
+### `co-si-basic`
 
-The default CLI mode should parse and index the trace only. Checkers are run
-only when `--checker` is provided.
+`CoSnapshotBasicChecker` validates each read against the latest committed
+version visible at the reader transaction's `start_ts`.
 
-Adding a checker should require:
+For each read:
 
-1. Implementing `Checker`.
-2. Registering it in one place.
-3. Adding focused tests.
+- Find the reader transaction from `event.txn_id`.
+- Look up the committed version list for `event.key`.
+- Use binary search to find the latest version with
+  `version.commit_ts <= txn.start_ts`.
+- If no visible version exists, or the visible version is a delete, the read
+  must be a miss.
+- If a visible non-delete version exists, the read must not be a miss and must
+  include the same value.
 
-No parser changes should be needed unless the input trace schema changes.
+The checker reports diagnostics for unexpected values, unexpected misses,
+missing read values, invalid non-delete versions, and invalid event ownership.
+It sets `CheckStatus::Fail` when diagnostics are present.
 
-## Initial Co-Snapshot Checker
+### `co-si-so-only`
 
-The first checker should validate snapshot reads against commit order.
+`SnapshotSOChecker` is an experimental checker that uses session-order state to
+eliminate some snapshot candidates.
 
-For each read event:
+It maintains:
 
-- Use `event.txn_id` to find the reader transaction and its `start_ts`.
-- Find the latest committed write to the same key with `writer.commit_ts <=
-  reader.start_ts`.
-- If no such write exists, the read must be a miss.
-- If the latest visible write is a delete, the read must be a miss.
-- Otherwise the read must be non-miss and `value` must equal the visible write
-  value.
+- `session_snapshots`: latest materialized snapshot per session.
+- `latest_txns_by_session`: latest transaction id per session.
+- `latest`: a running materialized snapshot in commit order.
 
-For write events:
+For a transaction, the checker:
 
-- Insert them into `versions_by_key` during index construction.
-- A delete write becomes a committed tombstone version.
+1. Finds the latest previous transaction in the same session.
+2. Starts from that session snapshot.
+3. Builds a `SnapshotOpt` read set so read misses are remembered.
+4. Tracks keys whose observed reads disagree with the session snapshot.
+5. Scans transactions between the session predecessor and current transaction
+   to see whether intervening writes can eliminate all disagreements.
+6. Emits diagnostics for remaining wrong keys.
 
-This checker is intentionally conservative. It checks observed snapshot
-visibility; it does not yet infer anti-dependencies, serialization graphs, or
-all write skew patterns.
+This checker is still conservative and under active development. It now sets
+`CheckStatus::Fail` whenever diagnostics are produced.
 
 ## Diagnostics and Results
 
-Checker output should separate status from evidence:
+Current result types:
 
 ```cpp
 enum class CheckStatus {
-    Pass,
-    Fail,
-    Inconclusive,
+  Pass,
+  Fail,
+  Inconclusive,
 };
 
 enum class Severity {
-    Info,
-    Warning,
-    Error,
+  Info,
+  Warning,
+  Error,
 };
 
 struct Diagnostic {
-    Severity severity;
-    std::string checker;
-    std::string code;
-    std::string message;
-    std::optional<TxnId> txn_id;
-    std::optional<EventId> event_id;
-    std::optional<EventSeq> event_seq;
-    std::optional<Key> key;
+  Severity severity = Severity::Error;
+  std::string checker;
+  std::string message;
+  std::optional<TxnId> txn_id;
+  std::optional<EventId> event_id;
+  std::optional<EventSeq> event_seq;
+  std::optional<Key> key;
 };
 
 struct CheckResult {
-    CheckStatus status;
-    std::vector<Diagnostic> diagnostics;
+  CheckStatus status = CheckStatus::Pass;
+  DiagnosticList diagnostics;
 };
 ```
 
-Examples:
+Diagnostics are message-oriented; the earlier `Diagnostic::code` field has been
+removed. CLI diagnostic output includes severity, checker, message, and
+available transaction/event/key context.
 
-- `parse.missing_field`: document is missing `commit_ts`.
-- `parse.invalid_hex`: `value_hex` is not valid hex.
-- `co_si.stale_read`: read value does not match latest visible committed
-  version.
-- `co_si.unexpected_miss`: read missed a key whose latest visible version exists.
-- `co_si.unexpected_value`: read value differs from visible version.
+CLI exit codes:
 
-The CLI should return:
-
-- `0`: all selected checkers pass.
-- `1`: at least one checker fails.
-- `2`: parse or input validation error.
+- `0`: parsing/indexing succeeded and all selected checkers passed.
+- `1`: at least one selected checker returned `Fail`.
+- `2`: parse or index error.
 - `3`: CLI/configuration error.
 
-## Logging and Dumps
+## CLI and Dumps
 
-The framework needs two related outputs:
-
-- Logs: execution progress and debug information.
-- Dumps: deterministic artifacts showing parsed and derived state.
-
-Logger interface:
-
-```cpp
-enum class LogLevel {
-    Error,
-    Warn,
-    Info,
-    Debug,
-    Trace,
-};
-
-class Logger {
-public:
-    virtual ~Logger() = default;
-    virtual bool enabled(LogLevel level) const = 0;
-    virtual void log(LogLevel level, std::string_view message) = 0;
-};
-```
-
-CLI options:
+CLI usage:
 
 ```bash
-co-checker --log-level debug trace.yaml
-co-checker --dump parsed trace.yaml
-co-checker --dump versions trace.yaml
-co-checker --dump all --dump-dir out trace.yaml
+build/co-checker [--checker none|co-si-basic|co-si-so-only|all] \
+  [--dump parsed|versions|all] <trace.yaml>
 ```
 
-Dump formats:
+Behavior:
 
-- `parsed`: normalized transaction list with event id lists plus the global event
-  array. Keys and values should render through `HexValue::to_hex()`.
-- `versions`: per-key committed version chain in commit order.
-- `reads`: each read with the visible version selected by the checker.
-- `result`: checker result summary plus diagnostics.
+- Default checker is `none`; the CLI parses and indexes the trace and prints
+  `trace: pass` if no dump is requested.
+- `--checker all` runs all registered checkers.
+- `--dump parsed` prints transactions and events using their `print` methods.
+- `--dump versions` prints committed version chains by key.
+- `--dump all` prints both parsed trace and version chains.
 
-Prefer stable text or JSON for dumps. Stable output matters for tests and diffing
-trace-analysis changes.
+There is no current `--log-level`, `--dump-dir`, `reads` dump, or JSON output.
 
-## CLI Flow
+## Test and Trace Driver
 
-High-level flow:
+Unit tests are split by module:
 
-1. Parse flags.
-2. Parse trace file into `Trace`.
-3. Build `TraceIndex`.
-4. Optionally dump parsed/indexed state.
-5. Run selected checker or checker set, if requested.
-6. Print summary and diagnostics.
-7. Return appropriate exit code.
+- `test_trace.cpp`: hex values, parser layout/errors, trace formatting.
+- `test_snapshot.cpp`: `Snapshot`, `SnapshotOpt`, and formatting.
+- `test_checker.cpp`: basic snapshot checker and SO-only status behavior.
+- `test_index.cpp`: committed version index behavior.
+- `test_harness.cpp`: shared helpers.
+- `test_main.cpp`: dispatches module test runners.
 
-Pseudo-code:
+Build and run tests:
 
-```cpp
-int main(int argc, char** argv) {
-    auto config = parse_cli(argc, argv);
-    auto logger = make_logger(config.log_level);
-
-    auto trace = TraceParser(config.parse_options).parse_file(config.trace_path);
-    if (!trace) {
-        print_diagnostics(trace.error());
-        return 2;
-    }
-
-    auto index = TraceIndexBuilder().build(*trace);
-    if (!index) {
-        print_diagnostics(index.error());
-        return 2;
-    }
-
-    dump_if_requested(*trace, *index, config);
-    if (config.checkers.empty()) {
-        return 0;
-    }
-
-    auto results = run_checkers(config.checkers, *trace, *index, logger.get());
-    print_results(results);
-    return any_failed(results) ? 1 : 0;
-}
+```bash
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
 ```
 
-## Testing Strategy
+`test/run_traces.py` runs `co-checker` across trace files:
 
-Parser tests:
+```bash
+test/run_traces.py --checker none
+test/run_traces.py --checker all
+test/run_traces.py --trace '*mixed*' --checker co-si-so-only
+test/run_traces.py --list
+```
 
-- Valid minimal trace.
-- Multiple transactions in commit order.
-- Reject missing `session_id`, `start_ts`, `commit_ts`, `events`.
-- Reject duplicate or decreasing `commit_ts`.
-- Reject malformed hex.
-- Reject invalid read/write field combinations.
-- Validate `seq` ordering.
-- Validate transaction `event_ids` point to events whose `txn_id` matches the
-  owning transaction.
-- Validate `HexValue` equality and hashing for both inline-only values and values
-  using `extra_words`.
-
-Index tests:
-
-- Multiple versions for one key.
-- Deletes create tombstone versions.
-- Session grouping.
-- Commit timestamp lookup.
-
-Checker tests:
-
-- Read sees latest version before `start_ts`.
-- Read does not see a future write.
-- Read miss is valid before first write.
-- Read miss is valid after visible delete.
-- Stale read is reported with transaction id, event id, and event seq.
-- Unexpected miss is reported.
-- Unexpected value is reported.
-
-Integration tests:
-
-- Run the checker over every generated trace in `traces/`.
-- Include at least one hand-written invalid trace per parser failure class.
+Driver options include `--checker-bin`, `--traces-dir`, repeated `--trace`
+selectors, `--fail-fast`, and `--verbose`. Unrecognized arguments are forwarded
+to `co-checker`.
 
 ## Performance Notes
 
-The first implementation can load a full trace into memory. The data model should
-still avoid unnecessary copying:
+The implementation currently loads the full trace into memory. Important
+efficiency choices already in place:
 
-- Validate and pack hex once during parsing.
-- Append `Event` objects once into `Trace::events`.
-- Store `EventId` values in each `Transaction`.
-- Store keys and values as packed `HexValue` objects, avoiding string comparison
-  in checker hot paths.
-- Build per-key version vectors once.
-- Use binary search over each key's version list for visible-version lookup.
+- Hex is decoded and packed once during parsing.
+- Events are stored once in `Trace::events`.
+- Transactions store event ids, not duplicated event objects.
+- `TraceIndex` stores per-key version vectors once.
+- The basic checker uses binary search in each key's version list.
+- `Snapshot::copy_from` clears and reserves before insertion to reduce rehashing
+  when copying materialized snapshots.
 
-Expected checker complexity for snapshot reads:
+Expected basic checker complexity:
 
-- Build index: `O(total_events)`.
-- Check reads: `O(read_events * log(versions_for_key))`.
+- Index build: `O(total_events)`.
+- Read checking: `O(read_events * log(versions_for_key))`.
 
-For large traces, later work can add interning for repeated `HexValue` objects,
-streaming parse validation, and compressed version storage.
+The SO-only checker uses materialized snapshot copies and is not yet optimized
+for very large traces. Future work may use persistent snapshots, deltas, or
+copy-on-write structures, but delete/miss semantics must remain explicit.
 
 ## Open Questions
 
-- Should the checker keep packed TiDB KV keys as the canonical key forever, or
-  should a later decoding layer expose table id, row handle, and index key
-  structure?
-- Should read-only transactions with no events be retained if the generator ever
-  emits them with `session_id`?
-- Should equal `commit_ts` be rejected permanently, or supported as a partial
-  order if TiDB ever emits ties?
-- Should dumps include an optional decoded TiDB key view for debugging?
-
-## Milestones
-
-1. Add build system and parser dependency.
-2. Implement model headers and parser.
-3. Implement trace validation and `TraceIndex`.
-4. Implement dumps for parsed trace and version chains.
-5. Implement checker registry and result/diagnostic types.
-6. Implement initial `co-si` snapshot visibility checker.
-7. Add CLI.
-8. Add parser, index, checker, and generated-trace integration tests.
+- Should `Snapshot` stay fully materialized, or should later checkers use a
+  parent-plus-delta representation?
+- Should equal `commit_ts` values remain rejected, or become a partial-order
+  relation if TiDB traces require it?
+- Should diagnostics regain stable machine-readable codes in addition to
+  messages?
+- Should dumps add JSON output for downstream tooling?
+- Should TiDB key/value decoding be introduced as a separate optional layer?
