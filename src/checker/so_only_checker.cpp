@@ -47,7 +47,7 @@ SnapshotMap updateCtx(SnapshotSOContext &ctx, const Transaction &txn,
 
   auto snapshot = std::move(next).persistent();
 
-  ctx.session_snapshots[txn.session_id] = snapshot;
+  ctx.session_snapshots[txn.session_id]      = snapshot;
   ctx.latest_txns_by_session[txn.session_id] = txn.id;
   return snapshot;
 }
@@ -98,20 +98,19 @@ CheckResult SnapshotSOChecker::run(const CheckerContext &ctx_) const {
         }
         reads.set(event.key, event.value);
         const auto expected = getFromSnapshot(snapshot, event.key);
-        const bool is_wrong =
-            (event.is_miss && expected.has_value()) ||
-            (!event.is_miss &&
-             (!expected.has_value() || expected != event.value));
+        const bool is_wrong = (event.is_miss && expected.has_value()) ||
+                              (!event.is_miss && (!expected.has_value() ||
+                                                  expected != event.value));
         if (is_wrong) {
           wrong_keys.insert(event.key);
         }
       }
     }
 
-    bool viable = false;
+    bool viable = wrong_keys.empty();
 
     // traverse transactions between t_max and t
-    for (auto i = *t_max + 1; i < txn.id; i++) {
+    for (auto i = *t_max + 1; !viable && i < txn.id; i++) {
       const Transaction &tmp = ctx.trace.transactions[i];
       // check all writes in tmp. If all writes are consistent with snapshot,
       // then Snapshot of tmp is consistent with txn.
