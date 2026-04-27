@@ -27,9 +27,6 @@ void print_diagnostic(std::ostream &os, const Diagnostic &diagnostic) {
   if (!diagnostic.checker.empty()) {
     os << diagnostic.checker << ": ";
   }
-  if (!diagnostic.code.empty()) {
-    os << diagnostic.code << ": ";
-  }
   os << diagnostic.message;
 
   if (diagnostic.txn_id.has_value()) {
@@ -56,33 +53,12 @@ void print_diagnostics(std::ostream &os, const DiagnosticList &diagnostics) {
 void dump_parsed_trace(std::ostream &os, const Trace &trace) {
   os << "transactions:\n";
   for (const auto &txn : trace.transactions) {
-    os << "  - id: " << txn.id << '\n';
-    os << "    session_id: " << txn.session_id << '\n';
-    os << "    start_ts: " << txn.start_ts << '\n';
-    os << "    commit_ts: " << txn.commit_ts << '\n';
-    os << "    event_ids:";
-    for (const auto event_id : txn.event_ids) {
-      os << ' ' << event_id;
-    }
-    os << '\n';
+    txn.print(os, "  ");
   }
 
   os << "events:\n";
   for (const auto &event : trace.events) {
-    os << "  - id: " << event.id << '\n';
-    os << "    txn_id: " << event.txn_id << '\n';
-    os << "    seq: " << event.seq << '\n';
-    os << "    op: " << (event.op == EventOp::Read ? "R" : "W") << '\n';
-    os << "    key_hex: " << event.key.to_hex() << '\n';
-    if (event.value.has_value()) {
-      os << "    value_hex: " << event.value->to_hex() << '\n';
-    }
-    if (event.is_delete) {
-      os << "    delete: true\n";
-    }
-    if (event.is_miss) {
-      os << "    miss: true\n";
-    }
+    event.print(os, "  ");
   }
 }
 

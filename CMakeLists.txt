@@ -29,6 +29,7 @@ add_library(checker
   src/checker/co_snapshot_checker.cpp
   src/checker/so_only_checker.cpp
   src/diag/trace_dump.cpp
+  src/trace/trace.cpp
   src/trace/trace_index.cpp
   src/trace/trace_parser.cpp
   src/trace/types.cpp
@@ -120,7 +121,12 @@ target_compile_options(co-checker
 include(CTest)
 if(BUILD_TESTING)
   add_executable(checker_tests
+    test/test_checker.cpp
+    test/test_harness.cpp
+    test/test_index.cpp
     test/test_main.cpp
+    test/test_snapshot.cpp
+    test/test_trace.cpp
   )
 
   target_link_libraries(checker_tests

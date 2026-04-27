@@ -13,11 +13,10 @@ namespace common {
 
 namespace {
 
-Diagnostic parse_error(std::string code, std::string message) {
+Diagnostic parse_error(std::string, std::string message) {
   Diagnostic diagnostic;
   diagnostic.severity = Severity::Error;
   diagnostic.checker  = "parser";
-  diagnostic.code     = std::move(code);
   diagnostic.message  = std::move(message);
   return diagnostic;
 }
