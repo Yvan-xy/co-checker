@@ -19,9 +19,22 @@ FetchContent_Declare(
   GIT_TAG 0.8.0
 )
 
+FetchContent_Declare(
+  immer
+  GIT_REPOSITORY https://github.com/arximboldi/immer.git
+  GIT_TAG bd4fc749b97dfa2b66a8f3de00bbf234db4856ef
+)
+
 # yaml-cpp 0.8.0 has not updated its declared policy floor for CMake 4.x.
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
-FetchContent_MakeAvailable(yaml-cpp)
+FetchContent_MakeAvailable(yaml-cpp immer)
+
+if(TARGET immer)
+  get_target_property(IMMER_INCLUDE_DIRS immer INTERFACE_INCLUDE_DIRECTORIES)
+  set_target_properties(immer PROPERTIES
+    INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${IMMER_INCLUDE_DIRS}"
+  )
+endif()
 
 add_library(checker
   src/checker/check_result.cpp
@@ -41,6 +54,8 @@ target_include_directories(checker
 )
 
 target_link_libraries(checker
+  PUBLIC
+    immer
   PRIVATE
     yaml-cpp::yaml-cpp
 )

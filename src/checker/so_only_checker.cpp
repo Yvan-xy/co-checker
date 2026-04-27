@@ -2,11 +2,11 @@
 
 #include <algorithm>
 #include <cassert>
-#include <memory>
 #include <optional>
 #include <string>
-#include <unordered_map>
 #include <unordered_set>
+
+#include <immer/map_transient.hpp>
 
 namespace checker {
 
@@ -21,42 +21,35 @@ std::optional<TxnId> getSOMax(const SnapshotSOContext &ctx,
   return it->second;
 }
 
-std::optional<Value> getFromSnapshot(const SnapshotDeltaPtr &snapshot,
+std::optional<Value> getFromSnapshot(const SnapshotMap &snapshot,
                                      const Key &key) {
-  for (auto node = snapshot; node != nullptr; node = node->parent) {
-    const auto it = node->writes.find(key);
-    if (it != node->writes.end()) {
-      return it->second;
-    }
+  const auto *value = snapshot.find(key);
+  if (value == nullptr) {
+    return std::nullopt;
   }
-  return std::nullopt;
+  return *value;
 }
 
-SnapshotDeltaPtr updateCtx(SnapshotSOContext &ctx, const Transaction &txn,
-                           const SnapshotDeltaPtr &latest) {
-  std::unordered_map<Key, std::optional<Value>, HexValueHash> writes;
-  writes.reserve(txn.event_ids.size());
+SnapshotMap updateCtx(SnapshotSOContext &ctx, const Transaction &txn,
+                      const SnapshotMap &latest) {
+  auto next = latest.transient();
 
   for (const auto &eid : txn.event_ids) {
     const auto &event = ctx.trace.events[eid];
     if (isWrite(event)) {
       if (event.is_delete) {
-        writes[event.key] = std::nullopt;
+        next.set(event.key, std::nullopt);
       } else if (!event.is_miss && event.value.has_value()) {
-        writes[event.key] = event.value;
+        next.set(event.key, event.value);
       }
     }
   }
 
-  auto next = latest;
-  if (!writes.empty()) {
-    next = std::make_shared<SnapshotDelta>(
-        SnapshotDelta{.parent = latest, .writes = std::move(writes)});
-  }
+  auto snapshot = std::move(next).persistent();
 
-  ctx.session_snapshots[txn.session_id] = next;
+  ctx.session_snapshots[txn.session_id] = snapshot;
   ctx.latest_txns_by_session[txn.session_id] = txn.id;
-  return next;
+  return snapshot;
 }
 
 } // namespace
@@ -75,11 +68,11 @@ std::string_view SnapshotSOChecker::name() const { return "co-si-so-only"; }
 CheckResult SnapshotSOChecker::run(const CheckerContext &ctx_) const {
   CheckResult result;
   SnapshotSOContext ctx(std::move(ctx_));
-  SnapshotDeltaPtr latest;
+  SnapshotMap latest;
   for (const auto &txn : ctx.trace.transactions) {
     // get the snapshot of t_max
     auto t_max = getSOMax(ctx, txn.session_id);
-    SnapshotDeltaPtr snapshot;
+    SnapshotMap snapshot;
     if (t_max.has_value()) {
       auto it = ctx.session_snapshots.find(ctx.trace.getTxn(*t_max).session_id);
       assert(it != ctx.session_snapshots.end());
