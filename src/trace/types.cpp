@@ -92,6 +92,32 @@ std::optional<HexValue> HexValue::from_hex(std::string_view hex,
   return value;
 }
 
+HexValue HexValue::from_bytes(std::span<const std::uint8_t> bytes) {
+  HexValue value;
+  value.byte_len = static_cast<std::uint32_t>(bytes.size());
+
+  const auto word_count = (bytes.size() + 7U) / 8U;
+  if (word_count > value.inline_words.size()) {
+    value.extra_words.assign(word_count - value.inline_words.size(), 0);
+  }
+
+  for (std::size_t byte_index = 0; byte_index < bytes.size(); ++byte_index) {
+    const auto word_index  = byte_index / 8U;
+    const auto byte_offset = byte_index % 8U;
+    const auto shift       = static_cast<unsigned>((7U - byte_offset) * 8U);
+    const auto byte        = static_cast<std::uint64_t>(bytes[byte_index]);
+
+    if (word_index < value.inline_words.size()) {
+      value.inline_words[word_index] |= byte << shift;
+    } else {
+      value.extra_words[word_index - value.inline_words.size()] |= byte
+                                                                   << shift;
+    }
+  }
+
+  return value;
+}
+
 std::string HexValue::to_hex() const {
   std::string out;
   out.reserve(static_cast<std::size_t>(byte_len) * 2U);
@@ -109,6 +135,28 @@ std::string HexValue::to_hex() const {
       }
     }
     append_byte_hex(out, byte_at_word(word, byte_offset));
+  }
+
+  return out;
+}
+
+std::vector<std::uint8_t> HexValue::to_bytes() const {
+  std::vector<std::uint8_t> out;
+  out.reserve(byte_len);
+
+  for (std::size_t byte_index = 0; byte_index < byte_len; ++byte_index) {
+    const auto word_index  = byte_index / 8U;
+    const auto byte_offset = byte_index % 8U;
+    std::uint64_t word     = 0;
+    if (word_index < inline_words.size()) {
+      word = inline_words[word_index];
+    } else {
+      const auto extra_index = word_index - inline_words.size();
+      if (extra_index < extra_words.size()) {
+        word = extra_words[extra_index];
+      }
+    }
+    out.push_back(byte_at_word(word, byte_offset));
   }
 
   return out;

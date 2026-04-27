@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -23,8 +24,10 @@ struct HexValue {
 
   static std::optional<HexValue> from_hex(std::string_view hex,
                                           std::string *error = nullptr);
+  static HexValue from_bytes(std::span<const std::uint8_t> bytes);
 
   [[nodiscard]] std::string to_hex() const;
+  [[nodiscard]] std::vector<std::uint8_t> to_bytes() const;
 
   [[nodiscard]] bool operator==(const HexValue &rhs) const {
     return byte_len == rhs.byte_len && inline_words == rhs.inline_words &&

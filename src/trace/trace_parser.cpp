@@ -9,6 +9,8 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include "common/trace/trace_binary.h"
+
 namespace common {
 
 namespace {
@@ -158,10 +160,13 @@ std::optional<EventOp> parse_op(const YAML::Node &node,
 TraceParser::TraceParser(ParseOptions options) : options_(options) {}
 
 Result<Trace> TraceParser::parse_file(std::string_view path) const {
-  std::ifstream input{std::string(path)};
+  std::ifstream input{std::string(path), std::ios::binary};
   if (!input.is_open()) {
     return single_error("parse.open_failed", "failed to open trace file `" +
                                                  std::string(path) + "`");
+  }
+  if (is_binary_trace_stream(input)) {
+    return read_binary_trace_stream(input, options_);
   }
   return parse_stream(input);
 }

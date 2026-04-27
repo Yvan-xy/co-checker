@@ -1,22 +1,32 @@
 #include <chrono>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "checker/checker_registry.h"
 #include "common/diag/trace_dump.h"
+#include "common/trace/trace_binary.h"
 #include "common/trace/trace_index.h"
 #include "common/trace/trace_parser.h"
 
 namespace {
 
+enum class TraceInputFormat {
+  Auto,
+  Yaml,
+  Binary,
+};
+
 struct CliConfig {
   std::string checker = "none";
   std::string dump;
   std::string trace_path;
-  bool help = false;
+  TraceInputFormat format = TraceInputFormat::Auto;
+  bool help               = false;
 };
 
 void print_checker_choices(std::ostream &os,
@@ -31,7 +41,24 @@ void print_checker_choices(std::ostream &os,
 void print_usage(std::ostream &os, const checker::CheckerRegistry &registry) {
   os << "usage: co-checker [--checker ";
   print_checker_choices(os, registry);
-  os << "] [--dump parsed|versions|all] <trace.yaml>\n";
+  os << "] [--format auto|yaml|bin] [--dump parsed|versions|all] "
+        "<trace.yaml|trace.trace>\n";
+}
+
+bool parse_format(const std::string_view value, TraceInputFormat &format) {
+  if (value == "auto") {
+    format = TraceInputFormat::Auto;
+    return true;
+  }
+  if (value == "yaml") {
+    format = TraceInputFormat::Yaml;
+    return true;
+  }
+  if (value == "bin" || value == "binary") {
+    format = TraceInputFormat::Binary;
+    return true;
+  }
+  return false;
 }
 
 bool parse_args(int argc, char **argv, CliConfig &config,
@@ -59,6 +86,17 @@ bool parse_args(int argc, char **argv, CliConfig &config,
       config.dump = argv[++i];
       continue;
     }
+    if (arg == "--format") {
+      if (i + 1 >= argc) {
+        std::cerr << "--format requires a value\n";
+        return false;
+      }
+      if (!parse_format(argv[++i], config.format)) {
+        std::cerr << "--format must be one of: auto, yaml, bin\n";
+        return false;
+      }
+      continue;
+    }
     if (!arg.empty() && arg.front() == '-') {
       std::cerr << "unknown option: " << arg << '\n';
       return false;
@@ -75,6 +113,30 @@ bool parse_args(int argc, char **argv, CliConfig &config,
     return false;
   }
   return true;
+}
+
+common::Result<common::Trace> parse_trace(const CliConfig &config) {
+  const common::TraceParser parser;
+  switch (config.format) {
+  case TraceInputFormat::Auto:
+    return parser.parse_file(config.trace_path);
+  case TraceInputFormat::Yaml: {
+    std::ifstream input{config.trace_path};
+    if (!input.is_open()) {
+      common::Diagnostic diagnostic;
+      diagnostic.severity = common::Severity::Error;
+      diagnostic.checker  = "parser";
+      diagnostic.message =
+          "failed to open trace file `" + config.trace_path + "`";
+      return common::Result<common::Trace>::err({std::move(diagnostic)});
+    }
+    return parser.parse_stream(input);
+  }
+  case TraceInputFormat::Binary:
+    return common::read_binary_trace_file(config.trace_path);
+  }
+
+  return parser.parse_file(config.trace_path);
 }
 
 double elapsed_ms(std::chrono::steady_clock::time_point start,
@@ -95,8 +157,7 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  const common::TraceParser parser;
-  auto trace = parser.parse_file(config.trace_path);
+  auto trace = parse_trace(config);
   if (!trace) {
     common::print_diagnostics(std::cerr, trace.error());
     return 2;
@@ -152,8 +213,8 @@ int main(int argc, char **argv) {
         .logger = &logger,
     };
     const auto start = std::chrono::steady_clock::now();
-    auto result = checker->run(context);
-    const auto end = std::chrono::steady_clock::now();
+    auto result      = checker->run(context);
+    const auto end   = std::chrono::steady_clock::now();
 
     std::cout << checker->name() << ": " << checker::to_string(result.status)
               << " (" << std::fixed << std::setprecision(3)

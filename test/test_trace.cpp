@@ -4,6 +4,7 @@
 #include <sstream>
 #include <string>
 
+#include "common/trace/trace_binary.h"
 #include "common/trace/trace_parser.h"
 #include "common/trace/types.h"
 
@@ -23,6 +24,7 @@ void test_hex_value() {
   CHECK(*value == *upper);
   CHECK(!(*value != *upper));
   CHECK(common::HexValueHash{}(*value) == common::HexValueHash{}(*upper));
+  CHECK(common::HexValue::from_bytes(value->to_bytes()) == *value);
 
   auto long_value =
       common::HexValue::from_hex("7480000000000000725f6980000000000000010380000"
@@ -31,6 +33,7 @@ void test_hex_value() {
   CHECK(long_value.has_value());
   CHECK(long_value->byte_len == 37);
   CHECK(!long_value->extra_words.empty());
+  CHECK(common::HexValue::from_bytes(long_value->to_bytes()) == *long_value);
   CHECK(long_value->to_hex() == "7480000000000000725f69800000000000000103800000"
                                 "0000000051038000000000000008");
 
@@ -98,6 +101,59 @@ events:
   CHECK(printed.find("value_hex: 0a") != std::string::npos);
 }
 
+void test_binary_trace_round_trip() {
+  auto trace = parse_or_die(R"yaml(
+---
+session_id: 7
+start_ts: 10
+commit_ts: 20
+events:
+  - seq: 1
+    op: W
+    key_hex: 01
+    value_hex: 0a
+  - seq: 2
+    op: W
+    key_hex: 02
+    delete: true
+---
+session_id: 8
+start_ts: 21
+commit_ts: 30
+events:
+  - seq: 1
+    op: R
+    key_hex: 01
+    value_hex: 0a
+  - seq: 2
+    op: R
+    key_hex: 03
+    miss: true
+)yaml");
+
+  std::ostringstream output;
+  std::string error;
+  CHECK(common::write_binary_trace_stream(output, trace, &error));
+  CHECK(error.empty());
+
+  const auto binary = output.str();
+  std::istringstream input(binary);
+  auto parsed = common::read_binary_trace_stream(input);
+  CHECK(parsed.has_value());
+  if (!parsed) {
+    return;
+  }
+
+  CHECK(parsed.value().transactions.size() == trace.transactions.size());
+  CHECK(parsed.value().events.size() == trace.events.size());
+  CHECK(parsed.value().transactions[1].session_id == 8);
+  CHECK(parsed.value().transactions[1].event_ids[1] == 3);
+  CHECK(parsed.value().events[0].key == trace.events[0].key);
+  CHECK(parsed.value().events[0].value == trace.events[0].value);
+  CHECK(parsed.value().events[1].is_delete);
+  CHECK(parsed.value().events[3].is_miss);
+}
+
 void test_parser_rejects_bad_hex() {
   std::istringstream input(R"yaml(
 ---
@@ -162,6 +218,7 @@ void run_trace_tests() {
   test_hex_value();
   test_parser_layout();
   test_trace_print_helpers();
+  test_binary_trace_round_trip();
   test_parser_rejects_bad_hex();
   test_parser_rejects_duplicate_commit_ts();
   test_generated_trace_parses();

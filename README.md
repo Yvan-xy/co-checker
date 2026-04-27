@@ -33,6 +33,15 @@ Run the prototype snapshot checker explicitly:
 build/co-checker --checker co-si traces/2s-4t-10e-mutual.yaml
 ```
 
+Pack a normalized YAML trace into the compact binary trace format:
+
+```bash
+build/trace-convert traces/2s-4t-10e-mutual.yaml
+build/co-checker --format bin --checker co-si-so-only traces/2s-4t-10e-mutual.trace
+```
+
+See `doc/binary_trace.md` for the binary format layout.
+
 ## Trace Generation
 
 The `trace-gen/` directory contains the TiDB-backed trace fixture generator and
