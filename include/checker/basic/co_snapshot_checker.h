@@ -9,8 +9,7 @@ public:
   [[nodiscard]] std::string_view name() const override;
   [[nodiscard]] CheckResult run(const CheckerContext &ctx) const override;
   [[nodiscard]] common::Diagnostic
-  make_diagnostic(std::string code, std::string message,
-                  const common::Transaction &txn,
+  make_diagnostic(std::string message, const common::Transaction &txn,
                   const common::Event &event) const override;
 };
 

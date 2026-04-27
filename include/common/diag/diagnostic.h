@@ -17,7 +17,6 @@ enum class Severity {
 struct Diagnostic {
   Severity severity = Severity::Error;
   std::string checker;
-  std::string code;
   std::string message;
   std::optional<TxnId> txn_id;
   std::optional<EventId> event_id;

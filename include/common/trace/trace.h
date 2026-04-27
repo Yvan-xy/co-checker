@@ -2,6 +2,9 @@
 
 #include <cassert>
 #include <optional>
+#include <ostream>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include "common/trace/types.h"
@@ -22,6 +25,10 @@ struct Event {
   std::optional<Value> value;
   bool is_delete = false;
   bool is_miss   = false;
+
+  [[nodiscard]] std::string to_string(std::string_view indent = "") const;
+  void print(std::ostream &os, std::string_view indent = "") const;
+  void print() const;
 };
 
 struct Transaction {
@@ -30,6 +37,10 @@ struct Transaction {
   Timestamp start_ts   = 0;
   Timestamp commit_ts  = 0;
   std::vector<EventId> event_ids;
+
+  [[nodiscard]] std::string to_string(std::string_view indent = "") const;
+  void print(std::ostream &os, std::string_view indent = "") const;
+  void print() const;
 };
 
 struct Trace {
