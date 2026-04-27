@@ -45,6 +45,9 @@ trace_paths=(
 	"${output_dir}/3s-large-mixed.yaml"
 	"${output_dir}/3s-very-large-roundrobin.yaml"
 	"${output_dir}/3s-very-large-mixed.yaml"
+	"${output_dir}/20s-many-session-roundrobin.yaml"
+	"${output_dir}/30s-many-session-mixed.yaml"
+	"${output_dir}/100s-many-session-roundrobin.yaml"
 )
 legacy_trace_paths=(
 	"${output_dir}/small-basic.yaml"
@@ -59,6 +62,8 @@ legacy_trace_paths=(
 	"${output_dir}"/*-large-mixed.yaml
 	"${output_dir}"/*-very-large-roundrobin.yaml
 	"${output_dir}"/*-very-large-mixed.yaml
+	"${output_dir}"/*-many-session-roundrobin.yaml
+	"${output_dir}"/*-many-session-mixed.yaml
 )
 rm -f "${trace_paths[@]}" "${legacy_trace_paths[@]}"
 

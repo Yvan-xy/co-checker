@@ -34,6 +34,9 @@ func TestCoCheckerTraceGen(t *testing.T) {
 	runTraceScenario(t, outputDir, "3s-large-mixed", generate3Session40Transaction200EventMixedTrace)
 	runTraceScenario(t, outputDir, "3s-very-large-roundrobin", generate3SessionVeryLargeRoundRobinTrace)
 	runTraceScenario(t, outputDir, "3s-very-large-mixed", generate3SessionVeryLargeMixedTrace)
+	runTraceScenario(t, outputDir, "20s-many-session-roundrobin", generate20SessionManySessionRoundRobinTrace)
+	runTraceScenario(t, outputDir, "30s-many-session-mixed", generate30SessionManySessionMixedTrace)
+	runTraceScenario(t, outputDir, "100s-many-session-roundrobin", generate100SessionManySessionRoundRobinTrace)
 }
 
 func runTraceScenario(t *testing.T, outputDir, name string, workload func(t *testing.T, tracePath string)) {
@@ -52,15 +55,20 @@ func runTraceScenario(t *testing.T, outputDir, name string, workload func(t *tes
 }
 
 func newTraceKit(t *testing.T) (*testkit.TestKit, *testkit.TestKit, *testkit.TestKit) {
+	kits := newTraceKits(t, 3)
+	return kits[0], kits[1], kits[2]
+}
+
+func newTraceKits(t *testing.T, count int) []*testkit.TestKit {
 	store := testkit.CreateMockStore(t)
 
-	tk1 := testkit.NewTestKit(t, store)
-	tk2 := testkit.NewTestKit(t, store)
-	tk3 := testkit.NewTestKit(t, store)
-	for _, tk := range []*testkit.TestKit{tk1, tk2, tk3} {
+	kits := make([]*testkit.TestKit, 0, count)
+	for i := 0; i < count; i++ {
+		tk := testkit.NewTestKit(t, store)
 		tk.MustExec("use test")
+		kits = append(kits, tk)
 	}
-	return tk1, tk2, tk3
+	return kits
 }
 
 func enableTrace(t *testing.T, tracePath string) {
@@ -613,6 +621,147 @@ func generate3SessionVeryLargeMixedTrace(t *testing.T, tracePath string) {
 		expectPointReadFromTable(tk2, "very_large_mixed", id, values, deleted)
 	}
 	tk2.MustExec("commit")
+
+	assertTraceContains(t, tracePath, "miss: true")
+	assertTraceContains(t, tracePath, "delete: true")
+	assertTraceContains(t, tracePath, `status: "rolled_back"`)
+}
+
+func generate20SessionManySessionRoundRobinTrace(t *testing.T, tracePath string) {
+	generateManySessionRoundRobinTrace(t, tracePath, "many_session_rr_20", 20, 100, 400, 4, 10)
+}
+
+func generate30SessionManySessionMixedTrace(t *testing.T, tracePath string) {
+	generateManySessionMixedTrace(t, tracePath, "many_session_mixed_30", 30, 120, 450, 3, 6)
+}
+
+func generate100SessionManySessionRoundRobinTrace(t *testing.T, tracePath string) {
+	generateManySessionRoundRobinTrace(t, tracePath, "many_session_rr_100", 100, 100, 500, 3, 8)
+}
+
+func generateManySessionRoundRobinTrace(
+	t *testing.T,
+	tracePath string,
+	table string,
+	sessionCount int,
+	keyCount int,
+	txnCount int,
+	readsPerTxn int,
+	valueStep int,
+) {
+	kits := newTraceKits(t, sessionCount)
+	kits[0].MustExec(fmt.Sprintf("create table %s(id int primary key, v int, index idx_v(v))", table))
+	enableTrace(t, tracePath)
+
+	kits[0].MustExec("begin")
+	kits[0].MustExec(fmt.Sprintf("insert into %s values %s", table, valueList(1, keyCount, valueStep)))
+	kits[0].MustExec("commit")
+
+	values := map[int]int{}
+	for id := 1; id <= keyCount; id++ {
+		values[id] = id * valueStep
+	}
+
+	for txnIndex := 0; txnIndex < txnCount; txnIndex++ {
+		tk := kits[txnIndex%len(kits)]
+		writeID := ((txnIndex * 7) % keyCount) + 1
+
+		tk.MustExec("begin")
+		for offset := 0; offset < readsPerTxn; offset++ {
+			readID := ((txnIndex + offset*17) % keyCount) + 1
+			tk.MustQuery(fmt.Sprintf("select v from %s where id = %d", table, readID)).
+				Check(testkit.Rows(fmt.Sprintf("%d", values[readID])))
+		}
+		tk.MustQuery(fmt.Sprintf("select v from %s where id = %d", table, writeID)).
+			Check(testkit.Rows(fmt.Sprintf("%d", values[writeID])))
+		values[writeID] += (txnIndex % 7) + 1
+		tk.MustExec(fmt.Sprintf("update %s set v = %d where id = %d", table, values[writeID], writeID))
+		tk.MustExec("commit")
+	}
+
+	kits[len(kits)-1].MustExec("begin")
+	for id := 1; id <= keyCount; id++ {
+		kits[len(kits)-1].MustQuery(fmt.Sprintf("select v from %s where id = %d", table, id)).
+			Check(testkit.Rows(fmt.Sprintf("%d", values[id])))
+	}
+	kits[len(kits)-1].MustExec("commit")
+
+	assertTraceContains(t, tracePath, `source: "snapshot"`)
+}
+
+func generateManySessionMixedTrace(
+	t *testing.T,
+	tracePath string,
+	table string,
+	sessionCount int,
+	keyCount int,
+	txnCount int,
+	readsPerTxn int,
+	valueStep int,
+) {
+	kits := newTraceKits(t, sessionCount)
+	kits[0].MustExec(fmt.Sprintf("create table %s(id int primary key, v int, index idx_v(v))", table))
+	enableTrace(t, tracePath)
+
+	kits[0].MustExec("begin")
+	kits[0].MustExec(fmt.Sprintf("insert into %s values %s", table, valueList(1, keyCount, valueStep)))
+	kits[0].MustExec("commit")
+
+	values := map[int]int{}
+	for id := 1; id <= keyCount; id++ {
+		values[id] = id * valueStep
+	}
+	deleted := map[int]bool{}
+
+	for txnIndex := 0; txnIndex < txnCount; txnIndex++ {
+		tk := kits[txnIndex%len(kits)]
+		writeID := ((txnIndex * 11) % keyCount) + 1
+		missID := 20000 + txnIndex
+		pendingValues := copyIntMap(values)
+		pendingDeleted := copyBoolMap(deleted)
+
+		tk.MustExec("begin")
+		for offset := 0; offset < readsPerTxn; offset++ {
+			readID := ((txnIndex + offset*19) % keyCount) + 1
+			expectPointReadFromTable(tk, table, readID, values, deleted)
+		}
+		tk.MustQuery(fmt.Sprintf("select v from %s where id = %d", table, missID)).Check(testkit.Rows())
+
+		if txnIndex%23 == 7 {
+			tk.MustExec(fmt.Sprintf("insert into %s values (%d, %d)", table, missID, missID*2))
+		} else if txnIndex%13 == 5 {
+			tk.MustExec(fmt.Sprintf("delete from %s where id = %d", table, writeID))
+			pendingDeleted[writeID] = true
+		} else {
+			if deleted[writeID] {
+				pendingValues[writeID] = writeID * valueStep
+				tk.MustExec(fmt.Sprintf("insert into %s values (%d, %d)", table, writeID, pendingValues[writeID]))
+				pendingDeleted[writeID] = false
+			} else {
+				pendingValues[writeID] += (txnIndex % 11) + 1
+				tk.MustExec(fmt.Sprintf("update %s set v = %d where id = %d", table, pendingValues[writeID], writeID))
+			}
+		}
+
+		if txnIndex%31 == 12 {
+			tk.MustHavePlan(fmt.Sprintf("select id, v from %s use index(idx_v)", table), "UnionScan")
+			tk.MustQuery(fmt.Sprintf("select id, v from %s use index(idx_v) where v >= 0 order by id limit 10", table))
+		}
+
+		if txnIndex%37 == 17 {
+			tk.MustExec("rollback")
+		} else {
+			tk.MustExec("commit")
+			values = pendingValues
+			deleted = pendingDeleted
+		}
+	}
+
+	kits[len(kits)-1].MustExec("begin")
+	for id := 1; id <= keyCount; id++ {
+		expectPointReadFromTable(kits[len(kits)-1], table, id, values, deleted)
+	}
+	kits[len(kits)-1].MustExec("commit")
 
 	assertTraceContains(t, tracePath, "miss: true")
 	assertTraceContains(t, tracePath, "delete: true")

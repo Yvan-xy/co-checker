@@ -20,6 +20,9 @@ Generated fixtures:
 - `3s-35t-233e-large-mixed.yaml`
 - `3s-252t-2430e-very-large-roundrobin.yaml`
 - `3s-234t-1956e-very-large-mixed.yaml`
+- `20s-402t-3500e-many-session-roundrobin.yaml`
+- `30s-440t-3353e-many-session-mixed.yaml`
+- `100s-502t-3800e-many-session-roundrobin.yaml`
 
 By default the script expects the instrumented TiDB checkout at `../tidb` relative
 to this repo and writes YAML files into `./traces`.
