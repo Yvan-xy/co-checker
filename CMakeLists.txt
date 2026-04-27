@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.24)
+cmake_minimum_required(VERSION 3.28)
 
 project(checker VERSION 0.1.0 LANGUAGES CXX)
 
@@ -18,6 +18,9 @@ FetchContent_Declare(
   GIT_REPOSITORY https://github.com/jbeder/yaml-cpp.git
   GIT_TAG 0.8.0
 )
+
+# yaml-cpp 0.8.0 has not updated its declared policy floor for CMake 4.x.
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 FetchContent_MakeAvailable(yaml-cpp)
 
 add_library(checker

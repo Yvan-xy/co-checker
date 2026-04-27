@@ -5,8 +5,6 @@
 #include <string>
 #include <unordered_set>
 
-namespace common = common;
-
 namespace checker {
 
 namespace {

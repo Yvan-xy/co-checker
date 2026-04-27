@@ -11,8 +11,6 @@
 
 namespace {
 
-namespace common = common;
-
 int failures = 0;
 
 void check(bool condition, const char *expression, const char *file, int line) {

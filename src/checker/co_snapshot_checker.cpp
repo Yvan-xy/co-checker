@@ -3,8 +3,6 @@
 #include <algorithm>
 #include <string>
 
-namespace common = common;
-
 namespace checker {
 
 namespace {
