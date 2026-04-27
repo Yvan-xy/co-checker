@@ -1,3 +1,5 @@
+#include <chrono>
+#include <iomanip>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -75,6 +77,11 @@ bool parse_args(int argc, char **argv, CliConfig &config,
   return true;
 }
 
+double elapsed_ms(std::chrono::steady_clock::time_point start,
+                  std::chrono::steady_clock::time_point end) {
+  return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -144,9 +151,13 @@ int main(int argc, char **argv) {
         .index  = index.value(),
         .logger = &logger,
     };
+    const auto start = std::chrono::steady_clock::now();
     auto result = checker->run(context);
+    const auto end = std::chrono::steady_clock::now();
+
     std::cout << checker->name() << ": " << checker::to_string(result.status)
-              << '\n';
+              << " (" << std::fixed << std::setprecision(3)
+              << elapsed_ms(start, end) << " ms)\n";
     common::print_diagnostics(std::cout, result.diagnostics);
     if (result.status == checker::CheckStatus::Fail) {
       any_failed = true;
