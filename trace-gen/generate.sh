@@ -37,6 +37,9 @@ trace_paths=(
 	"${output_dir}/2s-4t-10e-mutual.yaml"
 	"${output_dir}/2s-10t-28e.yaml"
 	"${output_dir}/2s-12t-67e-mixed.yaml"
+	"${output_dir}/1s-overwrite-chain.yaml"
+	"${output_dir}/2s-delete-reinsert.yaml"
+	"${output_dir}/3s-fanout.yaml"
 )
 legacy_trace_paths=(
 	"${output_dir}/small-basic.yaml"
@@ -53,7 +56,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-cp "${script_dir}/checker_tracegen_test.go" "${tmp_test}"
+cp "${script_dir}/co_checker_tracegen_test.go" "${tmp_test}"
 
 (
 	cd "${tidb_repo}/pkg/session/test/txn"

@@ -27,6 +27,9 @@ func TestCoCheckerTraceGen(t *testing.T) {
 	runTraceScenario(t, outputDir, "2s-4t-10e-mutual", generateSmallTwoSessionMutualTrace)
 	runTraceScenario(t, outputDir, "2s-10t-28e", generate2Session10Transaction28EventTrace)
 	runTraceScenario(t, outputDir, "2s-12t-67e-mixed", generateMediumMixedTrace)
+	runTraceScenario(t, outputDir, "1s-overwrite-chain", generateOverwriteChainTrace)
+	runTraceScenario(t, outputDir, "2s-delete-reinsert", generateDeleteReinsertTrace)
+	runTraceScenario(t, outputDir, "3s-fanout", generateThreeSessionFanoutTrace)
 }
 
 func runTraceScenario(t *testing.T, outputDir, name string, workload func(t *testing.T, tracePath string)) {
@@ -262,6 +265,121 @@ func generateMediumMixedTrace(t *testing.T, tracePath string) {
 	assertTraceContains(t, tracePath, `source: "mem_buffer"`)
 	assertTraceContains(t, tracePath, "miss: true")
 	assertTraceContains(t, tracePath, "delete: true")
+}
+
+func generateOverwriteChainTrace(t *testing.T, tracePath string) {
+	tk1, _, _ := newTraceKit(t)
+	tk1.MustExec("create table overwrite_chain(id int primary key, v int, index idx_v(v))")
+	enableTrace(t, tracePath)
+
+	tk1.MustExec("begin")
+	tk1.MustExec("insert into overwrite_chain values (1, 10), (2, 20)")
+	tk1.MustExec("commit")
+
+	tk1.MustExec("begin")
+	tk1.MustQuery("select v from overwrite_chain where id = 1").Check(testkit.Rows("10"))
+	tk1.MustExec("update overwrite_chain set v = 11 where id = 1")
+	tk1.MustExec("update overwrite_chain set v = 12 where id = 1")
+	tk1.MustQuery("select v from overwrite_chain where id = 1").Check(testkit.Rows("12"))
+	tk1.MustExec("commit")
+
+	tk1.MustExec("begin")
+	tk1.MustQuery("select v from overwrite_chain where id = 1").Check(testkit.Rows("12"))
+	tk1.MustQuery("select v from overwrite_chain where id = 2").Check(testkit.Rows("20"))
+	tk1.MustExec("update overwrite_chain set v = 21 where id = 2")
+	tk1.MustExec("commit")
+
+	tk1.MustExec("begin")
+	tk1.MustQuery("select v from overwrite_chain where id = 1").Check(testkit.Rows("12"))
+	tk1.MustQuery("select v from overwrite_chain where id = 2").Check(testkit.Rows("21"))
+	tk1.MustExec("commit")
+
+	assertTraceContains(t, tracePath, `status: "committed"`)
+}
+
+func generateDeleteReinsertTrace(t *testing.T, tracePath string) {
+	tk1, tk2, _ := newTraceKit(t)
+	tk1.MustExec("create table delete_reinsert(id int primary key, v int)")
+	enableTrace(t, tracePath)
+
+	tk1.MustExec("begin")
+	tk1.MustExec("insert into delete_reinsert values (1, 10)")
+	tk1.MustExec("commit")
+
+	tk1.MustExec("begin")
+	tk1.MustExec("delete from delete_reinsert where id = 1")
+	tk1.MustExec("commit")
+
+	tk2.MustExec("begin")
+	tk2.MustQuery("select v from delete_reinsert where id = 1").Check(testkit.Rows())
+	tk2.MustExec("insert into delete_reinsert values (1, 30)")
+	tk2.MustExec("commit")
+
+	tk1.MustExec("begin")
+	tk1.MustQuery("select v from delete_reinsert where id = 1").Check(testkit.Rows("30"))
+	tk1.MustExec("delete from delete_reinsert where id = 1")
+	tk1.MustExec("insert into delete_reinsert values (1, 40)")
+	tk1.MustExec("commit")
+
+	tk2.MustExec("begin")
+	tk2.MustQuery("select v from delete_reinsert where id = 1").Check(testkit.Rows("40"))
+	tk2.MustExec("commit")
+
+	assertTraceContains(t, tracePath, "delete: true")
+	assertTraceContains(t, tracePath, "miss: true")
+}
+
+func generateThreeSessionFanoutTrace(t *testing.T, tracePath string) {
+	tk1, tk2, tk3 := newTraceKit(t)
+	tk1.MustExec("create table fanout_vars(id int primary key, v int)")
+	enableTrace(t, tracePath)
+
+	tk1.MustExec("begin")
+	tk1.MustExec("insert into fanout_vars values (1, 10), (2, 20), (3, 30)")
+	tk1.MustExec("commit")
+
+	session1 := tk1.Session().GetSessionVars().ConnectionID
+	session2 := tk2.Session().GetSessionVars().ConnectionID
+	session3 := tk3.Session().GetSessionVars().ConnectionID
+	require.NotZero(t, session1)
+	require.NotZero(t, session2)
+	require.NotZero(t, session3)
+	require.NotEqual(t, session1, session2)
+	require.NotEqual(t, session1, session3)
+	require.NotEqual(t, session2, session3)
+
+	tk1.MustExec("begin")
+	tk2.MustExec("begin")
+	tk3.MustExec("begin")
+
+	tk1.MustQuery("select v from fanout_vars where id = 1").Check(testkit.Rows("10"))
+	tk1.MustQuery("select v from fanout_vars where id = 2").Check(testkit.Rows("20"))
+	tk1.MustQuery("select v from fanout_vars where id = 3").Check(testkit.Rows("30"))
+	tk2.MustQuery("select v from fanout_vars where id = 1").Check(testkit.Rows("10"))
+	tk2.MustQuery("select v from fanout_vars where id = 2").Check(testkit.Rows("20"))
+	tk2.MustQuery("select v from fanout_vars where id = 3").Check(testkit.Rows("30"))
+	tk3.MustQuery("select v from fanout_vars where id = 1").Check(testkit.Rows("10"))
+	tk3.MustQuery("select v from fanout_vars where id = 2").Check(testkit.Rows("20"))
+	tk3.MustQuery("select v from fanout_vars where id = 3").Check(testkit.Rows("30"))
+
+	tk1.MustExec("update fanout_vars set v = 11 where id = 1")
+	tk2.MustExec("update fanout_vars set v = 21 where id = 2")
+	tk3.MustExec("update fanout_vars set v = 31 where id = 3")
+
+	tk1.MustExec("commit")
+	tk2.MustExec("commit")
+	tk3.MustExec("commit")
+
+	tk1.MustExec("begin")
+	tk1.MustQuery("select v from fanout_vars where id = 1").Check(testkit.Rows("11"))
+	tk1.MustQuery("select v from fanout_vars where id = 2").Check(testkit.Rows("21"))
+	tk1.MustQuery("select v from fanout_vars where id = 3").Check(testkit.Rows("31"))
+	tk1.MustExec("commit")
+
+	assertTraceContains(t, tracePath, fmt.Sprintf("session_id: %d", session1))
+	assertTraceContains(t, tracePath, fmt.Sprintf("session_id: %d", session2))
+	assertTraceContains(t, tracePath, fmt.Sprintf("session_id: %d", session3))
+	assertTraceContains(t, tracePath, `source: "snapshot"`)
 }
 
 func valueList(startID, count, step int) string {

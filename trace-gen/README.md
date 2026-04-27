@@ -13,6 +13,9 @@ Generated fixtures:
 - `2s-4t-10e-mutual.yaml`
 - `2s-10t-28e.yaml`
 - `2s-12t-67e-mixed.yaml`
+- `1s-overwrite-chain.yaml`
+- `2s-delete-reinsert.yaml`
+- `3s-fanout.yaml`
 
 By default the script expects the instrumented TiDB checkout at `../tidb` relative
 to this repo and writes YAML files into `./traces`.
