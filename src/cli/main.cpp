@@ -17,18 +17,27 @@ struct CliConfig {
   bool help = false;
 };
 
-void print_usage(std::ostream &os) {
-  os << "usage: co-checker [--checker none|co-si-basic|co-si-so-only|all] "
-        "[--dump "
-        "parsed|versions|all] "
-        "<trace.yaml>\n";
+void print_checker_choices(std::ostream &os,
+                           const checker::CheckerRegistry &registry) {
+  os << "none";
+  for (const auto name : registry.names()) {
+    os << '|' << name;
+  }
+  os << "|all";
 }
 
-bool parse_args(int argc, char **argv, CliConfig &config) {
+void print_usage(std::ostream &os, const checker::CheckerRegistry &registry) {
+  os << "usage: co-checker [--checker ";
+  print_checker_choices(os, registry);
+  os << "] [--dump parsed|versions|all] <trace.yaml>\n";
+}
+
+bool parse_args(int argc, char **argv, CliConfig &config,
+                const checker::CheckerRegistry &registry) {
   for (int i = 1; i < argc; ++i) {
     const std::string_view arg(argv[i]);
     if (arg == "-h" || arg == "--help") {
-      print_usage(std::cout);
+      print_usage(std::cout, registry);
       config.help = true;
       return true;
     }
@@ -60,7 +69,7 @@ bool parse_args(int argc, char **argv, CliConfig &config) {
   }
 
   if (config.trace_path.empty()) {
-    print_usage(std::cerr);
+    print_usage(std::cerr, registry);
     return false;
   }
   return true;
@@ -69,8 +78,10 @@ bool parse_args(int argc, char **argv, CliConfig &config) {
 } // namespace
 
 int main(int argc, char **argv) {
+  auto registry = checker::make_default_checker_registry();
+
   CliConfig config;
-  if (!parse_args(argc, argv, config)) {
+  if (!parse_args(argc, argv, config, registry)) {
     return 3;
   }
   if (config.help) {
@@ -103,7 +114,6 @@ int main(int argc, char **argv) {
     return 3;
   }
 
-  auto registry = checker::make_default_checker_registry();
   std::vector<const checker::Checker *> selected;
   if (config.checker == "none") {
     if (config.dump.empty()) {
@@ -120,6 +130,9 @@ int main(int argc, char **argv) {
     selected.push_back(checker);
   } else {
     std::cerr << "unknown checker: " << config.checker << '\n';
+    std::cerr << "available checkers: ";
+    print_checker_choices(std::cerr, registry);
+    std::cerr << '\n';
     return 3;
   }
 
