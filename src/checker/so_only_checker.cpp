@@ -2,10 +2,11 @@
 
 #include <algorithm>
 #include <cassert>
+#include <memory>
+#include <optional>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
-
-#include <iostream>
 
 namespace checker {
 
@@ -20,21 +21,42 @@ std::optional<TxnId> getSOMax(const SnapshotSOContext &ctx,
   return it->second;
 }
 
-void updateCtx(SnapshotSOContext &ctx, const Transaction &txn,
-               Snapshot &snapshot) {
+std::optional<Value> getFromSnapshot(const SnapshotDeltaPtr &snapshot,
+                                     const Key &key) {
+  for (auto node = snapshot; node != nullptr; node = node->parent) {
+    const auto it = node->writes.find(key);
+    if (it != node->writes.end()) {
+      return it->second;
+    }
+  }
+  return std::nullopt;
+}
+
+SnapshotDeltaPtr updateCtx(SnapshotSOContext &ctx, const Transaction &txn,
+                           const SnapshotDeltaPtr &latest) {
+  std::unordered_map<Key, std::optional<Value>, HexValueHash> writes;
+  writes.reserve(txn.event_ids.size());
 
   for (const auto &eid : txn.event_ids) {
     const auto &event = ctx.trace.events[eid];
     if (isWrite(event)) {
       if (event.is_delete) {
-        snapshot.erase(event.key);
+        writes[event.key] = std::nullopt;
       } else if (!event.is_miss && event.value.has_value()) {
-        snapshot.set(event.key, *(event.value));
+        writes[event.key] = event.value;
       }
     }
   }
-  ctx.session_snapshots[txn.session_id].copy_from(snapshot);
+
+  auto next = latest;
+  if (!writes.empty()) {
+    next = std::make_shared<SnapshotDelta>(
+        SnapshotDelta{.parent = latest, .writes = std::move(writes)});
+  }
+
+  ctx.session_snapshots[txn.session_id] = next;
   ctx.latest_txns_by_session[txn.session_id] = txn.id;
+  return next;
 }
 
 } // namespace
@@ -53,24 +75,25 @@ std::string_view SnapshotSOChecker::name() const { return "co-si-so-only"; }
 CheckResult SnapshotSOChecker::run(const CheckerContext &ctx_) const {
   CheckResult result;
   SnapshotSOContext ctx(std::move(ctx_));
-  Snapshot latest;
+  SnapshotDeltaPtr latest;
   for (const auto &txn : ctx.trace.transactions) {
     // get the snapshot of t_max
     auto t_max = getSOMax(ctx, txn.session_id);
-    Snapshot snapshot;
+    SnapshotDeltaPtr snapshot;
     if (t_max.has_value()) {
-      // print_snapshot_map(std::cout, ctx.session_snapshots);
       auto it = ctx.session_snapshots.find(ctx.trace.getTxn(*t_max).session_id);
       assert(it != ctx.session_snapshots.end());
       snapshot = it->second;
     } else {
-      updateCtx(ctx, txn, latest);
+      latest = updateCtx(ctx, txn, latest);
       continue;
     }
 
     // build wrong_keys set
     std::unordered_set<Key, HexValueHash> wrong_keys;
+    wrong_keys.reserve(txn.event_ids.size());
     SnapshotOpt reads;
+    reads.data.reserve(txn.event_ids.size());
     for (const auto &eid : txn.event_ids) {
       const auto &event = ctx.trace.events[eid];
       if (isRead(event)) {
@@ -81,13 +104,14 @@ CheckResult SnapshotSOChecker::run(const CheckerContext &ctx_) const {
           result.diagnostics.push_back(diagnostic);
         }
         reads.set(event.key, event.value);
-        bool is_wrong = false;
-        is_wrong |= event.is_miss && snapshot.get(event.key).has_value();
-        is_wrong |= !event.is_miss && !snapshot.get(event.key).has_value();
-        is_wrong |= !event.is_miss && snapshot.get(event.key).has_value() &&
-                    (snapshot.get(event.key) != event.value);
-        if (is_wrong)
+        const auto expected = getFromSnapshot(snapshot, event.key);
+        const bool is_wrong =
+            (event.is_miss && expected.has_value()) ||
+            (!event.is_miss &&
+             (!expected.has_value() || expected != event.value));
+        if (is_wrong) {
           wrong_keys.insert(event.key);
+        }
       }
     }
 
@@ -129,7 +153,7 @@ CheckResult SnapshotSOChecker::run(const CheckerContext &ctx_) const {
       }
     }
 
-    updateCtx(ctx, txn, latest);
+    latest = updateCtx(ctx, txn, latest);
   }
 
   result.status =

@@ -1,5 +1,9 @@
 #pragma once
 
+#include <memory>
+#include <optional>
+#include <unordered_map>
+
 #include "checker/checker.h"
 #include "common/trace/trace_index.h"
 
@@ -7,8 +11,15 @@ namespace checker {
 
 using namespace common;
 
+struct SnapshotDelta {
+  std::shared_ptr<const SnapshotDelta> parent;
+  std::unordered_map<Key, std::optional<Value>, HexValueHash> writes;
+};
+
+using SnapshotDeltaPtr = std::shared_ptr<const SnapshotDelta>;
+
 struct SnapshotSOContext final : public CheckerContext {
-  SnapshotMap<SessionId> session_snapshots;
+  std::unordered_map<SessionId, SnapshotDeltaPtr> session_snapshots;
   std::unordered_map<SessionId, TxnId> latest_txns_by_session;
 
   template <typename T>
