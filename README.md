@@ -32,3 +32,21 @@ Run the prototype snapshot checker explicitly:
 ```bash
 build/co-checker --checker co-si traces/2s-4t-10e-mutual.yaml
 ```
+
+## Trace Generation
+
+The `trace-gen/` directory contains the TiDB-backed trace fixture generator and
+preprocessor. It runs instrumented TiDB `testkit` workloads, writes raw YAML
+transaction traces, filters them into checker-ready committed traces, normalizes
+session IDs, and renames files using the final
+`<sessions>s-<transactions>t-<events>e[-suffix].yaml` counts.
+
+Regenerate the trace fixtures with:
+
+```bash
+./trace-gen/generate.sh
+```
+
+By default this expects the instrumented TiDB checkout at `../tidb` and writes
+fixtures into `./traces`. See `trace-gen/README.md` for path overrides and
+manual preprocessing commands.

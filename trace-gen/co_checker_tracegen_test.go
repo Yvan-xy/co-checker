@@ -30,6 +30,10 @@ func TestCoCheckerTraceGen(t *testing.T) {
 	runTraceScenario(t, outputDir, "1s-overwrite-chain", generateOverwriteChainTrace)
 	runTraceScenario(t, outputDir, "2s-delete-reinsert", generateDeleteReinsertTrace)
 	runTraceScenario(t, outputDir, "3s-fanout", generateThreeSessionFanoutTrace)
+	runTraceScenario(t, outputDir, "3s-large-roundrobin", generate3Session30Transaction120EventTrace)
+	runTraceScenario(t, outputDir, "3s-large-mixed", generate3Session40Transaction200EventMixedTrace)
+	runTraceScenario(t, outputDir, "3s-very-large-roundrobin", generate3SessionVeryLargeRoundRobinTrace)
+	runTraceScenario(t, outputDir, "3s-very-large-mixed", generate3SessionVeryLargeMixedTrace)
 }
 
 func runTraceScenario(t *testing.T, outputDir, name string, workload func(t *testing.T, tracePath string)) {
@@ -380,6 +384,268 @@ func generateThreeSessionFanoutTrace(t *testing.T, tracePath string) {
 	assertTraceContains(t, tracePath, fmt.Sprintf("session_id: %d", session2))
 	assertTraceContains(t, tracePath, fmt.Sprintf("session_id: %d", session3))
 	assertTraceContains(t, tracePath, `source: "snapshot"`)
+}
+
+func generate3Session30Transaction120EventTrace(t *testing.T, tracePath string) {
+	tk1, tk2, tk3 := newTraceKit(t)
+	kits := []*testkit.TestKit{tk1, tk2, tk3}
+	tk1.MustExec("create table roundrobin_vars(id int primary key, v int, index idx_v(v))")
+	enableTrace(t, tracePath)
+
+	tk1.MustExec("begin")
+	tk1.MustExec("insert into roundrobin_vars values " + valueList(1, 6, 10))
+	tk1.MustExec("commit")
+
+	values := map[int]int{}
+	for id := 1; id <= 6; id++ {
+		values[id] = id * 10
+	}
+
+	for txnIndex := 0; txnIndex < 28; txnIndex++ {
+		tk := kits[txnIndex%len(kits)]
+		writeID := (txnIndex % 6) + 1
+		readA := ((txnIndex + 1) % 6) + 1
+		readB := ((txnIndex + 3) % 6) + 1
+
+		tk.MustExec("begin")
+		tk.MustQuery(fmt.Sprintf("select v from roundrobin_vars where id = %d", readA)).
+			Check(testkit.Rows(fmt.Sprintf("%d", values[readA])))
+		tk.MustQuery(fmt.Sprintf("select v from roundrobin_vars where id = %d", readB)).
+			Check(testkit.Rows(fmt.Sprintf("%d", values[readB])))
+		tk.MustQuery(fmt.Sprintf("select v from roundrobin_vars where id = %d", writeID)).
+			Check(testkit.Rows(fmt.Sprintf("%d", values[writeID])))
+		tk.MustExec(fmt.Sprintf("update roundrobin_vars set v = v + 1 where id = %d", writeID))
+		tk.MustExec("commit")
+		values[writeID]++
+	}
+
+	tk3.MustExec("begin")
+	for id := 1; id <= 6; id++ {
+		tk3.MustQuery(fmt.Sprintf("select v from roundrobin_vars where id = %d", id)).
+			Check(testkit.Rows(fmt.Sprintf("%d", values[id])))
+	}
+	tk3.MustExec("commit")
+
+	assertTraceContains(t, tracePath, `source: "snapshot"`)
+}
+
+func generate3Session40Transaction200EventMixedTrace(t *testing.T, tracePath string) {
+	tk1, tk2, tk3 := newTraceKit(t)
+	kits := []*testkit.TestKit{tk1, tk2, tk3}
+	tk1.MustExec("create table large_mixed(id int primary key, v int, index idx_v(v))")
+	enableTrace(t, tracePath)
+
+	tk1.MustExec("begin")
+	tk1.MustExec("insert into large_mixed values " + valueList(1, 20, 5))
+	tk1.MustExec("commit")
+
+	values := map[int]int{}
+	for id := 1; id <= 20; id++ {
+		values[id] = id * 5
+	}
+	deleted := map[int]bool{}
+
+	for txnIndex := 0; txnIndex < 36; txnIndex++ {
+		tk := kits[txnIndex%len(kits)]
+		readA := (txnIndex % 20) + 1
+		readB := ((txnIndex + 7) % 20) + 1
+		writeID := ((txnIndex + 3) % 20) + 1
+		missID := 1000 + txnIndex
+		pendingValues := copyIntMap(values)
+		pendingDeleted := copyBoolMap(deleted)
+
+		tk.MustExec("begin")
+		expectPointRead(tk, readA, values, deleted)
+		expectPointRead(tk, readB, values, deleted)
+		tk.MustQuery(fmt.Sprintf("select v from large_mixed where id = %d", missID)).Check(testkit.Rows())
+
+		if txnIndex%9 == 4 {
+			tk.MustExec(fmt.Sprintf("insert into large_mixed values (%d, %d)", missID, missID*2))
+		} else if txnIndex%8 == 3 {
+			tk.MustExec(fmt.Sprintf("delete from large_mixed where id = %d", writeID))
+			pendingDeleted[writeID] = true
+		} else {
+			if deleted[writeID] {
+				pendingValues[writeID] = writeID * 5
+				tk.MustExec(fmt.Sprintf("insert into large_mixed values (%d, %d)", writeID, pendingValues[writeID]))
+				pendingDeleted[writeID] = false
+			} else {
+				pendingValues[writeID] += 2
+				tk.MustExec(fmt.Sprintf("update large_mixed set v = %d where id = %d", pendingValues[writeID], writeID))
+			}
+		}
+
+		if txnIndex%10 == 6 {
+			tk.MustHavePlan("select id, v from large_mixed use index(idx_v)", "UnionScan")
+			tk.MustQuery("select id, v from large_mixed use index(idx_v) where v >= 0 order by id limit 5")
+		}
+
+		if txnIndex%13 == 8 {
+			tk.MustExec("rollback")
+		} else {
+			tk.MustExec("commit")
+			values = pendingValues
+			deleted = pendingDeleted
+		}
+	}
+
+	tk2.MustExec("begin")
+	for id := 1; id <= 5; id++ {
+		expectPointRead(tk2, id, values, deleted)
+	}
+	tk2.MustExec("commit")
+
+	assertTraceContains(t, tracePath, "miss: true")
+	assertTraceContains(t, tracePath, "delete: true")
+	assertTraceContains(t, tracePath, `status: "rolled_back"`)
+}
+
+func generate3SessionVeryLargeRoundRobinTrace(t *testing.T, tracePath string) {
+	tk1, tk2, tk3 := newTraceKit(t)
+	kits := []*testkit.TestKit{tk1, tk2, tk3}
+	tk1.MustExec("create table very_large_roundrobin(id int primary key, v int, index idx_v(v))")
+	enableTrace(t, tracePath)
+
+	const keyCount = 60
+	const txnCount = 250
+
+	tk1.MustExec("begin")
+	tk1.MustExec("insert into very_large_roundrobin values " + valueList(1, keyCount, 10))
+	tk1.MustExec("commit")
+
+	values := map[int]int{}
+	for id := 1; id <= keyCount; id++ {
+		values[id] = id * 10
+	}
+
+	for txnIndex := 0; txnIndex < txnCount; txnIndex++ {
+		tk := kits[txnIndex%len(kits)]
+		writeID := (txnIndex % keyCount) + 1
+
+		tk.MustExec("begin")
+		for offset := 0; offset < 5; offset++ {
+			readID := ((txnIndex + offset*11) % keyCount) + 1
+			tk.MustQuery(fmt.Sprintf("select v from very_large_roundrobin where id = %d", readID)).
+				Check(testkit.Rows(fmt.Sprintf("%d", values[readID])))
+		}
+		tk.MustQuery(fmt.Sprintf("select v from very_large_roundrobin where id = %d", writeID)).
+			Check(testkit.Rows(fmt.Sprintf("%d", values[writeID])))
+		values[writeID] += (txnIndex % 5) + 1
+		tk.MustExec(fmt.Sprintf("update very_large_roundrobin set v = %d where id = %d", values[writeID], writeID))
+		tk.MustExec("commit")
+	}
+
+	tk3.MustExec("begin")
+	for id := 1; id <= keyCount; id++ {
+		tk3.MustQuery(fmt.Sprintf("select v from very_large_roundrobin where id = %d", id)).
+			Check(testkit.Rows(fmt.Sprintf("%d", values[id])))
+	}
+	tk3.MustExec("commit")
+
+	assertTraceContains(t, tracePath, `source: "snapshot"`)
+}
+
+func generate3SessionVeryLargeMixedTrace(t *testing.T, tracePath string) {
+	tk1, tk2, tk3 := newTraceKit(t)
+	kits := []*testkit.TestKit{tk1, tk2, tk3}
+	tk1.MustExec("create table very_large_mixed(id int primary key, v int, index idx_v(v))")
+	enableTrace(t, tracePath)
+
+	const keyCount = 50
+	const txnCount = 240
+
+	tk1.MustExec("begin")
+	tk1.MustExec("insert into very_large_mixed values " + valueList(1, keyCount, 7))
+	tk1.MustExec("commit")
+
+	values := map[int]int{}
+	for id := 1; id <= keyCount; id++ {
+		values[id] = id * 7
+	}
+	deleted := map[int]bool{}
+
+	for txnIndex := 0; txnIndex < txnCount; txnIndex++ {
+		tk := kits[txnIndex%len(kits)]
+		writeID := ((txnIndex * 7) % keyCount) + 1
+		missID := 10000 + txnIndex
+		pendingValues := copyIntMap(values)
+		pendingDeleted := copyBoolMap(deleted)
+
+		tk.MustExec("begin")
+		for offset := 0; offset < 4; offset++ {
+			readID := ((txnIndex + offset*13) % keyCount) + 1
+			expectPointReadFromTable(tk, "very_large_mixed", readID, values, deleted)
+		}
+		tk.MustQuery(fmt.Sprintf("select v from very_large_mixed where id = %d", missID)).Check(testkit.Rows())
+
+		if txnIndex%17 == 5 {
+			tk.MustExec(fmt.Sprintf("insert into very_large_mixed values (%d, %d)", missID, missID*3))
+		} else if txnIndex%11 == 4 {
+			tk.MustExec(fmt.Sprintf("delete from very_large_mixed where id = %d", writeID))
+			pendingDeleted[writeID] = true
+		} else {
+			if deleted[writeID] {
+				pendingValues[writeID] = writeID * 7
+				tk.MustExec(fmt.Sprintf("insert into very_large_mixed values (%d, %d)", writeID, pendingValues[writeID]))
+				pendingDeleted[writeID] = false
+			} else {
+				pendingValues[writeID] += (txnIndex % 9) + 1
+				tk.MustExec(fmt.Sprintf("update very_large_mixed set v = %d where id = %d", pendingValues[writeID], writeID))
+			}
+		}
+
+		if txnIndex%20 == 9 {
+			tk.MustHavePlan("select id, v from very_large_mixed use index(idx_v)", "UnionScan")
+			tk.MustQuery("select id, v from very_large_mixed use index(idx_v) where v >= 0 order by id limit 10")
+		}
+
+		if txnIndex%29 == 13 {
+			tk.MustExec("rollback")
+		} else {
+			tk.MustExec("commit")
+			values = pendingValues
+			deleted = pendingDeleted
+		}
+	}
+
+	tk2.MustExec("begin")
+	for id := 1; id <= keyCount; id++ {
+		expectPointReadFromTable(tk2, "very_large_mixed", id, values, deleted)
+	}
+	tk2.MustExec("commit")
+
+	assertTraceContains(t, tracePath, "miss: true")
+	assertTraceContains(t, tracePath, "delete: true")
+	assertTraceContains(t, tracePath, `status: "rolled_back"`)
+}
+
+func expectPointRead(tk *testkit.TestKit, id int, values map[int]int, deleted map[int]bool) {
+	expectPointReadFromTable(tk, "large_mixed", id, values, deleted)
+}
+
+func expectPointReadFromTable(tk *testkit.TestKit, table string, id int, values map[int]int, deleted map[int]bool) {
+	if deleted[id] {
+		tk.MustQuery(fmt.Sprintf("select v from %s where id = %d", table, id)).Check(testkit.Rows())
+		return
+	}
+	tk.MustQuery(fmt.Sprintf("select v from %s where id = %d", table, id)).
+		Check(testkit.Rows(fmt.Sprintf("%d", values[id])))
+}
+
+func copyIntMap(input map[int]int) map[int]int {
+	output := make(map[int]int, len(input))
+	for key, value := range input {
+		output[key] = value
+	}
+	return output
+}
+
+func copyBoolMap(input map[int]bool) map[int]bool {
+	output := make(map[int]bool, len(input))
+	for key, value := range input {
+		output[key] = value
+	}
+	return output
 }
 
 func valueList(startID, count, step int) string {

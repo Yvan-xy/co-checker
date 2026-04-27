@@ -31,6 +31,7 @@ if [[ "${output_dir}" != /* ]]; then
 fi
 
 mkdir -p "${output_dir}"
+shopt -s nullglob
 trace_paths=(
 	"${output_dir}/1s-3t-7e-basic.yaml"
 	"${output_dir}/1s-3t-5e-delete-miss.yaml"
@@ -40,12 +41,24 @@ trace_paths=(
 	"${output_dir}/1s-overwrite-chain.yaml"
 	"${output_dir}/2s-delete-reinsert.yaml"
 	"${output_dir}/3s-fanout.yaml"
+	"${output_dir}/3s-large-roundrobin.yaml"
+	"${output_dir}/3s-large-mixed.yaml"
+	"${output_dir}/3s-very-large-roundrobin.yaml"
+	"${output_dir}/3s-very-large-mixed.yaml"
 )
 legacy_trace_paths=(
 	"${output_dir}/small-basic.yaml"
 	"${output_dir}/small-delete-miss.yaml"
 	"${output_dir}/small-two-session-mutual.yaml"
 	"${output_dir}/medium-mixed.yaml"
+	"${output_dir}"/*-overwrite-chain.yaml
+	"${output_dir}"/*-delete-reinsert.yaml
+	"${output_dir}"/*-fanout.yaml
+	"${output_dir}"/*-mixed.yaml
+	"${output_dir}"/*-large-roundrobin.yaml
+	"${output_dir}"/*-large-mixed.yaml
+	"${output_dir}"/*-very-large-roundrobin.yaml
+	"${output_dir}"/*-very-large-mixed.yaml
 )
 rm -f "${trace_paths[@]}" "${legacy_trace_paths[@]}"
 
@@ -65,12 +78,14 @@ cp "${script_dir}/co_checker_tracegen_test.go" "${tmp_test}"
 )
 
 printf '\nPreprocessing traces:\n'
+generated_trace_paths=()
 for path in "${trace_paths[@]}"; do
-	python3 "${script_dir}/preprocess_trace.py" --in-place "${path}"
-	printf '  %s\n' "${path}"
+	preprocessed_path=$(python3 "${script_dir}/preprocess_trace.py" --in-place --rename "${path}")
+	generated_trace_paths+=("${preprocessed_path}")
+	printf '  %s -> %s\n' "${path}" "${preprocessed_path}"
 done
 
 printf '\nGenerated preprocessed traces:\n'
-for path in "${trace_paths[@]}"; do
+for path in "${generated_trace_paths[@]}"; do
 	printf '  %s\n' "${path}"
 done

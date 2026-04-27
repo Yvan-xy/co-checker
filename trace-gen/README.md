@@ -12,10 +12,14 @@ Generated fixtures:
 - `1s-3t-5e-delete-miss.yaml`
 - `2s-4t-10e-mutual.yaml`
 - `2s-10t-28e.yaml`
-- `2s-12t-67e-mixed.yaml`
-- `1s-overwrite-chain.yaml`
-- `2s-delete-reinsert.yaml`
-- `3s-fanout.yaml`
+- `2s-12t-56e-mixed.yaml`
+- `1s-4t-18e-overwrite-chain.yaml`
+- `2s-5t-8e-delete-reinsert.yaml`
+- `3s-5t-18e-fanout.yaml`
+- `3s-30t-186e-large-roundrobin.yaml`
+- `3s-35t-233e-large-mixed.yaml`
+- `3s-252t-2430e-very-large-roundrobin.yaml`
+- `3s-234t-1956e-very-large-mixed.yaml`
 
 By default the script expects the instrumented TiDB checkout at `../tidb` relative
 to this repo and writes YAML files into `./traces`.
@@ -26,12 +30,15 @@ Override paths when needed:
 TIDB_REPO=/path/to/tidb ./trace-gen/generate.sh /path/to/output/traces
 ```
 
-The generator temporarily copies `checker_tracegen_test.go` into TiDB's
+The generator temporarily copies `co_checker_tracegen_test.go` into TiDB's
 `pkg/session/test/txn` package, runs real TiDB `testkit` workloads with
 `TIDB_TXN_TRACE_ENABLE=1`, removes the temporary test file on exit, and
 preprocesses the generated traces in place so the final YAML files contain only
 committed transactions sorted by commit timestamp. The preprocessor also
-normalizes TiDB connection IDs to per-file `session_id` values starting at `1`.
+normalizes TiDB connection IDs to per-file `session_id` values starting at `1`
+and renames generated files to
+`<sessions>s-<transactions>t-<events>e[-suffix].yaml` based on the
+checker-ready trace contents.
 
 ## Preprocess a Trace
 
@@ -40,6 +47,13 @@ transactions and sort the remaining transactions by commit order:
 
 ```bash
 python3 ./trace-gen/preprocess_trace.py traces/1s-3t-7e-basic.yaml -o traces/1s-3t-7e-basic.committed.yaml
+```
+
+Add `--rename` with `--in-place` or `--output` to derive the output filename
+from the postprocessed trace counts:
+
+```bash
+python3 ./trace-gen/preprocess_trace.py --in-place --rename traces/3s-large-mixed.yaml
 ```
 
 The preprocessor reads the YAML document stream emitted by TiDB, keeps only

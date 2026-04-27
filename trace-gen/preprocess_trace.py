@@ -9,6 +9,7 @@ transactions and orders them by commit timestamp.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -25,6 +26,8 @@ except ImportError as exc:  # pragma: no cover - exercised only without PyYAML.
 
 COMMITTED_STATUS = "committed"
 SESSION_ID_BASE = 1
+TRACE_NAME_RE = re.compile(r"^\d+s-\d+t-\d+e(?:-(?P<suffix>.+))?$")
+SESSION_PREFIX_RE = re.compile(r"^\d+s-(?P<suffix>.+)$")
 
 
 class TracePreprocessError(ValueError):
@@ -43,6 +46,13 @@ class CommittedTransaction:
     original_index: int
     commit_ts: int
     document: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class TraceStats:
+    sessions: int
+    transactions: int
+    events: int
 
 
 def load_trace(path: Path) -> list[dict[str, Any]]:
@@ -130,20 +140,52 @@ def write_trace(documents: Iterable[dict[str, Any]], output_file: TextIO) -> Non
     )
 
 
-def preprocess_file(input_path: Path, output_path: Path | None, in_place: bool) -> None:
+def preprocess_file(
+    input_path: Path,
+    output_path: Path | None,
+    in_place: bool,
+    rename: bool = False,
+) -> Path | None:
     """Preprocess one trace file."""
     documents = preprocess_documents(load_trace(input_path))
 
     if in_place:
         _write_in_place(input_path, documents)
-        return
+        if rename:
+            return _rename_with_trace_stats(input_path, documents)
+        return input_path
 
     if output_path is None:
         write_trace(documents, sys.stdout)
-        return
+        return None
 
+    final_output_path = (
+        _path_with_trace_stats(output_path, documents) if rename else output_path
+    )
     with output_path.open("w", encoding="utf-8") as output_file:
         write_trace(documents, output_file)
+    if final_output_path != output_path:
+        output_path.replace(final_output_path)
+    return final_output_path
+
+
+def trace_stats(documents: Iterable[dict[str, Any]]) -> TraceStats:
+    documents = list(documents)
+    sessions = {
+        _parse_session_id(document["session_id"])
+        for document in documents
+        if "session_id" in document
+    }
+    events = 0
+    for document in documents:
+        document_events = document.get("events")
+        if isinstance(document_events, list):
+            events += len(document_events)
+    return TraceStats(
+        sessions=len(sessions),
+        transactions=len(documents),
+        events=events,
+    )
 
 
 def _committed_commit_ts(document: dict[str, Any], doc_number: int) -> int | None:
@@ -245,6 +287,35 @@ def _write_in_place(path: Path, documents: list[dict[str, Any]]) -> None:
     temp_path.replace(path)
 
 
+def _rename_with_trace_stats(path: Path, documents: list[dict[str, Any]]) -> Path:
+    renamed_path = _path_with_trace_stats(path, documents)
+    if renamed_path == path:
+        return path
+    path.replace(renamed_path)
+    return renamed_path
+
+
+def _path_with_trace_stats(path: Path, documents: list[dict[str, Any]]) -> Path:
+    stats = trace_stats(documents)
+    suffix = _trace_name_suffix(path.stem)
+    stem = f"{stats.sessions}s-{stats.transactions}t-{stats.events}e"
+    if suffix:
+        stem = f"{stem}-{suffix}"
+    return path.with_name(f"{stem}{path.suffix}")
+
+
+def _trace_name_suffix(stem: str) -> str:
+    match = TRACE_NAME_RE.fullmatch(stem)
+    if match is not None:
+        return match.group("suffix") or ""
+
+    match = SESSION_PREFIX_RE.fullmatch(stem)
+    if match is not None:
+        return match.group("suffix")
+
+    return stem
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -264,17 +335,29 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="overwrite the input trace with the preprocessed result",
     )
+    parser.add_argument(
+        "--rename",
+        action="store_true",
+        help=(
+            "rename the output to <sessions>s-<transactions>t-<events>e[-suffix].yaml "
+            "using the preprocessed trace contents"
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.in_place and args.output is not None:
         parser.error("--in-place cannot be combined with --output")
+    if args.rename and not args.in_place and args.output is None:
+        parser.error("--rename requires --in-place or --output")
     return args
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     try:
-        preprocess_file(args.input, args.output, args.in_place)
+        output_path = preprocess_file(args.input, args.output, args.in_place, args.rename)
+        if args.rename and output_path is not None:
+            print(output_path)
     except OSError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

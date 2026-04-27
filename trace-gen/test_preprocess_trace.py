@@ -194,6 +194,46 @@ events: []
             self.assertEqual(len(docs), 1)
             self.assertEqual(docs[0]["commit_ts"], 2)
 
+    def test_rename_uses_preprocessed_trace_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "3s-large-mixed.yaml"
+            path.write_text(
+                """\
+---
+session_id: 11
+status: committed
+start_ts: 1
+commit_ts: 2
+events:
+  - seq: 1
+    op: R
+  - seq: 2
+    op: W
+---
+session_id: 12
+status: rolled_back
+start_ts: 3
+events:
+  - seq: 1
+    op: W
+---
+session_id: 12
+status: committed
+start_ts: 4
+commit_ts: 5
+events:
+  - seq: 1
+    op: R
+""",
+                encoding="utf-8",
+            )
+
+            output_path = preprocess_trace.preprocess_file(path, None, True, True)
+
+            self.assertEqual(output_path.name, "2s-2t-3e-large-mixed.yaml")
+            self.assertFalse(path.exists())
+            self.assertTrue(output_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
