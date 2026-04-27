@@ -1,9 +1,10 @@
 # Co-Checker Framework Notes
 
-The C++ checker currently consumes preprocessed YAML only: committed documents,
-sorted by ascending `commit_ts`, with dense per-file `session_id` values. Raw
-TiDB traces must pass through `trace-gen/preprocess_trace.py` first because raw
-documents can contain `status: "rolled_back"` and omit `commit_ts`.
+The C++ checker consumes checker-ready YAML and compact binary `.trace` files.
+Checker-ready traces contain committed documents sorted by ascending `commit_ts`
+with dense per-file `session_id` values. Raw TiDB traces must pass through a
+preprocessor first because raw documents can contain `status: "rolled_back"`
+and omit `commit_ts`.
 
 Common checker infrastructure lives under `include/common` and
 `namespace common`: trace model/parsing/indexing, diagnostics, logger,
@@ -44,8 +45,15 @@ Tests are split by module:
 - `test/test_main.cpp` dispatches module runners.
 
 `test/run_traces.py` runs `build/co-checker` over traces in `./traces`; it
-supports `--trace` selectors, `--list`, `--fail-fast`, `--verbose`, and forwards
-unknown args to `co-checker`.
+includes processed TPC-C traces under `./traces/tpcc`, supports `--trace`
+selectors, `--list`, `--fail-fast`, `--verbose`, and forwards unknown args to
+`co-checker`.
+
+Binary trace convention: `trace-convert` writes compact binary traces with the
+`.trace` suffix. Generation scripts write YAML under `./traces` and mirror the
+same relative structure under `./bin_traces`; for example
+`./traces/tpcc/foo.yaml` becomes `./bin_traces/tpcc/foo.trace`. The default can
+be overridden with `BIN_TRACE_DIR`.
 
 Useful validation commands:
 
@@ -54,5 +62,7 @@ ctest --test-dir build --output-on-failure
 python3 -m unittest trace-gen/test_preprocess_trace.py
 build/co-checker --checker co-si-basic traces/2s-4t-10e-mutual.yaml
 build/co-checker --checker co-si-so-only traces/2s-12t-67e-mixed.yaml
+build/trace-convert -o bin_traces/2s-4t-10e-mutual.trace traces/2s-4t-10e-mutual.yaml
+build/co-checker --format bin --checker co-si-so-only bin_traces/2s-4t-10e-mutual.trace
 test/run_traces.py --checker all
 ```
