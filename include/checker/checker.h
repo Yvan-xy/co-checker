@@ -4,14 +4,12 @@
 
 #include "common/diag/logger.h"
 #include "common/trace/trace.h"
-#include "common/trace/trace_index.h"
 #include "common/util/check_result.h"
 
 namespace checker {
 
 struct CheckerContext {
   const common::Trace &trace;
-  const common::TraceIndex &index;
   common::Logger *logger = nullptr;
 };
 

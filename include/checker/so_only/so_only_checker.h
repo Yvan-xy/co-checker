@@ -6,7 +6,7 @@
 #include <immer/map.hpp>
 
 #include "checker/checker.h"
-#include "common/trace/trace_index.h"
+#include "common/trace/snapshot.h"
 
 namespace checker {
 

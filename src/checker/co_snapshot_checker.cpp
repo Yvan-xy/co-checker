@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <string>
 
+#include "common/trace/trace_index.h"
+
 namespace checker {
 
 namespace {
@@ -37,6 +39,14 @@ std::string_view CoSnapshotBasicChecker::name() const { return "co-si-basic"; }
 
 CheckResult CoSnapshotBasicChecker::run(const CheckerContext &ctx) const {
   CheckResult result;
+  common::TraceIndexBuilder index_builder;
+  auto index = index_builder.build(ctx.trace);
+  if (!index) {
+    result.status      = CheckStatus::Fail;
+    result.diagnostics = index.error();
+    return result;
+  }
+  const auto &trace_index = index.value();
 
   for (const auto &event : ctx.trace.events) {
     if (event.op != common::EventOp::Read) {
@@ -55,10 +65,10 @@ CheckResult CoSnapshotBasicChecker::run(const CheckerContext &ctx) const {
       continue;
     }
 
-    const auto &txn                = ctx.trace.transactions[event.txn_id];
-    const auto versions_it         = ctx.index.versions_by_key.find(event.key);
+    const auto &txn        = ctx.trace.transactions[event.txn_id];
+    const auto versions_it = trace_index.versions_by_key.find(event.key);
     const common::Version *visible = nullptr;
-    if (versions_it != ctx.index.versions_by_key.end()) {
+    if (versions_it != trace_index.versions_by_key.end()) {
       visible = find_visible_version(versions_it->second, txn.start_ts);
     }
 

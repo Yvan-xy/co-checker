@@ -48,39 +48,30 @@ common::TraceIndex build_index_or_die(const common::Trace &trace) {
 }
 
 checker::CheckResult run_basic_checker(const common::Trace &trace) {
-  auto index = build_index_or_die(trace);
-
   checker::CoSnapshotBasicChecker checker;
   common::NullLogger logger;
   checker::CheckerContext context{
       .trace  = trace,
-      .index  = index,
       .logger = &logger,
   };
   return checker.run(context);
 }
 
 checker::CheckResult run_so_checker(const common::Trace &trace) {
-  auto index = build_index_or_die(trace);
-
   checker::SnapshotSOChecker checker;
   common::NullLogger logger;
   checker::CheckerContext context{
       .trace  = trace,
-      .index  = index,
       .logger = &logger,
   };
   return checker.run(context);
 }
 
 checker::CheckResult run_so_cl_checker(const common::Trace &trace) {
-  auto index = build_index_or_die(trace);
-
   checker::SnapshotSOCLChecker checker;
   common::NullLogger logger;
   checker::CheckerContext context{
       .trace  = trace,
-      .index  = index,
       .logger = &logger,
   };
   return checker.run(context);

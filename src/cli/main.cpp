@@ -163,23 +163,23 @@ int main(int argc, char **argv) {
     return 2;
   }
 
-  common::TraceIndexBuilder index_builder;
-  auto index = index_builder.build(trace.value());
-  if (!index) {
-    common::print_diagnostics(std::cerr, index.error());
-    return 2;
+  if (!config.dump.empty() && config.dump != "parsed" &&
+      config.dump != "versions" && config.dump != "all") {
+    std::cerr << "unknown dump kind: " << config.dump << '\n';
+    return 3;
   }
 
   if (config.dump == "parsed" || config.dump == "all") {
     common::dump_parsed_trace(std::cout, trace.value());
   }
   if (config.dump == "versions" || config.dump == "all") {
+    common::TraceIndexBuilder index_builder;
+    auto index = index_builder.build(trace.value());
+    if (!index) {
+      common::print_diagnostics(std::cerr, index.error());
+      return 2;
+    }
     common::dump_versions(std::cout, index.value());
-  }
-  if (!config.dump.empty() && config.dump != "parsed" &&
-      config.dump != "versions" && config.dump != "all") {
-    std::cerr << "unknown dump kind: " << config.dump << '\n';
-    return 3;
   }
 
   std::vector<const checker::Checker *> selected;
@@ -209,7 +209,6 @@ int main(int argc, char **argv) {
   for (const auto *checker : selected) {
     checker::CheckerContext context{
         .trace  = trace.value(),
-        .index  = index.value(),
         .logger = &logger,
     };
     const auto start = std::chrono::steady_clock::now();

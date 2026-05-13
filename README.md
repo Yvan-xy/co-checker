@@ -14,7 +14,7 @@ The build fetches `yaml-cpp` into `build/_deps` through CMake `FetchContent`.
 
 ## Usage
 
-Parse and index a trace:
+Parse a trace:
 
 ```bash
 build/co-checker traces/2s-10t-28e.yaml

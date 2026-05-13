@@ -238,7 +238,6 @@ All checkers implement `checker::Checker`:
 ```cpp
 struct CheckerContext {
   const common::Trace& trace;
-  const common::TraceIndex& index;
   common::Logger* logger = nullptr;
 };
 
@@ -260,13 +259,15 @@ default registry currently registers:
 
 - `co-si-basic`
 - `co-si-so-only`
+- `snapshot-so-cl`
 
 ## Checkers
 
 ### `co-si-basic`
 
-`CoSnapshotBasicChecker` validates each read against the latest committed
-version visible at the reader transaction's `start_ts`.
+`CoSnapshotBasicChecker` builds its committed-version index inside `run()` and
+validates each read against the latest committed version visible at the reader
+transaction's `start_ts`.
 
 For each read:
 
@@ -346,9 +347,9 @@ available transaction/event/key context.
 
 CLI exit codes:
 
-- `0`: parsing/indexing succeeded and all selected checkers passed.
+- `0`: parsing succeeded and all selected checkers passed.
 - `1`: at least one selected checker returned `Fail`.
-- `2`: parse or index error.
+- `2`: parse error, or an index error while dumping versions.
 - `3`: CLI/configuration error.
 
 ## CLI and Dumps
@@ -356,17 +357,18 @@ CLI exit codes:
 CLI usage:
 
 ```bash
-build/co-checker [--checker none|co-si-basic|co-si-so-only|all] \
+build/co-checker [--checker none|co-si-basic|co-si-so-only|snapshot-so-cl|all] \
   [--dump parsed|versions|all] <trace.yaml>
 ```
 
 Behavior:
 
-- Default checker is `none`; the CLI parses and indexes the trace and prints
-  `trace: pass` if no dump is requested.
+- Default checker is `none`; the CLI parses the trace and prints `trace: pass`
+  if no dump is requested.
 - `--checker all` runs all registered checkers.
 - `--dump parsed` prints transactions and events using their `print` methods.
-- `--dump versions` prints committed version chains by key.
+- `--dump versions` builds a committed-version index and prints version chains
+  by key.
 - `--dump all` prints both parsed trace and version chains.
 
 There is no current `--log-level`, `--dump-dir`, `reads` dump, or JSON output.
@@ -411,7 +413,8 @@ efficiency choices already in place:
 - Hex is decoded and packed once during parsing.
 - Events are stored once in `Trace::events`.
 - Transactions store event ids, not duplicated event objects.
-- `TraceIndex` stores per-key version vectors once.
+- `TraceIndex` stores per-key version vectors compactly when a checker or dump
+  needs committed-version lookup.
 - The basic checker uses binary search in each key's version list.
 - `Snapshot::copy_from` clears and reserves before insertion to reduce rehashing
   when copying materialized snapshots.
