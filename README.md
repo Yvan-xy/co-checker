@@ -33,6 +33,12 @@ Run the prototype snapshot checker explicitly:
 build/co-checker --checker co-si traces/2s-4t-10e-mutual.yaml
 ```
 
+Enable checker-specific statistics:
+
+```bash
+build/co-checker --checker snapshot-so-cl --stat traces/2s-4t-10e-mutual.yaml
+```
+
 Pack a normalized YAML trace into the compact binary trace format:
 
 ```bash

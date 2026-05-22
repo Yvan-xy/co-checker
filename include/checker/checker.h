@@ -11,6 +11,7 @@ namespace checker {
 struct CheckerContext {
   const common::Trace &trace;
   common::Logger *logger = nullptr;
+  bool stat              = false;
 };
 
 class Checker {

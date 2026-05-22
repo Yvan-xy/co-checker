@@ -2,7 +2,9 @@
 bin_traces/
 *.yaml
 build/
+build_dbg/
 *.pyc
 __pycache__/
 *.log
 *.tmp
+*.csv

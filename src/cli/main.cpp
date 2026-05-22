@@ -27,6 +27,7 @@ struct CliConfig {
   std::string trace_path;
   TraceInputFormat format = TraceInputFormat::Auto;
   bool help               = false;
+  bool stat               = false;
 };
 
 void print_checker_choices(std::ostream &os,
@@ -41,7 +42,7 @@ void print_checker_choices(std::ostream &os,
 void print_usage(std::ostream &os, const checker::CheckerRegistry &registry) {
   os << "usage: co-checker [--checker ";
   print_checker_choices(os, registry);
-  os << "] [--format auto|yaml|bin] [--dump parsed|versions|all] "
+  os << "] [--format auto|yaml|bin] [--dump parsed|versions|all] [--stat] "
         "<trace.yaml|trace.trace>\n";
 }
 
@@ -69,6 +70,10 @@ bool parse_args(int argc, char **argv, CliConfig &config,
       print_usage(std::cout, registry);
       config.help = true;
       return true;
+    }
+    if (arg == "--stat") {
+      config.stat = true;
+      continue;
     }
     if (arg == "--checker") {
       if (i + 1 >= argc) {
@@ -210,6 +215,7 @@ int main(int argc, char **argv) {
     checker::CheckerContext context{
         .trace  = trace.value(),
         .logger = &logger,
+        .stat   = config.stat,
     };
     const auto start = std::chrono::steady_clock::now();
     auto result      = checker->run(context);
