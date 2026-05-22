@@ -64,6 +64,77 @@ events:
         "read value does not match latest visible committed version");
 }
 
+void test_co_snapshot_checker_fails_overlapping_same_key_writes() {
+  auto trace = parse_or_die(R"yaml(
+---
+session_id: 1
+start_ts: 10
+commit_ts: 20
+events:
+  - seq: 1
+    op: W
+    key_hex: 01
+    value_hex: 0a
+---
+session_id: 1
+start_ts: 30
+commit_ts: 50
+events:
+  - seq: 1
+    op: W
+    key_hex: 02
+    value_hex: 0b
+---
+session_id: 2
+start_ts: 40
+commit_ts: 60
+events:
+  - seq: 1
+    op: R
+    key_hex: 01
+    value_hex: 0a
+  - seq: 2
+    op: W
+    key_hex: 02
+    value_hex: 0c
+)yaml");
+
+  auto result = run_basic_checker(trace);
+  CHECK(result.status == checker::CheckStatus::Fail);
+  CHECK(!result.diagnostics.empty());
+  CHECK(result.diagnostics[0].message.find("write-write conflict") !=
+        std::string::npos);
+  CHECK(result.diagnostics[0].key.has_value());
+  CHECK(result.diagnostics[0].key->to_hex() == "02");
+}
+
+void test_co_snapshot_checker_allows_nonoverlapping_same_key_writes() {
+  auto trace = parse_or_die(R"yaml(
+---
+session_id: 1
+start_ts: 10
+commit_ts: 20
+events:
+  - seq: 1
+    op: W
+    key_hex: 01
+    value_hex: 0a
+---
+session_id: 2
+start_ts: 21
+commit_ts: 30
+events:
+  - seq: 1
+    op: W
+    key_hex: 01
+    value_hex: 0b
+)yaml");
+
+  auto result = run_basic_checker(trace);
+  CHECK(result.status == checker::CheckStatus::Pass);
+  CHECK(result.diagnostics.empty());
+}
+
 void test_so_checker_sets_fail_status_when_diagnostics_exist() {
   auto trace = parse_or_die(R"yaml(
 ---
@@ -231,6 +302,8 @@ void test_generated_trace_passes_basic_checker() {
 void run_checker_tests() {
   test_co_snapshot_checker_passes();
   test_co_snapshot_checker_fails_stale_read();
+  test_co_snapshot_checker_fails_overlapping_same_key_writes();
+  test_co_snapshot_checker_allows_nonoverlapping_same_key_writes();
   test_so_checker_sets_fail_status_when_diagnostics_exist();
   test_so_cl_checker_uses_final_write_per_key();
   test_so_cl_checker_ignores_unread_keys_while_rolling_back();

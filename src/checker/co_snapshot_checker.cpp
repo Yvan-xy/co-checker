@@ -1,6 +1,7 @@
 #include "checker/basic/co_snapshot_checker.h"
 
 #include <algorithm>
+#include <sstream>
 #include <string>
 
 #include "common/trace/trace_index.h"
@@ -47,6 +48,32 @@ CheckResult CoSnapshotBasicChecker::run(const CheckerContext &ctx) const {
     return result;
   }
   const auto &trace_index = index.value();
+
+  for (const auto &[key, versions] : trace_index.versions_by_key) {
+    // Version chains are in commit order. The immediately previous writer is
+    // enough to detect whether any same-key writer committed after this
+    // transaction's snapshot started.
+    for (std::size_t i = 1; i < versions.size(); ++i) {
+      const auto &previous = versions[i - 1];
+      const auto &current  = versions[i];
+      const auto &txn      = ctx.trace.transactions[current.writer];
+
+      if (previous.commit_ts <= txn.start_ts) {
+        continue;
+      }
+
+      std::ostringstream message;
+      message << "write-write conflict with overlapping committed transaction"
+              << " previous_txn=" << previous.writer
+              << " previous_commit_ts=" << previous.commit_ts
+              << " current_start_ts=" << txn.start_ts;
+
+      auto diagnostic = make_diagnostic(message.str(), txn,
+                                        ctx.trace.events[current.write_event]);
+      diagnostic.key  = key;
+      result.diagnostics.push_back(std::move(diagnostic));
+    }
+  }
 
   for (const auto &event : ctx.trace.events) {
     if (event.op != common::EventOp::Read) {
