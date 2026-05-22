@@ -21,10 +21,9 @@ inline std::optional<TxnId> getSOWWMax(const SOWWContext &ctx,
   std::unordered_set<Key, HexValueHash> visited;
   for (const auto eid : txn.event_ids) {
     const Event &e = ctx.trace.getEvent(eid);
-    if (!isWrite(e) || visited.contains(e.key))
+    if (!isWrite(e) || !visited.insert(e.key).second)
       continue;
 
-    visited.insert(e.key);
     const auto &it = ctx.latext_writer.find(e.key);
     if (it == ctx.latext_writer.end())
       continue;
@@ -43,9 +42,8 @@ void updateSnapshot(SOWWContext &ctx, const Transaction &txn) {
     const Event &e = ctx.trace.getEvent(*it);
     if (isWrite(e)) {
       // not the latest write on e.key
-      if (updated_keys.contains(e.key))
+      if (!updated_keys.insert(e.key).second)
         continue;
-      updated_keys.insert(e.key);
 
       // update current snapshot
       d.push_back(DeltaEntry{*it, ctx.cur_snapshot.get(e.key)});
@@ -97,17 +95,22 @@ CheckResult SnapshotSOWWChecker::run(const CheckerContext &ctx_) const {
     for (const auto &eid : txn.event_ids) {
       const auto &event = ctx.trace.events[eid];
       if (isRead(event)) {
-        if (reads.has_key(event.key) && (reads.get(event.key) != event.value)) {
+        auto [read_it, inserted] =
+            reads.data.try_emplace(event.key, event.value);
+        if (!inserted && read_it->second != event.value) {
           auto diagnostic = make_diagnostic(
               "inconsistent read of the same key in the same transaction", txn,
               event);
           result.diagnostics.push_back(diagnostic);
         }
-        reads.set(event.key, event.value);
-        const auto expected = ctx.cur_snapshot.get(event.key);
-        const bool is_wrong = (event.is_miss && expected.has_value()) ||
-                              (!event.is_miss && (!expected.has_value() ||
-                                                  expected != event.value));
+        const auto expected_it = ctx.cur_snapshot.data.find(event.key);
+        const bool expected_has_value =
+            expected_it != ctx.cur_snapshot.data.end() &&
+            expected_it->second.has_value();
+        const bool is_wrong =
+            (event.is_miss && expected_has_value) ||
+            (!event.is_miss &&
+             (!expected_has_value || expected_it->second != event.value));
         if (is_wrong) {
           wrong_keys.insert(event.key);
         }
@@ -131,10 +134,11 @@ CheckResult SnapshotSOWWChecker::run(const CheckerContext &ctx_) const {
       const auto &old_vals = ctx.cl[id].second;
       for (const auto &[eid, v] : old_vals) {
         const auto &k = ctx.trace.getEvent(eid).key;
-        if (!reads.has_key(k)) {
+        const auto read_it = reads.data.find(k);
+        if (read_it == reads.data.end()) {
           continue;
         }
-        if (reads.get(k) == v) {
+        if (read_it->second == v) {
           wrong_keys.erase(k);
         } else {
           wrong_keys.insert(k);
