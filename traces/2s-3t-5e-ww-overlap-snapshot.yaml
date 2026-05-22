@@ -1,0 +1,39 @@
+---
+session_id: 1
+start_ts: 10
+commit_ts: 20
+events:
+  - seq: 1
+    op: W
+    key_hex: 01
+    value_hex: 00
+  - seq: 2
+    op: W
+    key_hex: 02
+    value_hex: 00
+---
+session_id: 1
+start_ts: 30
+commit_ts: 50
+events:
+  - seq: 1
+    op: W
+    key_hex: 01
+    value_hex: 01
+  - seq: 2
+    op: W
+    key_hex: 02
+    value_hex: 01
+---
+session_id: 2
+start_ts: 40
+commit_ts: 60
+events:
+  - seq: 1
+    op: R
+    key_hex: 01
+    value_hex: 00
+  - seq: 2
+    op: W
+    key_hex: 02
+    value_hex: 02

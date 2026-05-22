@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="700" viewBox="0 0 760 700">
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M 0 0 L 10 5 L 0 10 z" fill="#000"/>
+</marker>
+</defs>
+<rect x="0" y="0" width="100%" height="100%" fill="#fff"/>
+<line x1="190.0" y1="45.0" x2="190.0" y2="655.0" stroke="#000" stroke-width="2"/>
+<line x1="570.0" y1="45.0" x2="570.0" y2="655.0" stroke="#000" stroke-width="2"/>
+<text x="138.0" y="86.0" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="normal">T1</text>
+<line x1="170.0" y1="80.0" x2="210.0" y2="80.0" stroke="#000" stroke-width="2" marker-end="url(#arrow)"/>
+<line x1="210.0" y1="188.0" x2="170.0" y2="188.0" stroke="#000" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="272.0" y="122.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="normal">X = 0</text>
+<text x="272.0" y="158.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="normal">Y = 0</text>
+<text x="138.0" y="302.0" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="normal">T2</text>
+<line x1="170.0" y1="296.0" x2="210.0" y2="296.0" stroke="#000" stroke-width="2" marker-end="url(#arrow)"/>
+<line x1="210.0" y1="512.0" x2="170.0" y2="512.0" stroke="#000" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="272.0" y="374.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="normal">X = 1</text>
+<text x="272.0" y="446.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="normal">Y = 1</text>
+<text x="622.0" y="410.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="normal">T3</text>
+<line x1="550.0" y1="404.0" x2="590.0" y2="404.0" stroke="#000" stroke-width="2" marker-end="url(#arrow)"/>
+<line x1="590.0" y1="620.0" x2="550.0" y2="620.0" stroke="#000" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="652.0" y="482.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="normal">r1 = X // 0</text>
+<text x="652.0" y="554.0" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="normal">Y = 2</text>
+</svg>
