@@ -239,6 +239,7 @@ All checkers implement `checker::Checker`:
 struct CheckerContext {
   const common::Trace& trace;
   common::Logger* logger = nullptr;
+  bool stat = false;
 };
 
 class Checker {
@@ -260,14 +261,24 @@ default registry currently registers:
 - `co-si-basic`
 - `co-si-so-only`
 - `snapshot-so-cl`
+- `snapshot-so-ww`
 
 ## Checkers
 
 ### `co-si-basic`
 
 `CoSnapshotBasicChecker` builds its committed-version index inside `run()` and
-validates each read against the latest committed version visible at the reader
-transaction's `start_ts`.
+validates full snapshot isolation: reads must observe the latest committed
+version visible at the reader transaction's `start_ts`, and committed
+transactions that write the same key must not overlap.
+
+For each committed version after the first version of a key:
+
+- Compare it with the immediately previous committed version for that key.
+- If the previous writer's `commit_ts` is greater than the current writer's
+  `start_ts`, both writers overlapped and committed a write to the same key.
+- Report a write-write conflict. This is the first-committer-wins rule used by
+  classic snapshot isolation.
 
 For each read:
 
@@ -280,9 +291,10 @@ For each read:
 - If a visible non-delete version exists, the read must not be a miss and must
   include the same value.
 
-The checker reports diagnostics for unexpected values, unexpected misses,
-missing read values, invalid non-delete versions, and invalid event ownership.
-It sets `CheckStatus::Fail` when diagnostics are present.
+The checker reports diagnostics for overlapping write-write conflicts,
+unexpected values, unexpected misses, missing read values, invalid non-delete
+versions, and invalid event ownership. It sets `CheckStatus::Fail` when
+diagnostics are present.
 
 ### `co-si-so-only`
 
@@ -358,7 +370,7 @@ CLI usage:
 
 ```bash
 build/co-checker [--checker none|co-si-basic|co-si-so-only|snapshot-so-cl|all] \
-  [--dump parsed|versions|all] <trace.yaml>
+  [--dump parsed|versions|all] [--stat] <trace.yaml>
 ```
 
 Behavior:
@@ -370,6 +382,8 @@ Behavior:
 - `--dump versions` builds a committed-version index and prints version chains
   by key.
 - `--dump all` prints both parsed trace and version chains.
+- `--stat` sets `CheckerContext::stat`, allowing selected checkers to collect
+  and report optional statistics.
 
 There is no current `--log-level`, `--dump-dir`, `reads` dump, or JSON output.
 
