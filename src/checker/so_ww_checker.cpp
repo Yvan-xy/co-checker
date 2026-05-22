@@ -28,9 +28,23 @@ inline void printStat(uint64_t txn_num) {
 #endif
 }
 
+void collectFinalWrites(const Trace &trace, const Transaction &txn,
+                        std::vector<EventId> &writes,
+                        std::unordered_set<Key, HexValueHash> &seen) {
+  writes.clear();
+  seen.clear();
+  for (auto it = txn.event_ids.rbegin(); it != txn.event_ids.rend(); it++) {
+    const Event &e = trace.getEvent(*it);
+    if (!isWrite(e) || !seen.insert(e.key).second) {
+      continue;
+    }
+    writes.push_back(*it);
+  }
+}
+
 inline std::optional<TxnId> getSOWWMax(const SOWWContext &ctx,
                                        SessionId session_id,
-                                       const Transaction &txn) {
+                                       const std::vector<EventId> &writes) {
   std::optional<TxnId> res = std::nullopt;
   auto it                  = ctx.latest_txns_by_session.find(session_id);
   if (it != ctx.latest_txns_by_session.end()) {
@@ -38,12 +52,8 @@ inline std::optional<TxnId> getSOWWMax(const SOWWContext &ctx,
   }
 
   // find latest writer
-  std::unordered_set<Key, HexValueHash> visited;
-  for (const auto eid : txn.event_ids) {
+  for (const auto eid : writes) {
     const Event &e = ctx.trace.getEvent(eid);
-    if (!isWrite(e) || !visited.insert(e.key).second)
-      continue;
-
     const auto &it = ctx.latext_writer.find(e.key);
     if (it == ctx.latext_writer.end())
       continue;
@@ -55,23 +65,18 @@ inline std::optional<TxnId> getSOWWMax(const SOWWContext &ctx,
   return res;
 }
 
-void updateSnapshot(SOWWContext &ctx, const Transaction &txn) {
+void updateSnapshot(SOWWContext &ctx, const Transaction &txn,
+                    const std::vector<EventId> &writes) {
   SOWWDelta d;
-  std::unordered_set<Key, HexValueHash> updated_keys;
-  for (auto it = txn.event_ids.rbegin(); it != txn.event_ids.rend(); it++) {
-    const Event &e = ctx.trace.getEvent(*it);
-    if (isWrite(e)) {
-      // not the latest write on e.key
-      if (!updated_keys.insert(e.key).second)
-        continue;
+  for (const auto eid : writes) {
+    const Event &e = ctx.trace.getEvent(eid);
 
-      // update current snapshot
-      d.push_back(DeltaEntry{*it, ctx.cur_snapshot.get(e.key)});
-      ctx.cur_snapshot.set(e.key, e.value);
+    // update current snapshot
+    d.push_back(DeltaEntry{eid, ctx.cur_snapshot.get(e.key)});
+    ctx.cur_snapshot.set(e.key, e.value);
 
-      // update latest writers
-      ctx.latext_writer[e.key] = txn.id;
-    }
+    // update latest writers
+    ctx.latext_writer[e.key] = txn.id;
   }
   ctx.cl.push_back(std::make_pair(txn.id, d));
   ctx.latest_txns_by_session[txn.session_id] = txn.id;
@@ -98,12 +103,15 @@ CheckResult SnapshotSOWWChecker::run(const CheckerContext &ctx_) const {
   ctx.cl.reserve(ctx.trace.transactions.size());
   ctx.latest_txns_by_session.reserve(ctx.trace.transactions.size());
   ctx.latext_writer.reserve(ctx.trace.events.size());
+  std::vector<EventId> writes;
+  std::unordered_set<Key, HexValueHash> seen_writes;
 
   for (const auto &txn : ctx.trace.transactions) {
-    auto t_max = getSOWWMax(ctx, txn.session_id, txn);
+    collectFinalWrites(ctx.trace, txn, writes, seen_writes);
+    auto t_max = getSOWWMax(ctx, txn.session_id, writes);
 
     if (t_max == std::nullopt) {
-      updateSnapshot(ctx, txn);
+      updateSnapshot(ctx, txn, writes);
       continue;
     }
 
@@ -183,7 +191,7 @@ CheckResult SnapshotSOWWChecker::run(const CheckerContext &ctx_) const {
       }
     }
 
-    updateSnapshot(ctx, txn);
+    updateSnapshot(ctx, txn, writes);
   }
 
   result.status =
