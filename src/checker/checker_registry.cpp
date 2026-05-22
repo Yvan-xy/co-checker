@@ -5,6 +5,7 @@
 #include "checker/basic/co_snapshot_checker.h"
 #include "checker/so_only/so_cl_checker.h"
 #include "checker/so_only/so_only_checker.h"
+#include "checker/so_ww/so_ww_checker.h"
 
 namespace checker {
 
@@ -39,6 +40,7 @@ CheckerRegistry make_default_checker_registry() {
   registry.register_checker(std::make_unique<CoSnapshotBasicChecker>());
   registry.register_checker(std::make_unique<SnapshotSOChecker>());
   registry.register_checker(std::make_unique<SnapshotSOCLChecker>());
+  registry.register_checker(std::make_unique<SnapshotSOWWChecker>());
   return registry;
 }
 

@@ -42,6 +42,7 @@ add_library(checker
   src/checker/co_snapshot_checker.cpp
   src/checker/so_only_checker.cpp
   src/checker/so_cl_checker.cpp
+  src/checker/so_ww_checker.cpp
   src/diag/trace_dump.cpp
   src/trace/trace.cpp
   src/trace/trace_binary.cpp
