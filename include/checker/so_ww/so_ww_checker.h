@@ -1,6 +1,9 @@
 #pragma once
 
+#include <optional>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "checker/checker.h"
 #include "common/trace/snapshot.h"
@@ -9,12 +12,17 @@ namespace checker {
 
 using namespace common;
 
-typedef std::vector<std::pair<Key, std::optional<Value>>> Delta;
-typedef std::vector<std::pair<TxnId, Delta>> ChangeList;
+struct DeltaEntry {
+  EventId event_id;
+  std::optional<Value> old_value;
+};
+
+using SOWWDelta = std::vector<DeltaEntry>;
+using SOWWChangeList = std::vector<std::pair<TxnId, SOWWDelta>>;
 
 struct SOWWContext final : public CheckerContext {
   SnapshotOpt cur_snapshot;
-  ChangeList cl;
+  SOWWChangeList cl;
   std::unordered_map<SessionId, TxnId> latest_txns_by_session;
   std::unordered_map<Key, TxnId, HexValueHash> latext_writer;
 

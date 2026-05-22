@@ -37,7 +37,7 @@ inline std::optional<TxnId> getSOWWMax(const SOWWContext &ctx,
 }
 
 void updateSnapshot(SOWWContext &ctx, const Transaction &txn) {
-  Delta d;
+  SOWWDelta d;
   std::unordered_set<Key, HexValueHash> updated_keys;
   for (auto it = txn.event_ids.rbegin(); it != txn.event_ids.rend(); it++) {
     const Event &e = ctx.trace.getEvent(*it);
@@ -48,7 +48,7 @@ void updateSnapshot(SOWWContext &ctx, const Transaction &txn) {
       updated_keys.insert(e.key);
 
       // update current snapshot
-      d.push_back(std::make_pair(e.key, ctx.cur_snapshot.get(e.key)));
+      d.push_back(DeltaEntry{*it, ctx.cur_snapshot.get(e.key)});
       ctx.cur_snapshot.set(e.key, e.value);
 
       // update latest writers
@@ -76,6 +76,10 @@ SnapshotSOWWChecker::make_diagnostic(std::string message,
 CheckResult SnapshotSOWWChecker::run(const CheckerContext &ctx_) const {
   CheckResult result;
   SOWWContext ctx(std::move(ctx_));
+  ctx.cur_snapshot.data.reserve(ctx.trace.events.size());
+  ctx.cl.reserve(ctx.trace.transactions.size());
+  ctx.latest_txns_by_session.reserve(ctx.trace.transactions.size());
+  ctx.latext_writer.reserve(ctx.trace.events.size());
 
   for (const auto &txn : ctx.trace.transactions) {
     auto t_max = getSOWWMax(ctx, txn.session_id, txn);
@@ -125,7 +129,8 @@ CheckResult SnapshotSOWWChecker::run(const CheckerContext &ctx_) const {
       id--;
 
       const auto &old_vals = ctx.cl[id].second;
-      for (const auto &[k, v] : old_vals) {
+      for (const auto &[eid, v] : old_vals) {
+        const auto &k = ctx.trace.getEvent(eid).key;
         if (!reads.has_key(k)) {
           continue;
         }
