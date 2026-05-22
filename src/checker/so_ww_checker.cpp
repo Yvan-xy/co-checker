@@ -4,9 +4,29 @@
 #include <cassert>
 #include <unordered_set>
 
+#define STAT 1
+
+#ifdef STAT
+#include <iostream>
+static uint64_t snp_distantce;
+static uint64_t t_tmax_distance;
+#endif
+
 namespace checker {
 
 namespace {
+
+inline void printStat(uint64_t txn_num) {
+#ifdef STAT
+  double average_snp_dist    = (double)snp_distantce / txn_num;
+  double average_t_tmax_dist = (double)t_tmax_distance / txn_num;
+  std::cout << "snp_distance: " << snp_distantce << std::endl;
+  std::cout << "t_tmax_distance: " << t_tmax_distance << std::endl;
+  std::cout << "txn_num: " << txn_num << std::endl;
+  std::cout << "average_snp_dist: " << average_snp_dist << std::endl;
+  std::cout << "average_t_tmax_dist: " << average_t_tmax_dist << std::endl;
+#endif
+}
 
 inline std::optional<TxnId> getSOWWMax(const SOWWContext &ctx,
                                        SessionId session_id,
@@ -87,6 +107,10 @@ CheckResult SnapshotSOWWChecker::run(const CheckerContext &ctx_) const {
       continue;
     }
 
+#ifdef STAT
+    t_tmax_distance += txn.id - *t_max;
+#endif
+
     // build wrong_keys set
     std::unordered_set<Key, HexValueHash> wrong_keys;
     wrong_keys.reserve(txn.event_ids.size());
@@ -129,6 +153,10 @@ CheckResult SnapshotSOWWChecker::run(const CheckerContext &ctx_) const {
         break;
       }
 
+#ifdef STAT
+      snp_distantce++;
+#endif
+
       id--;
 
       const auto &old_vals = ctx.cl[id].second;
@@ -160,6 +188,11 @@ CheckResult SnapshotSOWWChecker::run(const CheckerContext &ctx_) const {
 
   result.status =
       result.diagnostics.empty() ? CheckStatus::Pass : CheckStatus::Fail;
+
+  if (ctx.stat) {
+    printStat(ctx.trace.transactions.size());
+  }
+
   return result;
 }
 
