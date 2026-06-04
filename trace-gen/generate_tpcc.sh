@@ -14,11 +14,12 @@ run_time=${RUN_TIME:-5s}
 port=${PORT:-4020}
 status_port=${STATUS_PORT:-10200}
 host=${HOST:-127.0.0.1}
-db_name=${DB_NAME:-"tpcc_trace_${warehouses}w_${threads}t"}
+db_name=${DB_NAME:-"tpcc_trace_optimistic_${warehouses}w_${threads}t"}
 store_dir=${STORE_DIR:-"$(mktemp -d /tmp/co-checker-tpcc-store.XXXXXX)"}
 keep_store=${KEEP_STORE:-0}
+conn_params="tidb_txn_mode=optimistic"
 
-suffix="tpcc-${warehouses}w-${threads}th-${run_time}"
+suffix="tpcc-optimistic-${warehouses}w-${threads}th-${run_time}"
 suffix=${suffix//[^A-Za-z0-9_.-]/_}
 raw_path="${raw_dir}/${suffix}.raw.yaml"
 processed_seed="${output_dir}/${suffix}.yaml"
@@ -93,6 +94,19 @@ if [[ ! -x "${go_tpc}" ]]; then
 	exit 1
 fi
 
+tidb_server=${TIDB_SERVER_BIN:-"${repo_root}/build/tidb-server-trace"}
+if [[ ! -x "${tidb_server}" ]]; then
+	mkdir -p "$(dirname -- "${tidb_server}")"
+	(
+		cd "${tidb_repo}"
+		go build -o "${tidb_server}" ./cmd/tidb-server
+	)
+fi
+if [[ ! -x "${tidb_server}" ]]; then
+	printf 'tidb-server executable not found at %s\n' "${tidb_server}" >&2
+	exit 1
+fi
+
 mkdir -p "${raw_dir}" "${output_dir}"
 rm -f "${raw_path}" "${processed_seed}" "${processed_seed}.tmp" "${log_path}"
 
@@ -110,10 +124,9 @@ trap cleanup EXIT INT TERM
 
 printf 'Starting instrumented TiDB on %s:%s\n' "${host}" "${port}"
 (
-	cd "${tidb_repo}"
 	export TIDB_TXN_TRACE_ENABLE=1
 	export TIDB_TXN_TRACE_PATH="${raw_path}"
-	exec go run ./cmd/tidb-server \
+	exec "${tidb_server}" \
 		-store=unistore \
 		-path="${store_dir}" \
 		-P "${port}" \
@@ -148,11 +161,11 @@ print(f"timed out waiting for TiDB at {host}:{port}", file=sys.stderr)
 sys.exit(1)
 PY
 
-printf 'Running go-tpc prepare: warehouses=%s threads=%s db=%s\n' "${warehouses}" "${threads}" "${db_name}"
-"${go_tpc}" -H "${host}" -P "${port}" -D "${db_name}" tpcc --warehouses "${warehouses}" prepare -T "${threads}"
+printf 'Running go-tpc prepare: warehouses=%s threads=%s db=%s conn_params=%s\n' "${warehouses}" "${threads}" "${db_name}" "${conn_params}"
+"${go_tpc}" -H "${host}" -P "${port}" -D "${db_name}" --conn-params "${conn_params}" tpcc --warehouses "${warehouses}" prepare -T "${threads}"
 
-printf 'Running go-tpc workload: warehouses=%s threads=%s time=%s db=%s\n' "${warehouses}" "${threads}" "${run_time}" "${db_name}"
-"${go_tpc}" -H "${host}" -P "${port}" -D "${db_name}" tpcc --warehouses "${warehouses}" run -T "${threads}" --time "${run_time}" --silence
+printf 'Running go-tpc workload: warehouses=%s threads=%s time=%s db=%s conn_params=%s\n' "${warehouses}" "${threads}" "${run_time}" "${db_name}" "${conn_params}"
+"${go_tpc}" -H "${host}" -P "${port}" -D "${db_name}" --conn-params "${conn_params}" tpcc --warehouses "${warehouses}" run -T "${threads}" --time "${run_time}" --silence
 
 printf 'Stopping TiDB\n'
 cleanup
