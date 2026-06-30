@@ -7,6 +7,7 @@
 #include "checker/basic/co_snapshot_checker.h"
 #include "checker/so_only/so_cl_checker.h"
 #include "checker/so_only/so_only_checker.h"
+#include "checker/so_ww/so_ww_checker.h"
 #include "common/diag/logger.h"
 #include "common/trace/trace_parser.h"
 
@@ -69,6 +70,16 @@ checker::CheckResult run_so_checker(const common::Trace &trace) {
 
 checker::CheckResult run_so_cl_checker(const common::Trace &trace) {
   checker::SnapshotSOCLChecker checker;
+  common::NullLogger logger;
+  checker::CheckerContext context{
+      .trace  = trace,
+      .logger = &logger,
+  };
+  return checker.run(context);
+}
+
+checker::CheckResult run_so_ww_checker(const common::Trace &trace) {
+  checker::SnapshotSOWWChecker checker;
   common::NullLogger logger;
   checker::CheckerContext context{
       .trace  = trace,

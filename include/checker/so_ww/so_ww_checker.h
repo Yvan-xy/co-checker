@@ -17,14 +17,13 @@ struct DeltaEntry {
   std::optional<Value> old_value;
 };
 
-using SOWWDelta = std::vector<DeltaEntry>;
+using SOWWDelta      = std::vector<DeltaEntry>;
 using SOWWChangeList = std::vector<std::pair<TxnId, SOWWDelta>>;
 
 struct SOWWContext final : public CheckerContext {
   SnapshotOpt cur_snapshot;
   SOWWChangeList cl;
   std::unordered_map<SessionId, TxnId> latest_txns_by_session;
-  std::unordered_map<Key, TxnId, HexValueHash> latext_writer;
 
   template <typename T>
   SOWWContext(T &&ctx) noexcept : CheckerContext(std::forward<T>(ctx)) {}

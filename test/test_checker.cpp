@@ -279,6 +279,88 @@ void test_so_cl_checker_passes_overwrite_chain_trace() {
   CHECK(result.diagnostics.empty());
 }
 
+void test_so_ww_checker_rolls_back_unrelated_writes_before_ww_bound() {
+  auto trace = parse_or_die(R"yaml(
+---
+session_id: 1
+start_ts: 10
+commit_ts: 20
+events:
+  - seq: 1
+    op: W
+    key_hex: 01
+    value_hex: 0a
+---
+session_id: 2
+start_ts: 21
+commit_ts: 30
+events:
+  - seq: 1
+    op: W
+    key_hex: 02
+    value_hex: 0b
+---
+session_id: 3
+start_ts: 31
+commit_ts: 40
+events:
+  - seq: 1
+    op: R
+    key_hex: 02
+    miss: true
+  - seq: 2
+    op: W
+    key_hex: 01
+    value_hex: 0c
+)yaml");
+
+  auto result = run_so_ww_checker(trace);
+  CHECK(result.status == checker::CheckStatus::Pass);
+  CHECK(result.diagnostics.empty());
+}
+
+void test_so_ww_checker_does_not_rollback_before_ww_bound() {
+  auto trace = parse_or_die(R"yaml(
+---
+session_id: 1
+start_ts: 10
+commit_ts: 20
+events:
+  - seq: 1
+    op: W
+    key_hex: 01
+    value_hex: 0a
+---
+session_id: 2
+start_ts: 21
+commit_ts: 30
+events:
+  - seq: 1
+    op: W
+    key_hex: 02
+    value_hex: 0b
+---
+session_id: 3
+start_ts: 31
+commit_ts: 40
+events:
+  - seq: 1
+    op: R
+    key_hex: 01
+    miss: true
+  - seq: 2
+    op: W
+    key_hex: 01
+    value_hex: 0c
+)yaml");
+
+  auto result = run_so_ww_checker(trace);
+  CHECK(result.status == checker::CheckStatus::Fail);
+  CHECK(!result.diagnostics.empty());
+  CHECK(result.diagnostics[0].key.has_value());
+  CHECK(result.diagnostics[0].key->to_hex() == "01");
+}
+
 void test_generated_trace_passes_basic_checker() {
   const auto path = std::filesystem::path(CO_CHECKER_SOURCE_DIR) / "traces" /
                     "2s-4t-10e-mutual.yaml";
@@ -309,6 +391,8 @@ void run_checker_tests() {
   test_so_cl_checker_ignores_unread_keys_while_rolling_back();
   test_so_cl_checker_does_not_rollback_before_session_predecessor();
   test_so_cl_checker_passes_overwrite_chain_trace();
+  test_so_ww_checker_rolls_back_unrelated_writes_before_ww_bound();
+  test_so_ww_checker_does_not_rollback_before_ww_bound();
   test_generated_trace_passes_basic_checker();
 }
 

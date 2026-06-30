@@ -1,0 +1,17 @@
+trace,co-si-basic,snapshot-so-ww,snapshot-so-ww-optimized
+bin_traces/tpcc/4s-900t-729344e-tpcc-optimistic-1w-1th-1s.trace,1160.289,860.189,465.431
+bin_traces/tpcc/7s-901t-729889e-tpcc-optimistic-1w-2th-1s.trace,1165.846,842.038,484.236
+bin_traces/tpcc/12s-1192t-743366e-tpcc-optimistic-1w-4th-2s.trace,1132.966,879.505,460.665
+bin_traces/tpcc/27s-107713t-4794984e-tpcc-optimistic-1w-4th-360s.trace,4567.738,3285.717,2475.788
+bin_traces/tpcc/28s-1493t-751254e-tpcc-optimistic-1w-8th-3s.trace,1188.405,842.317,471.154
+bin_traces/tpcc/28s-18356t-1388732e-tpcc-optimistic-1w-8th-60s.trace,1645.948,1146.952,746.181
+bin_traces/tpcc/31s-9441t-1057515e-tpcc-optimistic-1w-8th-30s.trace,1352.088,1021.195,588.798
+bin_traces/tpcc/35s-1847t-765411e-tpcc-optimistic-1w-16th-4s.trace,1201.773,862.461,459.305
+bin_traces/tpcc/39s-1647t-1358820e-tpcc-optimistic-2w-8th-2s.trace,2085.413,1594.245,887.917
+bin_traces/tpcc/39s-35213t-2027364e-tpcc-optimistic-1w-8th-120s.trace,2215.093,1558.548,1038.792
+bin_traces/tpcc/40s-71097t-3391297e-tpcc-optimistic-1w-8th-240s.trace,3438.521,2337.129,1718.706
+bin_traces/tpcc/41s-2170t-777972e-tpcc-optimistic-1w-32th-5s.trace,1186.297,866.406,469.476
+bin_traces/tpcc/207s-2771t-2599759e-tpcc-optimistic-4w-16th-2s.trace,4107.450,3279.216,1804.516
+bin_traces/tpcc/559s-4931t-5080220e-tpcc-optimistic-8w-32th-2s.trace,8781.198,6812.753,3783.369
+bin_traces/tpcc/1035s-7969t-7592034e-tpcc-optimistic-12w-64th-5s.trace,13716.498,10093.964,5819.314
+bin_traces/tpcc/1445s-9397t-10047372e-tpcc-optimistic-16w-64th-3s.trace,17560.540,13376.920,7739.381

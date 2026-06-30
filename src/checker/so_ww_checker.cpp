@@ -42,28 +42,47 @@ void collectFinalWrites(const Trace &trace, const Transaction &txn,
   }
 }
 
-inline std::optional<TxnId> getSOWWMax(const SOWWContext &ctx,
-                                       SessionId session_id,
-                                       const std::vector<EventId> &writes) {
-  std::optional<TxnId> res = std::nullopt;
-  auto it                  = ctx.latest_txns_by_session.find(session_id);
+std::optional<TxnId> getSOMax(const SOWWContext &ctx, SessionId session_id) {
+  auto it = ctx.latest_txns_by_session.find(session_id);
   if (it != ctx.latest_txns_by_session.end()) {
-    res = it->second;
+    return it->second;
+  }
+  return std::nullopt;
+}
+
+bool writesCurrentWriteKey(
+    const Trace &trace, const SOWWDelta &delta,
+    const std::unordered_set<Key, HexValueHash> &current_write_keys) {
+  if (current_write_keys.empty()) {
+    return false;
   }
 
-  // find latest writer
-  for (const auto eid : writes) {
-    const Event &e = ctx.trace.getEvent(eid);
-    const auto &it = ctx.latext_writer.find(e.key);
-    if (it == ctx.latext_writer.end())
-      continue;
-
-    TxnId w = it->second;
-    res     = (res == std::nullopt) ? w : std::max(w, *res);
+  for (const auto &[eid, old_value] : delta) {
+    (void)old_value;
+    if (current_write_keys.contains(trace.getEvent(eid).key)) {
+      return true;
+    }
   }
+  return false;
+}
 
+#ifdef STAT
+std::optional<TxnId> getSOWWMaxForStats(
+    const SOWWContext &ctx, const std::optional<TxnId> so_max,
+    const std::unordered_set<Key, HexValueHash> &current_write_keys) {
+  auto res = so_max;
+  for (auto it = ctx.cl.rbegin(); it != ctx.cl.rend(); ++it) {
+    if (so_max.has_value() && it->first <= *so_max) {
+      break;
+    }
+    if (writesCurrentWriteKey(ctx.trace, it->second, current_write_keys)) {
+      res = it->first;
+      break;
+    }
+  }
   return res;
 }
+#endif
 
 void updateSnapshot(SOWWContext &ctx, const Transaction &txn,
                     const std::vector<EventId> &writes) {
@@ -74,9 +93,6 @@ void updateSnapshot(SOWWContext &ctx, const Transaction &txn,
     // update current snapshot
     d.push_back(DeltaEntry{eid, ctx.cur_snapshot.get(e.key)});
     ctx.cur_snapshot.set(e.key, e.value);
-
-    // update latest writers
-    ctx.latext_writer[e.key] = txn.id;
   }
   ctx.cl.push_back(std::make_pair(txn.id, d));
   ctx.latest_txns_by_session[txn.session_id] = txn.id;
@@ -102,24 +118,29 @@ CheckResult SnapshotSOWWChecker::run(const CheckerContext &ctx_) const {
   ctx.cur_snapshot.data.reserve(ctx.trace.events.size());
   ctx.cl.reserve(ctx.trace.transactions.size());
   ctx.latest_txns_by_session.reserve(ctx.trace.transactions.size());
-  ctx.latext_writer.reserve(ctx.trace.events.size());
   std::vector<EventId> writes;
   std::unordered_set<Key, HexValueHash> seen_writes;
 
   for (const auto &txn : ctx.trace.transactions) {
     collectFinalWrites(ctx.trace, txn, writes, seen_writes);
-    auto t_max = getSOWWMax(ctx, txn.session_id, writes);
+    auto so_max = getSOMax(ctx, txn.session_id);
 
-    if (t_max == std::nullopt) {
+    if (so_max == std::nullopt && writes.empty()) {
       updateSnapshot(ctx, txn, writes);
       continue;
     }
 
 #ifdef STAT
-    t_tmax_distance += txn.id - *t_max;
+    if (ctx.stat) {
+      const auto t_max = getSOWWMaxForStats(ctx, so_max, seen_writes);
+      if (t_max.has_value()) {
+        t_tmax_distance += txn.id - *t_max;
+      }
+    }
 #endif
 
     // build wrong_keys set
+    std::vector<Diagnostic> pending_read_diagnostics;
     std::unordered_set<Key, HexValueHash> wrong_keys;
     wrong_keys.reserve(txn.event_ids.size());
     SnapshotOpt reads;
@@ -133,7 +154,7 @@ CheckResult SnapshotSOWWChecker::run(const CheckerContext &ctx_) const {
           auto diagnostic = make_diagnostic(
               "inconsistent read of the same key in the same transaction", txn,
               event);
-          result.diagnostics.push_back(diagnostic);
+          pending_read_diagnostics.push_back(std::move(diagnostic));
         }
         const auto expected_it = ctx.cur_snapshot.data.find(event.key);
         const bool expected_has_value =
@@ -149,15 +170,26 @@ CheckResult SnapshotSOWWChecker::run(const CheckerContext &ctx_) const {
       }
     }
 
-    bool viable = false;
-    auto id     = ctx.cl.size();
+    bool viable          = false;
+    bool has_lower_bound = so_max.has_value();
+    auto id              = ctx.cl.size();
     while (true) {
       if (wrong_keys.empty()) {
         viable = true;
         break;
       }
 
-      if (id == 0 || ctx.cl[id - 1].first == *t_max) {
+      if (id == 0) {
+        viable = so_max == std::nullopt;
+        break;
+      }
+
+      const auto &[rollback_txn_id, old_vals] = ctx.cl[id - 1];
+      if (so_max.has_value() && rollback_txn_id == *so_max) {
+        break;
+      }
+      if (writesCurrentWriteKey(ctx.trace, old_vals, seen_writes)) {
+        has_lower_bound = true;
         break;
       }
 
@@ -166,10 +198,8 @@ CheckResult SnapshotSOWWChecker::run(const CheckerContext &ctx_) const {
 #endif
 
       id--;
-
-      const auto &old_vals = ctx.cl[id].second;
       for (const auto &[eid, v] : old_vals) {
-        const auto &k = ctx.trace.getEvent(eid).key;
+        const auto &k      = ctx.trace.getEvent(eid).key;
         const auto read_it = reads.data.find(k);
         if (read_it == reads.data.end()) {
           continue;
@@ -180,6 +210,12 @@ CheckResult SnapshotSOWWChecker::run(const CheckerContext &ctx_) const {
           wrong_keys.insert(k);
         }
       }
+    }
+
+    if (has_lower_bound) {
+      result.diagnostics.insert(result.diagnostics.end(),
+                                pending_read_diagnostics.begin(),
+                                pending_read_diagnostics.end());
     }
 
     if (!viable) {
