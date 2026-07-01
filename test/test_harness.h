@@ -18,6 +18,7 @@ checker::CheckResult run_basic_checker(const common::Trace &trace);
 checker::CheckResult run_so_checker(const common::Trace &trace);
 checker::CheckResult run_so_cl_checker(const common::Trace &trace);
 checker::CheckResult run_so_ww_checker(const common::Trace &trace);
+checker::CheckResult run_serializable_checker(const common::Trace &trace);
 
 void run_trace_tests();
 void run_snapshot_tests();

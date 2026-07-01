@@ -361,6 +361,114 @@ events:
   CHECK(result.diagnostics[0].key->to_hex() == "01");
 }
 
+void test_serializable_checker_allows_read_own_write() {
+  auto trace = parse_or_die(R"yaml(
+---
+session_id: 1
+start_ts: 10
+commit_ts: 20
+events:
+  - seq: 1
+    op: W
+    key_hex: 01
+    value_hex: 0a
+---
+session_id: 2
+start_ts: 21
+commit_ts: 30
+events:
+  - seq: 1
+    op: W
+    key_hex: 01
+    value_hex: 0b
+  - seq: 2
+    op: R
+    key_hex: 01
+    value_hex: 0b
+)yaml");
+
+  auto result = run_serializable_checker(trace);
+  CHECK(result.status == checker::CheckStatus::Pass);
+  CHECK(result.diagnostics.empty());
+}
+
+void test_serializable_checker_requires_explicit_miss_for_absent_key() {
+  auto trace = parse_or_die(R"yaml(
+---
+session_id: 1
+start_ts: 10
+commit_ts: 20
+events:
+  - seq: 1
+    op: R
+    key_hex: 01
+)yaml");
+
+  auto result = run_serializable_checker(trace);
+  CHECK(result.status == checker::CheckStatus::Fail);
+  CHECK(!result.diagnostics.empty());
+}
+
+void test_serializable_checker_allows_read_miss_after_local_delete() {
+  auto trace = parse_or_die(R"yaml(
+---
+session_id: 1
+start_ts: 10
+commit_ts: 20
+events:
+  - seq: 1
+    op: W
+    key_hex: 01
+    value_hex: 0a
+---
+session_id: 2
+start_ts: 21
+commit_ts: 30
+events:
+  - seq: 1
+    op: W
+    key_hex: 01
+    delete: true
+  - seq: 2
+    op: R
+    key_hex: 01
+    miss: true
+)yaml");
+
+  auto result = run_serializable_checker(trace);
+  CHECK(result.status == checker::CheckStatus::Pass);
+  CHECK(result.diagnostics.empty());
+}
+
+void test_serializable_checker_rejects_commit_order_stale_read() {
+  auto trace = parse_or_die(R"yaml(
+---
+session_id: 1
+start_ts: 10
+commit_ts: 20
+events:
+  - seq: 1
+    op: W
+    key_hex: 01
+    value_hex: 0a
+---
+session_id: 2
+start_ts: 21
+commit_ts: 30
+events:
+  - seq: 1
+    op: R
+    key_hex: 01
+    miss: true
+)yaml");
+
+  auto result = run_serializable_checker(trace);
+  CHECK(result.status == checker::CheckStatus::Fail);
+  CHECK(!result.diagnostics.empty());
+  CHECK(result.diagnostics[0].message ==
+        "read value does not match the commit-order serial snapshot");
+}
+
 void test_generated_trace_passes_basic_checker() {
   const auto path = std::filesystem::path(CO_CHECKER_SOURCE_DIR) / "traces" /
                     "2s-4t-10e-mutual.yaml";
@@ -393,6 +501,10 @@ void run_checker_tests() {
   test_so_cl_checker_passes_overwrite_chain_trace();
   test_so_ww_checker_rolls_back_unrelated_writes_before_ww_bound();
   test_so_ww_checker_does_not_rollback_before_ww_bound();
+  test_serializable_checker_allows_read_own_write();
+  test_serializable_checker_requires_explicit_miss_for_absent_key();
+  test_serializable_checker_allows_read_miss_after_local_delete();
+  test_serializable_checker_rejects_commit_order_stale_read();
   test_generated_trace_passes_basic_checker();
 }
 
