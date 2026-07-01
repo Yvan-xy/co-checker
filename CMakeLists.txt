@@ -40,6 +40,7 @@ add_library(checker
   src/checker/check_result.cpp
   src/checker/checker_registry.cpp
   src/checker/co_snapshot_checker.cpp
+  src/checker/ser_checker.cpp
   src/checker/so_only_checker.cpp
   src/checker/so_cl_checker.cpp
   src/checker/so_ww_checker.cpp
