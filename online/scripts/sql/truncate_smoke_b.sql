@@ -1,0 +1,1 @@
+TRUNCATE TABLE online_checker_truncate_smoke_b

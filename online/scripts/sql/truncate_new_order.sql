@@ -1,0 +1,1 @@
+TRUNCATE TABLE new_order
