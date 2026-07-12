@@ -1,0 +1,6 @@
+CO_CHECKER_ONLINE_1.0 {
+  global:
+    co_checker_online_*_v1;
+  local:
+    *;
+};
