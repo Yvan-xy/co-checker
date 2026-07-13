@@ -300,6 +300,7 @@ print(json.dumps({
     "new_order_error_count": int(error_summary["Count"]) if error_summary else 0,
     "tpm_c": float(final["tpmC"]),
     "go_tpc_ignore_error": True,
+    "go_tpc_silence_errors": True,
 }, indent=2, sort_keys=True))
 PY
 }
@@ -379,6 +380,7 @@ settings = {
     for name in setting_names
 }
 settings["go_tpc_ignore_error"] = True
+settings["go_tpc_silence_errors"] = True
 settings["transaction_weights"] = [100, 0, 0, 0, 0]
 checker = os.environ["CHECKER"]
 tidb = os.environ["TIDB"]
@@ -463,7 +465,7 @@ sleep "$STABILIZE_SECONDS"
   taskset -c "$CLIENT_CPUSET" "$GO_TPC" tpcc run \
     -H "$SQL_HOST" -P "$SQL_PORT" -D "$DATABASE" \
     -T "$RUN_THREADS" --warehouses "$WAREHOUSES" \
-    --ignore-error \
+    --ignore-error --silence \
     --weight 100,0,0,0,0 --time "$WARMUP_TIME" --interval "$OUTPUT_INTERVAL" \
     --conn-params "$DSN_PARAMS" --output json \
     >warmup.txt 2>&1
@@ -477,7 +479,7 @@ set +e
   taskset -c "$CLIENT_CPUSET" "$GO_TPC" tpcc run \
     -H "$SQL_HOST" -P "$SQL_PORT" -D "$DATABASE" \
     -T "$RUN_THREADS" --warehouses "$WAREHOUSES" \
-    --ignore-error \
+    --ignore-error --silence \
     --weight 100,0,0,0,0 --time "$RUN_TIME" --interval "$OUTPUT_INTERVAL" \
     --conn-params "$DSN_PARAMS" --output json \
     >workload.txt 2>&1
