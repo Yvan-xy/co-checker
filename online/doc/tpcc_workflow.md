@@ -6,7 +6,73 @@ an empty user keyspace, and closes checked results only through graceful TiDB
 shutdown. Commands below use the paths and 16-vCPU layout of the recorded test
 host; override the variables rather than editing the commands.
 
-## Fixed inputs and build
+## Current sustained benchmark
+
+Use `online/scripts/run_tpcc_long_mode.sh` for performance comparisons. Its
+defaults reproduce the sustained benchmark under
+`online/results/tpcc-live-10m-w8-t16`:
+
+- eight warehouses and 16 clients, after a concurrency sweep showed throughput
+  saturating at 16 clients on the recorded host;
+- TiDB pinned to CPUs `0-7` and go-tpc pinned to CPUs `8-15`;
+- 30 seconds of server stabilization, a separate unmeasured 60-second warm-up,
+  and a 600-second measured phase with 10-second diagnostic intervals;
+- New-Order-only weights `100,0,0,0,0`, because the standard mixed workload
+  uses unsupported coprocessor read paths;
+- optimistic transactions with async commit, 1PC, and low-resolution TSO
+  disabled in every mode;
+- a 2 GiB queue ceiling and 32 GiB capture, reorder, and retained-state
+  ceilings. These are fail-closed admission limits rather than eager
+  allocations;
+- `pidstat`, `mpstat`, and `iostat` sampling during the measured phase, with no
+  concurrent `perf` or pprof collection in a headline throughput run.
+
+The runner always passes both `--ignore-error` and `--silence` to go-tpc.
+`--ignore-error` is required for a valid concurrency comparison: optimistic
+write conflicts are expected under load, and without it each affected worker
+returns instead of continuing for the requested duration. `--silence` removes
+per-conflict logging overhead while go-tpc's structured `NEW_ORDER_ERR` summary
+still records every failed attempt. The runner validates the requested elapsed
+time, interval count, exactly one `Finished` marker, clean checker close, count
+conservation, zero capture/backpressure errors, and all 12 TPC-C post-check
+conditions for each of the eight warehouses.
+
+The recorded run used one four-mode trial and a reverse-order full/baseline
+confirmation pair:
+
+```sh
+export RESULT_ROOT=/home/dyf/code/db-consistency/co-checker/online/results/tpcc-live-10m-w8-t16
+
+for mode in baseline capture-only order-only full; do
+  RESULT_ROOT="$RESULT_ROOT" TRIAL=trial-01 \
+    online/scripts/run_tpcc_long_mode.sh "$mode"
+done
+
+for mode in full baseline; do
+  RESULT_ROOT="$RESULT_ROOT" TRIAL=trial-02 \
+    online/scripts/run_tpcc_long_mode.sh "$mode"
+done
+
+python3 online/tools/analyze_tpcc_long.py "$RESULT_ROOT"
+```
+
+Compare only complete baseline/mode pairs with identical configuration
+fingerprints. Ten-second windows diagnose drift and stalls; they are correlated
+parts of one run, not independent repetitions or a basis for confidence
+intervals.
+
+UniStore does not provide a continuously advancing authoritative frontier for
+this integration. During the measured phase, full-mode tpmC therefore covers
+capture, packing, native publication, queueing, and reorder retention. Ordered
+transactions are checked only at the graceful shutdown barrier. Report native
+checking time and total checked-shutdown time separately; do not describe the
+measured tpmC gap as steady-state full rule-checking overhead.
+
+The step-by-step commands below remain useful for short lifecycle diagnostics
+and profiling. Their one-warehouse, 60-second defaults are not the current
+headline performance methodology.
+
+## Manual diagnostic inputs and build
 
 ```sh
 export CHECKER=/home/dyf/code/db-consistency/co-checker
@@ -240,6 +306,7 @@ fi
 taskset -c "$CLIENT_CPUSET" "$GO_TPC" tpcc run \
   -H "$SQL_HOST" -P "$SQL_PORT" -D "$DATABASE" \
   -T "$RUN_THREADS" --warehouses "$WAREHOUSES" \
+  --ignore-error --silence \
   --weight 100,0,0,0,0 --time "$RUN_TIME" --interval 1s \
   --conn-params "$DSN_PARAMS" --output json \
   >"$MODE_DIR/workload.txt" 2>&1
