@@ -10,7 +10,7 @@ MODE is one of: baseline, capture-only, order-only, full.
 
 The output directory is RESULT_ROOT/TRIAL/MODE. All workload parameters and
 paths can be overridden through the environment; the defaults describe the
-recorded 8-warehouse, 8-client, 60-second-warm-up, 10-minute experiment.
+recorded 8-warehouse, 16-client, 60-second-warm-up, 10-minute experiment.
 EOF
 }
 
@@ -20,6 +20,7 @@ if [[ $# -ne 1 ]]; then
 fi
 
 MODE=$1
+RUNNER_PATH=$(realpath "$0")
 case "$MODE" in
   baseline | capture-only | order-only | full) ;;
   *)
@@ -34,7 +35,7 @@ GO_TPC=${GO_TPC:-/home/dyf/go/bin/go-tpc}
 TIDB_SERVER=${TIDB_SERVER:-$TIDB/bin/tidb-server}
 NATIVE_LIBRARY=${NATIVE_LIBRARY:-$CHECKER/online/build-release/libco_checker_online_c.so}
 TEMPLATE=${TEMPLATE:-$CHECKER/online/results/tpcc-live/schema-template}
-RESULT_ROOT=${RESULT_ROOT:-$CHECKER/online/results/tpcc-live-10m-w8-t8}
+RESULT_ROOT=${RESULT_ROOT:-$CHECKER/online/results/tpcc-live-10m-w8-t16}
 TRIAL=${TRIAL:-trial-01}
 
 SQL_HOST=${SQL_HOST:-127.0.0.1}
@@ -43,7 +44,7 @@ STATUS_PORT=${STATUS_PORT:-14080}
 DATABASE=${DATABASE:-tpcc}
 WAREHOUSES=${WAREHOUSES:-8}
 PREPARE_THREADS=${PREPARE_THREADS:-8}
-RUN_THREADS=${RUN_THREADS:-8}
+RUN_THREADS=${RUN_THREADS:-16}
 WARMUP_TIME=${WARMUP_TIME:-60s}
 RUN_TIME=${RUN_TIME:-600s}
 OUTPUT_INTERVAL=${OUTPUT_INTERVAL:-10s}
@@ -57,8 +58,8 @@ DSN_PARAMS=${DSN_PARAMS:-tidb_enable_async_commit=0&tidb_enable_1pc=0&tidb_txn_m
 # until the graceful close barrier. The defaults leave headroom on the
 # recorded 62 GiB host while preserving fail-closed boundedness.
 QUEUE_CAPACITY_BYTES=${QUEUE_CAPACITY_BYTES:-2147483648}
-REORDER_CAPACITY_BYTES=${REORDER_CAPACITY_BYTES:-25769803776}
-CAPTURE_CAPACITY_BYTES=${CAPTURE_CAPACITY_BYTES:-25769803776}
+REORDER_CAPACITY_BYTES=${REORDER_CAPACITY_BYTES:-34359738368}
+CAPTURE_CAPACITY_BYTES=${CAPTURE_CAPACITY_BYTES:-34359738368}
 RETAINED_STATE_CAPACITY_BYTES=${RETAINED_STATE_CAPACITY_BYTES:-34359738368}
 QUEUE_TIMEOUT=${QUEUE_TIMEOUT:-5m}
 CAPTURE_TIMEOUT=${CAPTURE_TIMEOUT:-5m}
@@ -113,19 +114,32 @@ cleanup() {
   fi
   exit "$status"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 wait_for_server() {
   local status_file=$1
   local attempt
   for attempt in $(seq 1 180); do
-    if curl --fail --silent "http://$SQL_HOST:$STATUS_PORT/status" >"$status_file"; then
-      return 0
-    fi
     if ! kill -0 "$TIDB_PID" 2>/dev/null; then
       wait "$TIDB_PID" || true
       echo "TiDB exited before becoming ready" >&2
       return 1
+    fi
+    if curl --fail --silent "http://$SQL_HOST:$STATUS_PORT/status" >"$status_file"; then
+      python3 - "$status_file" "$EXPECTED_TIDB_COMMIT" <<'PY'
+import json
+import pathlib
+import sys
+
+status = json.loads(pathlib.Path(sys.argv[1]).read_text())
+if status.get("git_hash") != sys.argv[2]:
+    raise SystemExit(
+        f"unexpected TiDB server identity: {status.get('git_hash')!r} != {sys.argv[2]!r}"
+    )
+PY
+      return 0
     fi
     sleep 1
   done
@@ -201,8 +215,97 @@ start_monitors() {
   MONITOR_PIDS+=("$!")
 }
 
+validate_go_tpc_run() {
+  local expected_duration=$1
+  local output_interval=$2
+  local input=$3
+  local output=$4
+  python3 - "$expected_duration" "$output_interval" "$input" >"$output" <<'PY'
+import json
+import math
+import pathlib
+import re
+import sys
+
+def duration_seconds(text):
+    units = {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 0.001}
+    pattern = re.compile(r"([0-9]+(?:\.[0-9]+)?)(ms|h|m|s)")
+    position = 0
+    total = 0.0
+    for match in pattern.finditer(text):
+        if match.start() != position:
+            raise SystemExit(f"unsupported duration {text!r}")
+        total += float(match.group(1)) * units[match.group(2)]
+        position = match.end()
+    if position != len(text) or total <= 0:
+        raise SystemExit(f"unsupported duration {text!r}")
+    return total
+
+expected = duration_seconds(sys.argv[1])
+interval = duration_seconds(sys.argv[2])
+text = pathlib.Path(sys.argv[3]).read_text(errors="replace")
+finished = sum(line.strip() == "Finished" for line in text.splitlines())
+current_intervals = 0
+summary = None
+error_summary = None
+final = None
+malformed_json_records = 0
+for line in text.splitlines():
+    stripped = line.strip()
+    if not stripped.startswith(("[{", "{")):
+        continue
+    try:
+        decoded = json.loads(stripped)
+    except json.JSONDecodeError:
+        malformed_json_records += 1
+        continue
+    records = decoded if isinstance(decoded, list) else [decoded]
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        prefix = str(record.get("Prefix", "")).strip()
+        if prefix == "[Current]" and record.get("Operation") == "NEW_ORDER":
+            current_intervals += 1
+        elif prefix == "[Summary]" and record.get("Operation") == "NEW_ORDER":
+            summary = record
+        elif prefix == "[Summary]" and record.get("Operation") == "NEW_ORDER_ERR":
+            error_summary = record
+        elif "tpmC" in record:
+            final = record
+
+if finished != 1:
+    raise SystemExit(f"expected one Finished marker, found {finished}")
+if malformed_json_records:
+    raise SystemExit(f"found {malformed_json_records} malformed JSON records")
+if summary is None or final is None:
+    raise SystemExit("go-tpc final summary is incomplete")
+takes = float(summary["Takes(s)"])
+tolerance = max(2.0, expected * 0.01)
+if abs(takes - expected) > tolerance:
+    raise SystemExit(f"summary duration {takes} differs from expected {expected}")
+minimum_intervals = max(1, math.floor(expected / interval) - 1)
+if current_intervals < minimum_intervals:
+    raise SystemExit(
+        f"only {current_intervals} intervals, expected at least {minimum_intervals}"
+    )
+
+print(json.dumps({
+    "expected_seconds": expected,
+    "summary_seconds": takes,
+    "current_interval_count": current_intervals,
+    "minimum_interval_count": minimum_intervals,
+    "finished_marker_count": finished,
+    "malformed_json_record_count": malformed_json_records,
+    "new_order_count": int(summary["Count"]),
+    "new_order_error_count": int(error_summary["Count"]) if error_summary else 0,
+    "tpm_c": float(final["tpmC"]),
+    "go_tpc_ignore_error": True,
+}, indent=2, sort_keys=True))
+PY
+}
+
 for command in realpath git sha256sum curl taskset python3 pidstat mpstat iostat \
-  lscpu free df uname go /usr/bin/time; do
+  lscpu free df uname go ss /usr/bin/time; do
   command -v "$command" >/dev/null
 done
 test -x "$GO_TPC"
@@ -212,12 +315,22 @@ test -d "$TEMPLATE/store"
 test "$(git -C "$CHECKER" branch --show-current)" = online-checker
 test "$(git -C "$TIDB" branch --show-current)" = online-checker
 test ! -e "$MODE_DIR"
+if [[ -n "$(ss -H -ltn "sport = :$SQL_PORT")" ]]; then
+  echo "SQL port $SQL_PORT is already listening" >&2
+  exit 1
+fi
+if [[ -n "$(ss -H -ltn "sport = :$STATUS_PORT")" ]]; then
+  echo "status port $STATUS_PORT is already listening" >&2
+  exit 1
+fi
+EXPECTED_TIDB_COMMIT=$(git -C "$TIDB" rev-parse HEAD)
 
 mkdir -p "$MODE_DIR"
 cp -a --reflink=auto "$TEMPLATE/store" "$MODE_DIR/store"
 cd "$MODE_DIR"
 
 export MODE CHECKER TIDB GO_TPC TIDB_SERVER NATIVE_LIBRARY TEMPLATE RESULT_ROOT
+export RUNNER_PATH
 export TRIAL MODE_DIR SQL_HOST SQL_PORT STATUS_PORT DATABASE WAREHOUSES
 export PREPARE_THREADS RUN_THREADS WARMUP_TIME RUN_TIME OUTPUT_INTERVAL
 export STABILIZE_SECONDS TIDB_CPUSET CLIENT_CPUSET DSN_PARAMS
@@ -265,6 +378,8 @@ settings = {
     name.lower(): int(os.environ[name]) if name in integer_names else os.environ[name]
     for name in setting_names
 }
+settings["go_tpc_ignore_error"] = True
+settings["transaction_weights"] = [100, 0, 0, 0, 0]
 checker = os.environ["CHECKER"]
 tidb = os.environ["TIDB"]
 server = os.environ["TIDB_SERVER"]
@@ -288,6 +403,10 @@ config = {
         "tidb_server": {"path": server, "sha256": sha256(server)},
         "native_library": {"path": library, "sha256": sha256(library)},
         "go_tpc": {"path": os.environ["GO_TPC"], "sha256": sha256(os.environ["GO_TPC"])},
+        "benchmark_runner": {
+            "path": os.environ["RUNNER_PATH"],
+            "sha256": sha256(os.environ["RUNNER_PATH"]),
+        },
     },
     "template": str(pathlib.Path(os.environ["TEMPLATE"]).resolve()),
     "settings": settings,
@@ -344,9 +463,12 @@ sleep "$STABILIZE_SECONDS"
   taskset -c "$CLIENT_CPUSET" "$GO_TPC" tpcc run \
     -H "$SQL_HOST" -P "$SQL_PORT" -D "$DATABASE" \
     -T "$RUN_THREADS" --warehouses "$WAREHOUSES" \
+    --ignore-error \
     --weight 100,0,0,0,0 --time "$WARMUP_TIME" --interval "$OUTPUT_INTERVAL" \
     --conn-params "$DSN_PARAMS" --output json \
     >warmup.txt 2>&1
+validate_go_tpc_run "$WARMUP_TIME" "$OUTPUT_INTERVAL" warmup.txt \
+  warmup-validation.json
 
 record_process_snapshot tidb-proc-before.txt
 start_monitors
@@ -355,6 +477,7 @@ set +e
   taskset -c "$CLIENT_CPUSET" "$GO_TPC" tpcc run \
     -H "$SQL_HOST" -P "$SQL_PORT" -D "$DATABASE" \
     -T "$RUN_THREADS" --warehouses "$WAREHOUSES" \
+    --ignore-error \
     --weight 100,0,0,0,0 --time "$RUN_TIME" --interval "$OUTPUT_INTERVAL" \
     --conn-params "$DSN_PARAMS" --output json \
     >workload.txt 2>&1
@@ -363,6 +486,11 @@ set -e
 printf '%d\n' "$WORKLOAD_STATUS" >workload-exit-status.txt
 stop_monitors
 record_process_snapshot tidb-proc-after.txt
+
+if [[ $WORKLOAD_STATUS -eq 0 ]]; then
+  validate_go_tpc_run "$RUN_TIME" "$OUTPUT_INTERVAL" workload.txt \
+    workload-validation.json
+fi
 
 stop_server checked
 rm -rf "$MODE_DIR/tmp"
@@ -445,6 +573,52 @@ start_server "$MODE_DIR/post-check-server.txt" \
     -T 1 --warehouses "$WAREHOUSES" --check-all \
     --conn-params "$DSN_PARAMS" --output json \
     >post-check.txt 2>&1
+
+python3 - "$WAREHOUSES" post-check.txt >post-check-validation.json <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+warehouses = int(sys.argv[1])
+text = pathlib.Path(sys.argv[2]).read_text(errors="replace")
+lower = text.lower()
+failure_markers = [
+    marker for marker in ("execute check failed", "panic:", "fatal error")
+    if marker in lower
+]
+if failure_markers:
+    raise SystemExit(f"TPC-C post-check reported failure markers: {failure_markers}")
+if sum(line.strip() == "Finished" for line in text.splitlines()) != 1:
+    raise SystemExit("TPC-C post-check did not finish exactly once")
+
+pattern = re.compile(r"^begin to check warehouse (\d+) at condition (3\.3\.2\.(\d+))$")
+observed = []
+for line in text.splitlines():
+    match = pattern.match(line.strip())
+    if match:
+        observed.append((int(match.group(1)), match.group(2)))
+expected = {
+    (warehouse, f"3.3.2.{condition}")
+    for warehouse in range(1, warehouses + 1)
+    for condition in range(1, 13)
+}
+observed_set = set(observed)
+if observed_set != expected or len(observed) != len(expected):
+    missing = sorted(expected - observed_set)
+    unexpected = sorted(observed_set - expected)
+    raise SystemExit(
+        f"TPC-C post-check coverage mismatch: missing={missing}, "
+        f"unexpected={unexpected}, records={len(observed)}, expected={len(expected)}"
+    )
+print(json.dumps({
+    "outcome": "pass",
+    "warehouses": warehouses,
+    "conditions_per_warehouse": 12,
+    "checks_completed": len(observed),
+    "failure_markers": failure_markers,
+}, indent=2, sort_keys=True))
+PY
 
 stop_server post-check
 rm -rf "$MODE_DIR/tmp"
