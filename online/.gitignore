@@ -1,8 +1,5 @@
 /build*/
 /worktrees/
 __pycache__/
-/results/**/store/
-/results/**/tmp/
-/results/**/oom_record/
-!/results/**/*.csv
+/results/
 *.pyc
