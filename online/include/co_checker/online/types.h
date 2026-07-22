@@ -9,10 +9,13 @@
 namespace co_checker::online {
 
 using ByteView    = std::span<const std::byte>;
-using CommitSeq   = std::uint64_t;
-using EventSeq    = std::uint32_t;
-using ProducerId  = std::uint32_t;
-using ProducerSeq = std::uint64_t;
+using CommitSeq      = std::uint64_t;
+using PublicationSeq = std::uint64_t;
+using EventSeq       = std::uint32_t;
+using ProducerId     = std::uint32_t;
+using ProducerSeq    = std::uint64_t;
+
+inline constexpr PublicationSeq kUnassignedPublicationSeq = 0;
 
 struct RuntimeEpoch {
   std::array<std::uint64_t, 2> words{};
@@ -46,6 +49,13 @@ struct CommitOrderToken {
                          const CommitOrderToken &) = default;
 };
 
+enum class OrderTokenKind : std::uint8_t {
+  WriteCommit = 1,
+  ReadOnlyStart,
+  ReadOnlyCompletion,
+  NoWriteCompletion,
+};
+
 struct OrderedTxnMeta {
   CommitSeq commit_seq = 0;
   TransactionUid transaction_id;
@@ -53,6 +63,8 @@ struct OrderedTxnMeta {
   SessionUid session_id;
   std::uint64_t session_seq = 0;
   CommitOrderToken commit_token;
+  OrderTokenKind order_token_kind = OrderTokenKind::WriteCommit;
+  PublicationSeq publication_seq  = kUnassignedPublicationSeq;
   ProducerId producer_id   = 0;
   ProducerSeq producer_seq = 0;
 };

@@ -72,11 +72,16 @@ struct RuntimeOwner {
 };
 
 [[nodiscard]] co_checker_online_options_v1 test_options(
-    const co_checker_online_mode_v1 mode = CO_CHECKER_ONLINE_MODE_FULL_V1) {
+    const co_checker_online_mode_v1 mode = CO_CHECKER_ONLINE_MODE_FULL_V1,
+    const co_checker_online_ordering_protocol_v1 ordering_protocol =
+        CO_CHECKER_ONLINE_ORDERING_FRONTIER_REORDER_V1) {
   co_checker_online_options_v1 options{};
   co_checker_online_options_init_v1(&options);
   options.queue_capacity_bytes          = 1U << 20U;
-  options.reorder_capacity_bytes        = 1U << 20U;
+  options.reorder_capacity_bytes =
+      ordering_protocol == CO_CHECKER_ONLINE_ORDERING_FRONTIER_REORDER_V1
+          ? 1U << 20U
+          : 0U;
   options.capture_capacity_bytes        = 1U << 20U;
   options.retained_state_capacity_bytes = 1U << 20U;
   options.queue_timeout_ns              = 5'000'000'000ULL;
@@ -85,6 +90,7 @@ struct RuntimeOwner {
   options.max_cached_chunk_segments     = 16U;
   options.cluster_epoch                 = 7U;
   options.mode                          = mode;
+  options.ordering_protocol              = ordering_protocol;
   return options;
 }
 
@@ -98,6 +104,14 @@ create_runtime(const co_checker_online_options_v1 &options,
             &runtime) == CO_CHECKER_ONLINE_STATUS_OK_V1);
   CHECK(runtime != nullptr);
   return RuntimeOwner(runtime);
+}
+
+void advance_frontiers(co_checker_online_runtime_v1 *runtime,
+                       const std::uint64_t timestamp) {
+  CHECK(co_checker_online_database_frontier_v1(runtime, timestamp) ==
+        CO_CHECKER_ONLINE_STATUS_OK_V1);
+  CHECK(co_checker_online_producer_frontier_v1(runtime, 1, timestamp) ==
+        CO_CHECKER_ONLINE_STATUS_OK_V1);
 }
 
 struct InputEvent {
@@ -228,8 +242,9 @@ register_attempt(co_checker_online_runtime_v1 *runtime,
   CHECK(co_checker_online_metrics_json_v1(runtime, nullptr, 0, &required) ==
         CO_CHECKER_ONLINE_STATUS_BUFFER_TOO_SMALL_V1);
   CHECK(required > 1U);
-  std::vector<char> buffer(static_cast<std::size_t>(required));
-  CHECK(co_checker_online_metrics_json_v1(runtime, buffer.data(), required,
+  const auto capacity = required + 4096U;
+  std::vector<char> buffer(static_cast<std::size_t>(capacity));
+  CHECK(co_checker_online_metrics_json_v1(runtime, buffer.data(), capacity,
                                           &required) ==
         CO_CHECKER_ONLINE_STATUS_OK_V1);
   return std::string(buffer.data());
@@ -262,7 +277,9 @@ void test_c_header_and_fixed_layout() {
   CHECK(options.struct_size == sizeof(options));
   CHECK(options.abi_version == CO_CHECKER_ONLINE_ABI_VERSION_V1);
   CHECK(options.chunk_segment_bytes == 4096U);
-  CHECK(options.reserved0 == 0U);
+  CHECK(options.reorder_capacity_bytes == 0U);
+  CHECK(options.ordering_protocol ==
+        CO_CHECKER_ONLINE_ORDERING_SERIALIZED_GLOBAL_LOCK_V1);
 }
 
 void test_runtime_generated_logical_ids_are_unique() {
@@ -319,6 +336,7 @@ void test_full_lifecycle_retry_ownership_and_clean_close() {
                                              read.size()) ==
         CO_CHECKER_ONLINE_STATUS_OK_V1);
   std::fill(read.begin(), read.end(), std::byte{0xee});
+  advance_frontiers(runtime, 30);
 
   CHECK(co_checker_online_quiescent_close_v1(runtime) ==
         CO_CHECKER_ONLINE_STATUS_OK_V1);
@@ -343,6 +361,37 @@ void test_full_lifecycle_retry_ownership_and_clean_close() {
   CHECK(metrics.find("\"max_checking_ns\":") != std::string::npos);
 }
 
+void test_live_frontiers_check_before_quiescent_close() {
+  auto owner         = create_runtime(test_options());
+  const auto session = new_session(owner.runtime);
+  const auto attempt = register_attempt(owner.runtime, session, 1, 10);
+  auto input = flat_input(10, 20, false, {write_event(1, "key", "value")});
+  CHECK(co_checker_online_attempt_publish_v1(owner.runtime, &attempt.attempt,
+                                             input.data(), input.size()) ==
+        CO_CHECKER_ONLINE_STATUS_OK_V1);
+
+  const auto before = metrics_json(owner.runtime);
+  CHECK(before.find("\"captured_transactions\":1") != std::string::npos);
+  CHECK(before.find("\"checked_transactions\":0") != std::string::npos);
+  CHECK(co_checker_online_database_frontier_v1(owner.runtime, 20) ==
+        CO_CHECKER_ONLINE_STATUS_OK_V1);
+  CHECK(co_checker_online_producer_frontier_v1(owner.runtime, 1, 20) ==
+        CO_CHECKER_ONLINE_STATUS_OK_V1);
+
+  const auto live = metrics_json(owner.runtime);
+  CHECK(live.find("\"ordered_transactions\":1") != std::string::npos);
+  CHECK(live.find("\"checked_transactions\":1") != std::string::npos);
+  CHECK(live.find("\"checked_events\":1") != std::string::npos);
+  CHECK(live.find("\"closed\":false") != std::string::npos);
+
+  CHECK(co_checker_online_quiescent_close_v1(owner.runtime) ==
+        CO_CHECKER_ONLINE_STATUS_OK_V1);
+  co_checker_online_verdict_v1 verdict{};
+  CHECK(co_checker_online_verdict_get_v1(owner.runtime, &verdict) ==
+        CO_CHECKER_ONLINE_STATUS_OK_V1);
+  CHECK(verdict.status == CO_CHECKER_ONLINE_VERDICT_PASS_V1);
+}
+
 void test_violation_getter() {
   auto owner         = create_runtime(test_options());
   const auto session = new_session(owner.runtime);
@@ -353,6 +402,7 @@ void test_violation_getter() {
   CHECK(co_checker_online_attempt_publish_v1(owner.runtime, &attempt.attempt,
                                              input.data(), input.size()) ==
         CO_CHECKER_ONLINE_STATUS_OK_V1);
+  advance_frontiers(owner.runtime, 10);
   CHECK(co_checker_online_quiescent_close_v1(owner.runtime) ==
         CO_CHECKER_ONLINE_STATUS_OK_V1);
   co_checker_online_verdict_v1 verdict{};
@@ -375,6 +425,9 @@ void test_modes_capture_and_order_never_expose_pass() {
     CHECK(co_checker_online_attempt_publish_v1(owner.runtime, &attempt.attempt,
                                                input.data(), input.size()) ==
           CO_CHECKER_ONLINE_STATUS_OK_V1);
+    if (mode != CO_CHECKER_ONLINE_MODE_CAPTURE_ONLY_V1) {
+      advance_frontiers(owner.runtime, 20);
+    }
     CHECK(co_checker_online_quiescent_close_v1(owner.runtime) ==
           CO_CHECKER_ONLINE_STATUS_OK_V1);
     co_checker_online_verdict_v1 verdict{};
@@ -497,6 +550,7 @@ void test_same_producer_concurrent_publish_assigns_lossless_sequences() {
     thread.join();
   }
   CHECK(failures.load(std::memory_order_relaxed) == 0U);
+  advance_frontiers(owner.runtime, 10'000);
   CHECK(co_checker_online_quiescent_close_v1(owner.runtime) ==
         CO_CHECKER_ONLINE_STATUS_OK_V1);
   const auto metrics = metrics_json(owner.runtime);
@@ -528,6 +582,7 @@ void test_write_path_without_a_normalized_write_uses_commit_token() {
   CHECK(co_checker_online_attempt_publish_v1(owner.runtime, &attempt.attempt,
                                              input.data(), input.size()) ==
         CO_CHECKER_ONLINE_STATUS_OK_V1);
+  advance_frontiers(owner.runtime, 20);
   CHECK(co_checker_online_quiescent_close_v1(owner.runtime) ==
         CO_CHECKER_ONLINE_STATUS_OK_V1);
   co_checker_online_verdict_v1 verdict{};
@@ -597,6 +652,10 @@ void test_retained_state_limit_is_a_fatal_engine_error() {
   CHECK(co_checker_online_attempt_publish_v1(owner.runtime, &attempt.attempt,
                                              input.data(), input.size()) ==
         CO_CHECKER_ONLINE_STATUS_OK_V1);
+  CHECK(co_checker_online_database_frontier_v1(owner.runtime, 20) ==
+        CO_CHECKER_ONLINE_STATUS_OK_V1);
+  CHECK(co_checker_online_producer_frontier_v1(owner.runtime, 1, 20) ==
+        CO_CHECKER_ONLINE_STATUS_RUNTIME_ERROR_V1);
   CHECK(co_checker_online_quiescent_close_v1(owner.runtime) ==
         CO_CHECKER_ONLINE_STATUS_RUNTIME_ERROR_V1);
   co_checker_online_verdict_v1 verdict{};
@@ -610,6 +669,190 @@ void test_retained_state_limit_is_a_fatal_engine_error() {
   CHECK(error.source_error != 0U);
 }
 
+
+void test_serialized_full_prepare_finalize_and_completion() {
+  auto owner = create_runtime(test_options(
+      CO_CHECKER_ONLINE_MODE_FULL_V1,
+      CO_CHECKER_ONLINE_ORDERING_SERIALIZED_GLOBAL_LOCK_V1));
+  const auto session = new_session(owner.runtime);
+
+  const auto writer = register_attempt(owner.runtime, session, 1, 10);
+  auto write =
+      flat_input(10, 0, false, {write_event(1, "key", "value")});
+  CHECK(co_checker_online_attempt_prepare_v1(
+            owner.runtime, &writer.attempt, write.data(), write.size()) ==
+        CO_CHECKER_ONLINE_STATUS_OK_V1);
+  CHECK(metrics_json(owner.runtime).find("\"queue_reserved_depth\":1") !=
+        std::string::npos);
+  CHECK(co_checker_online_attempt_finalize_v1(
+            owner.runtime, &writer.attempt,
+            CO_CHECKER_ONLINE_ORDER_TOKEN_WRITE_COMMIT_V1, 20, 1) ==
+        CO_CHECKER_ONLINE_STATUS_OK_V1);
+
+  const auto reader = register_attempt(owner.runtime, session, 2, 30);
+  auto read = flat_input(
+      30, 0, true,
+      {read_event(1, "key", std::optional<std::string>{"value"})});
+  CHECK(co_checker_online_attempt_prepare_v1(
+            owner.runtime, &reader.attempt, read.data(), read.size()) ==
+        CO_CHECKER_ONLINE_STATUS_OK_V1);
+  CHECK(co_checker_online_attempt_finalize_v1(
+            owner.runtime, &reader.attempt,
+            CO_CHECKER_ONLINE_ORDER_TOKEN_READ_ONLY_COMPLETION_V1, 40, 2) ==
+        CO_CHECKER_ONLINE_STATUS_OK_V1);
+
+  CHECK(co_checker_online_quiescent_close_v1(owner.runtime) ==
+        CO_CHECKER_ONLINE_STATUS_OK_V1);
+  co_checker_online_verdict_v1 verdict{};
+  CHECK(co_checker_online_verdict_get_v1(owner.runtime, &verdict) ==
+        CO_CHECKER_ONLINE_STATUS_OK_V1);
+  CHECK(verdict.status == CO_CHECKER_ONLINE_VERDICT_PASS_V1);
+  const auto metrics = metrics_json(owner.runtime);
+  CHECK(metrics.find("\"ordering_protocol\":1") != std::string::npos);
+  CHECK(metrics.find("\"successful_write_commits\":1") !=
+        std::string::npos);
+  CHECK(metrics.find("\"completion_transactions\":1") !=
+        std::string::npos);
+  CHECK(metrics.find("\"accepted_publications\":2") != std::string::npos);
+  CHECK(metrics.find("\"ordered_transactions\":2") != std::string::npos);
+  CHECK(metrics.find("\"checked_transactions\":2") != std::string::npos);
+  CHECK(metrics.find("\"queue_reserved_depth\":0") != std::string::npos);
+}
+
+void test_serialized_mode_matrix_and_no_write_completion() {
+  for (const auto mode : {CO_CHECKER_ONLINE_MODE_CAPTURE_ONLY_V1,
+                          CO_CHECKER_ONLINE_MODE_ORDER_ONLY_V1,
+                          CO_CHECKER_ONLINE_MODE_FULL_V1}) {
+    auto owner = create_runtime(test_options(
+        mode, CO_CHECKER_ONLINE_ORDERING_SERIALIZED_GLOBAL_LOCK_V1));
+    const auto session = new_session(owner.runtime);
+    const auto attempt = register_attempt(owner.runtime, session, 1, 10);
+    auto input = flat_input(10, 0, false, {});
+    CHECK(co_checker_online_attempt_prepare_v1(
+              owner.runtime, &attempt.attempt, input.data(), input.size()) ==
+          CO_CHECKER_ONLINE_STATUS_OK_V1);
+    CHECK(co_checker_online_attempt_finalize_v1(
+              owner.runtime, &attempt.attempt,
+              CO_CHECKER_ONLINE_ORDER_TOKEN_NO_WRITE_COMPLETION_V1, 20, 1) ==
+          CO_CHECKER_ONLINE_STATUS_OK_V1);
+    CHECK(co_checker_online_quiescent_close_v1(owner.runtime) ==
+          CO_CHECKER_ONLINE_STATUS_OK_V1);
+
+    co_checker_online_verdict_v1 verdict{};
+    CHECK(co_checker_online_verdict_get_v1(owner.runtime, &verdict) ==
+          CO_CHECKER_ONLINE_STATUS_OK_V1);
+    CHECK(verdict.status ==
+          (mode == CO_CHECKER_ONLINE_MODE_FULL_V1
+               ? CO_CHECKER_ONLINE_VERDICT_PASS_V1
+               : CO_CHECKER_ONLINE_VERDICT_UNAVAILABLE_V1));
+    const auto metrics = metrics_json(owner.runtime);
+    CHECK(metrics.find("\"accepted_publications\":1") !=
+          std::string::npos);
+    if (mode == CO_CHECKER_ONLINE_MODE_CAPTURE_ONLY_V1) {
+      CHECK(metrics.find("\"recycled_transactions\":1") !=
+            std::string::npos);
+      CHECK(metrics.find("\"ordered_transactions\":0") !=
+            std::string::npos);
+    }
+  }
+}
+
+void test_serialized_prepared_abort_releases_reservations() {
+  auto owner = create_runtime(test_options(
+      CO_CHECKER_ONLINE_MODE_FULL_V1,
+      CO_CHECKER_ONLINE_ORDERING_SERIALIZED_GLOBAL_LOCK_V1));
+  const auto session = new_session(owner.runtime);
+  const auto attempt = register_attempt(owner.runtime, session, 1, 10);
+  auto input =
+      flat_input(10, 0, false, {write_event(1, "key", "value")});
+  CHECK(co_checker_online_attempt_prepare_v1(
+            owner.runtime, &attempt.attempt, input.data(), input.size()) ==
+        CO_CHECKER_ONLINE_STATUS_OK_V1);
+  CHECK(metrics_json(owner.runtime).find("\"queue_reserved_depth\":1") !=
+        std::string::npos);
+  CHECK(co_checker_online_attempt_abort_v1(owner.runtime, &attempt.attempt) ==
+        CO_CHECKER_ONLINE_STATUS_OK_V1);
+  const auto metrics = metrics_json(owner.runtime);
+  CHECK(metrics.find("\"queue_reserved_depth\":0") != std::string::npos);
+  CHECK(metrics.find("\"capture_active_bytes\":0") != std::string::npos);
+  CHECK(metrics.find("\"definitive_aborts\":1") != std::string::npos);
+  CHECK(co_checker_online_quiescent_close_v1(owner.runtime) ==
+        CO_CHECKER_ONLINE_STATUS_OK_V1);
+}
+
+void test_serialized_sequence_and_wrong_protocol_fail_closed() {
+  {
+    auto owner = create_runtime(test_options(
+        CO_CHECKER_ONLINE_MODE_FULL_V1,
+        CO_CHECKER_ONLINE_ORDERING_SERIALIZED_GLOBAL_LOCK_V1));
+    const auto session = new_session(owner.runtime);
+    const auto attempt = register_attempt(owner.runtime, session, 1, 10);
+    auto input =
+        flat_input(10, 0, false, {write_event(1, "key", "value")});
+    CHECK(co_checker_online_attempt_prepare_v1(
+              owner.runtime, &attempt.attempt, input.data(), input.size()) ==
+          CO_CHECKER_ONLINE_STATUS_OK_V1);
+    CHECK(co_checker_online_attempt_finalize_v1(
+              owner.runtime, &attempt.attempt,
+              CO_CHECKER_ONLINE_ORDER_TOKEN_WRITE_COMMIT_V1, 20, 2) ==
+          CO_CHECKER_ONLINE_STATUS_RUNTIME_ERROR_V1);
+    CHECK(co_checker_online_quiescent_close_v1(owner.runtime) ==
+          CO_CHECKER_ONLINE_STATUS_RUNTIME_ERROR_V1);
+  }
+  {
+    auto owner = create_runtime(test_options(
+        CO_CHECKER_ONLINE_MODE_FULL_V1,
+        CO_CHECKER_ONLINE_ORDERING_SERIALIZED_GLOBAL_LOCK_V1));
+    const auto session = new_session(owner.runtime);
+    const auto attempt = register_attempt(owner.runtime, session, 1, 10);
+    auto input =
+        flat_input(10, 20, false, {write_event(1, "key", "value")});
+    CHECK(co_checker_online_attempt_publish_v1(
+              owner.runtime, &attempt.attempt, input.data(), input.size()) ==
+          CO_CHECKER_ONLINE_STATUS_RUNTIME_ERROR_V1);
+  }
+  {
+    auto owner = create_runtime(test_options());
+    const auto session = new_session(owner.runtime);
+    const auto attempt = register_attempt(owner.runtime, session, 1, 10);
+    auto input =
+        flat_input(10, 0, false, {write_event(1, "key", "value")});
+    CHECK(co_checker_online_attempt_prepare_v1(
+              owner.runtime, &attempt.attempt, input.data(), input.size()) ==
+          CO_CHECKER_ONLINE_STATUS_RUNTIME_ERROR_V1);
+  }
+}
+
+void test_serialized_queue_backpressure_occurs_during_prepare() {
+  auto options = test_options(
+      CO_CHECKER_ONLINE_MODE_FULL_V1,
+      CO_CHECKER_ONLINE_ORDERING_SERIALIZED_GLOBAL_LOCK_V1);
+  options.queue_capacity_bytes = sizeof(BatchHeaderV1);
+  options.queue_timeout_ns     = 30'000'000ULL;
+  auto owner                   = create_runtime(options);
+  const auto first_session     = new_session(owner.runtime);
+  const auto second_session    = new_session(owner.runtime);
+  const auto first =
+      register_attempt(owner.runtime, first_session, 1, 10);
+  const auto second =
+      register_attempt(owner.runtime, second_session, 1, 20);
+  auto first_input  = flat_input(10, 0, false, {});
+  auto second_input = flat_input(20, 0, false, {});
+
+  CHECK(co_checker_online_attempt_prepare_v1(
+            owner.runtime, &first.attempt, first_input.data(),
+            first_input.size()) == CO_CHECKER_ONLINE_STATUS_OK_V1);
+  const auto started = std::chrono::steady_clock::now();
+  CHECK(co_checker_online_attempt_prepare_v1(
+            owner.runtime, &second.attempt, second_input.data(),
+            second_input.size()) == CO_CHECKER_ONLINE_STATUS_RUNTIME_ERROR_V1);
+  CHECK(std::chrono::steady_clock::now() - started >= 20ms);
+  const auto metrics = metrics_json(owner.runtime);
+  CHECK(metrics.find("\"queue_reserved_depth\":1") != std::string::npos);
+  CHECK(metrics.find("\"queue_backpressure_wait_count\":1") !=
+        std::string::npos);
+}
+
 } // namespace
 
 int run_c_api_tests() {
@@ -617,6 +860,7 @@ int run_c_api_tests() {
     test_c_header_and_fixed_layout();
     test_runtime_generated_logical_ids_are_unique();
     test_full_lifecycle_retry_ownership_and_clean_close();
+    test_live_frontiers_check_before_quiescent_close();
     test_violation_getter();
     test_modes_capture_and_order_never_expose_pass();
     test_malformed_input_is_sticky_and_precludes_pass();
@@ -627,6 +871,11 @@ int run_c_api_tests() {
     test_stalled_capture_budget_plateaus_then_fails_closed();
     test_external_fatal_is_sticky();
     test_retained_state_limit_is_a_fatal_engine_error();
+    test_serialized_full_prepare_finalize_and_completion();
+    test_serialized_mode_matrix_and_no_write_completion();
+    test_serialized_prepared_abort_releases_reservations();
+    test_serialized_sequence_and_wrong_protocol_fail_closed();
+    test_serialized_queue_backpressure_occurs_during_prepare();
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "C ABI tests failed: " << error.what() << '\n';

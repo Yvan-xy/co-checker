@@ -53,6 +53,11 @@ enum class NativeMode : std::uint8_t {
   Full,
 };
 
+enum class NativeOrderingProtocol : std::uint8_t {
+  SerializedGlobalLock,
+  FrontierReorder,
+};
+
 struct EntityLess {
   [[nodiscard]] bool operator()(const EntityUid &lhs,
                                 const EntityUid &rhs) const noexcept {
@@ -94,6 +99,22 @@ to_c_epoch(const RuntimeEpoch &epoch) noexcept {
 
 [[nodiscard]] co_checker_online_uid_v1 to_c_uid(const EntityUid &uid) noexcept {
   return co_checker_online_uid_v1{uid.words[0], uid.words[1]};
+}
+
+[[nodiscard]] std::optional<OrderTokenKind>
+to_order_token_kind(const co_checker_online_order_token_kind_v1 kind) noexcept {
+  switch (kind) {
+  case CO_CHECKER_ONLINE_ORDER_TOKEN_WRITE_COMMIT_V1:
+    return OrderTokenKind::WriteCommit;
+  case CO_CHECKER_ONLINE_ORDER_TOKEN_READ_ONLY_START_V1:
+    return OrderTokenKind::ReadOnlyStart;
+  case CO_CHECKER_ONLINE_ORDER_TOKEN_READ_ONLY_COMPLETION_V1:
+    return OrderTokenKind::ReadOnlyCompletion;
+  case CO_CHECKER_ONLINE_ORDER_TOKEN_NO_WRITE_COMPLETION_V1:
+    return OrderTokenKind::NoWriteCompletion;
+  default:
+    return std::nullopt;
+  }
 }
 
 [[nodiscard]] SessionUid
@@ -182,6 +203,11 @@ struct FlatInputView {
   }
 };
 
+enum class FlatInputPurpose : std::uint8_t {
+  FrontierCommitted,
+  SerializedPrepared,
+};
+
 struct FlatParseResult {
   std::optional<FlatInputView> input;
   const char *error = nullptr;
@@ -207,7 +233,8 @@ struct FlatParseResult {
 
 [[nodiscard]] FlatParseResult
 parse_flat_input(const void *flat_input, const std::uint64_t flat_input_size,
-                 const std::size_t segment_size) {
+                 const std::size_t segment_size,
+                 const FlatInputPurpose purpose) {
   if (flat_input == nullptr) {
     return {{}, "flat transaction input is null"};
   }
@@ -239,11 +266,15 @@ parse_flat_input(const void *flat_input, const std::uint64_t flat_input_size,
   if (result.header.start_ts == 0U) {
     return {{}, "transaction start timestamp must be nonzero"};
   }
-  if ((result.header.read_only != 0U && result.header.commit_ts != 0U) ||
-      (result.header.read_only == 0U &&
-       (result.header.commit_ts == 0U ||
-        result.header.commit_ts <= result.header.start_ts))) {
-    return {{}, "transaction start/commit timestamp relation is invalid"};
+  if (purpose == FlatInputPurpose::FrontierCommitted) {
+    if ((result.header.read_only != 0U && result.header.commit_ts != 0U) ||
+        (result.header.read_only == 0U &&
+         (result.header.commit_ts == 0U ||
+          result.header.commit_ts <= result.header.start_ts))) {
+      return {{}, "transaction start/commit timestamp relation is invalid"};
+    }
+  } else if (result.header.commit_ts != 0U) {
+    return {{}, "serialized prepared input must not carry a final commit timestamp"};
   }
 
   std::size_t descriptor_bytes = 0;
@@ -394,6 +425,8 @@ struct NativeConfiguration {
   std::size_t max_cached_segments = 0;
   std::uint64_t cluster_epoch     = 0;
   NativeMode mode                 = NativeMode::Full;
+  NativeOrderingProtocol ordering_protocol =
+      NativeOrderingProtocol::SerializedGlobalLock;
 };
 
 struct ConfigurationResult {
@@ -404,8 +437,8 @@ struct ConfigurationResult {
 
 [[nodiscard]] bool reserved_options_are_zero(
     const co_checker_online_options_v1 &options) noexcept {
-  return options.reserved0 == 0U && options.reserved[0] == 0U &&
-         options.reserved[1] == 0U && options.reserved[2] == 0U;
+  return options.reserved[0] == 0U && options.reserved[1] == 0U &&
+         options.reserved[2] == 0U;
 }
 
 [[nodiscard]] ConfigurationResult
@@ -424,7 +457,6 @@ parse_configuration(const co_checker_online_options_v1 *options) {
            static_cast<std::uint64_t>(std::chrono::nanoseconds::max().count());
   };
   if (options->queue_capacity_bytes == 0U ||
-      options->reorder_capacity_bytes == 0U ||
       options->capture_capacity_bytes == 0U ||
       options->retained_state_capacity_bytes == 0U ||
       options->chunk_segment_bytes < kPackedDescriptorSize ||
@@ -439,7 +471,17 @@ parse_configuration(const co_checker_online_options_v1 *options) {
       !fits_duration(options->capture_timeout_ns) ||
       (options->mode != CO_CHECKER_ONLINE_MODE_CAPTURE_ONLY_V1 &&
        options->mode != CO_CHECKER_ONLINE_MODE_ORDER_ONLY_V1 &&
-       options->mode != CO_CHECKER_ONLINE_MODE_FULL_V1)) {
+       options->mode != CO_CHECKER_ONLINE_MODE_FULL_V1) ||
+      (options->ordering_protocol !=
+           CO_CHECKER_ONLINE_ORDERING_SERIALIZED_GLOBAL_LOCK_V1 &&
+       options->ordering_protocol !=
+           CO_CHECKER_ONLINE_ORDERING_FRONTIER_REORDER_V1) ||
+      (options->ordering_protocol ==
+           CO_CHECKER_ONLINE_ORDERING_SERIALIZED_GLOBAL_LOCK_V1 &&
+       options->reorder_capacity_bytes != 0U) ||
+      (options->ordering_protocol ==
+           CO_CHECKER_ONLINE_ORDERING_FRONTIER_REORDER_V1 &&
+       options->reorder_capacity_bytes == 0U)) {
     return {};
   }
 
@@ -452,8 +494,21 @@ parse_configuration(const co_checker_online_options_v1 *options) {
       static_cast<std::size_t>(options->reorder_capacity_bytes);
   result.runtime.retained_state_capacity_bytes =
       static_cast<std::size_t>(options->retained_state_capacity_bytes);
-  result.runtime.checking_enabled =
-      options->mode == CO_CHECKER_ONLINE_MODE_FULL_V1;
+  if (options->mode == CO_CHECKER_ONLINE_MODE_CAPTURE_ONLY_V1) {
+    result.runtime.pipeline_mode = PipelineMode::CaptureOnly;
+  } else if (options->mode == CO_CHECKER_ONLINE_MODE_ORDER_ONLY_V1) {
+    result.runtime.pipeline_mode = PipelineMode::OrderOnly;
+  } else {
+    result.runtime.pipeline_mode = PipelineMode::Full;
+  }
+  if (options->ordering_protocol ==
+      CO_CHECKER_ONLINE_ORDERING_FRONTIER_REORDER_V1) {
+    result.runtime.ordering_protocol = OrderingProtocol::FrontierReorder;
+    result.ordering_protocol = NativeOrderingProtocol::FrontierReorder;
+  } else {
+    result.runtime.ordering_protocol =
+        OrderingProtocol::SerializedGlobalLock;
+  }
   result.capture.capacity_bytes =
       static_cast<std::size_t>(options->capture_capacity_bytes);
   result.capture.reservation_timeout = std::chrono::nanoseconds{
@@ -487,8 +542,24 @@ struct LogicalTransactionState {
   std::uint64_t session_seq = 0;
 };
 
+struct PreparedEvidence {
+  RuntimePreparedBatch runtime_batch;
+  PackedBatchEnvelope capture_only_batch;
+  std::uint32_t normalized_write_count = 0;
+  std::uint32_t event_count             = 0;
+  bool declared_read_only               = false;
+};
+
+struct AttemptIdentity {
+  EntityUid attempt_id;
+  EntityUid transaction_id;
+  SessionUid session_id;
+  std::uint64_t session_seq = 0;
+  std::uint64_t start_ts    = 0;
+};
+
 struct AttemptState {
-  enum class Phase : std::uint8_t { Registered, Publishing };
+  enum class Phase : std::uint8_t { Registered, Preparing, Prepared, Publishing };
 
   EntityUid attempt_id;
   EntityUid transaction_id;
@@ -496,6 +567,7 @@ struct AttemptState {
   std::uint64_t session_seq = 0;
   std::uint64_t start_ts    = 0;
   Phase phase               = Phase::Registered;
+  std::unique_ptr<PreparedEvidence> prepared;
 };
 
 struct ProducerState {
@@ -509,12 +581,15 @@ public:
                 std::vector<ProducerId> producers)
       : epoch_(make_runtime_epoch()),
         cluster_epoch_(configuration.cluster_epoch), mode_(configuration.mode),
+        ordering_protocol_(configuration.ordering_protocol),
         producers_(producers.begin(), producers.end()),
         chunk_pool_(
             std::make_shared<ChunkPool>(configuration.chunk_segment_bytes,
                                         configuration.max_cached_segments)),
         capture_budget_(configuration.capture),
-        runtime_(std::move(configuration.runtime), std::move(producers)) {
+        runtime_(runtime_options(std::move(configuration.runtime), epoch_,
+                                 cluster_epoch_),
+                 std::move(producers)) {
     for (const auto producer : producers_) {
       producer_state_.try_emplace(producer, std::make_unique<ProducerState>());
     }
@@ -612,7 +687,9 @@ public:
     const EntityUid attempt{
         {mix64(epoch_.words[0] ^ 0xa77e6d5bULL ^ next_attempt_counter_),
          mix64(epoch_.words[1] ^ next_attempt_counter_)}};
-    if (mode_ != NativeMode::CaptureOnly) {
+    if (ordering_protocol_ ==
+            NativeOrderingProtocol::FrontierReorder &&
+        mode_ != NativeMode::CaptureOnly) {
       const auto registered = runtime_.registerActiveStart(
           attempt, session.producer_id,
           CommitOrderToken{cluster_epoch_, start_ts, std::nullopt});
@@ -621,10 +698,19 @@ public:
       }
     }
     attempts_.try_emplace(
-        attempt, AttemptState{attempt, transaction, session, session_seq,
-                              start_ts, AttemptState::Phase::Registered});
+        attempt,
+        AttemptState{.attempt_id     = attempt,
+                     .transaction_id = transaction,
+                     .session_id     = session,
+                     .session_seq    = session_seq,
+                     .start_ts       = start_ts,
+                     .phase          = AttemptState::Phase::Registered,
+                     .prepared       = nullptr});
     active_by_transaction_.try_emplace(transaction, attempt);
-    update_highest(start_ts);
+    if (ordering_protocol_ ==
+        NativeOrderingProtocol::FrontierReorder) {
+      update_highest(start_ts);
+    }
     attempt_out = attempt;
     return CO_CHECKER_ONLINE_STATUS_OK_V1;
   }
@@ -636,34 +722,63 @@ public:
         status != CO_CHECKER_ONLINE_STATUS_OK_V1) {
       return status;
     }
-    std::lock_guard state_lock(state_mutex_);
-    const auto attempt_it = attempts_.find(attempt);
-    if (attempt_it == attempts_.end() ||
-        attempt_it->second.phase != AttemptState::Phase::Registered) {
-      return fail_lifecycle("abort did not match a registered native attempt");
+
+    std::unique_ptr<PreparedEvidence> prepared;
+    EntityUid transaction_id;
+    {
+      std::lock_guard state_lock(state_mutex_);
+      const auto attempt_it = attempts_.find(attempt);
+      if (attempt_it == attempts_.end()) {
+        return fail_lifecycle(
+            "abort did not match a registered native attempt");
+      }
+      const bool serialized_abort =
+          ordering_protocol_ ==
+              NativeOrderingProtocol::SerializedGlobalLock &&
+          (attempt_it->second.phase == AttemptState::Phase::Registered ||
+           attempt_it->second.phase == AttemptState::Phase::Prepared);
+      const bool frontier_abort =
+          ordering_protocol_ == NativeOrderingProtocol::FrontierReorder &&
+          attempt_it->second.phase == AttemptState::Phase::Registered;
+      if (!serialized_abort && !frontier_abort) {
+        return fail_lifecycle(
+            "abort did not match an abortable native attempt");
+      }
+      transaction_id = attempt_it->second.transaction_id;
+      prepared       = std::move(attempt_it->second.prepared);
+      active_by_transaction_.erase(transaction_id);
+      attempts_.erase(attempt_it);
     }
-    if (mode_ != NativeMode::CaptureOnly) {
+
+    if (ordering_protocol_ == NativeOrderingProtocol::FrontierReorder &&
+        mode_ != NativeMode::CaptureOnly) {
       const auto aborted = runtime_.abortActiveStart(attempt);
       if (!aborted.ok()) {
         return CO_CHECKER_ONLINE_STATUS_RUNTIME_ERROR_V1;
       }
     }
-    active_by_transaction_.erase(attempt_it->second.transaction_id);
-    attempts_.erase(attempt_it);
+    definitive_aborts_.fetch_add(1U, std::memory_order_relaxed);
     return CO_CHECKER_ONLINE_STATUS_OK_V1;
   }
 
   [[nodiscard]] co_checker_online_status_v1
-  publish(const EntityUid &attempt, const void *flat_input,
+  prepare(const EntityUid &attempt, const void *flat_input,
           const std::uint64_t flat_input_size) {
     std::shared_lock lifecycle_lock(lifecycle_mutex_);
+    if (ordering_protocol_ !=
+        NativeOrderingProtocol::SerializedGlobalLock) {
+      return fail_lifecycle(
+          "two-stage prepare is only valid for serialized-global-lock");
+    }
     if (const auto status = available_status();
         status != CO_CHECKER_ONLINE_STATUS_OK_V1) {
       return status;
     }
+
     const auto parse_started = std::chrono::steady_clock::now();
-    const auto parsed        = parse_flat_input(flat_input, flat_input_size,
-                                                chunk_pool_->ordinary_segment_size());
+    const auto parsed = parse_flat_input(
+        flat_input, flat_input_size, chunk_pool_->ordinary_segment_size(),
+        FlatInputPurpose::SerializedPrepared);
     native_parse_ns_.fetch_add(
         static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -674,7 +789,242 @@ public:
       return fail_malformed(parsed.error);
     }
 
-    AttemptState attempt_state;
+    AttemptIdentity attempt_state;
+    {
+      std::lock_guard state_lock(state_mutex_);
+      const auto attempt_it = attempts_.find(attempt);
+      if (attempt_it == attempts_.end() ||
+          attempt_it->second.phase != AttemptState::Phase::Registered) {
+        return fail_lifecycle(
+            "prepare did not match a registered native attempt");
+      }
+      if (parsed.input->header.start_ts != attempt_it->second.start_ts) {
+        return fail_malformed(
+            "prepared start timestamp disagrees with registration");
+      }
+      attempt_it->second.phase = AttemptState::Phase::Preparing;
+      attempt_state = AttemptIdentity{
+          .attempt_id     = attempt_it->second.attempt_id,
+          .transaction_id = attempt_it->second.transaction_id,
+          .session_id     = attempt_it->second.session_id,
+          .session_seq    = attempt_it->second.session_seq,
+          .start_ts       = attempt_it->second.start_ts,
+      };
+    }
+
+    OrderedTxnMeta metadata;
+    metadata.commit_seq     = kUnassignedCommitSeq;
+    metadata.transaction_id = attempt_state.transaction_id;
+    metadata.attempt_id     = attempt_state.attempt_id;
+    metadata.session_id     = attempt_state.session_id;
+    metadata.session_seq    = attempt_state.session_seq;
+    metadata.commit_token =
+        CommitOrderToken{cluster_epoch_, 0, std::nullopt};
+    metadata.order_token_kind =
+        parsed.input->header.read_only != 0U
+            ? OrderTokenKind::ReadOnlyCompletion
+            : OrderTokenKind::WriteCommit;
+    metadata.publication_seq = kUnassignedPublicationSeq;
+    metadata.producer_id     = attempt_state.session_id.producer_id;
+    metadata.producer_seq    = 0;
+
+    PackedBatchEnvelope envelope;
+    if (const auto built = build_batch(*parsed.input, metadata, envelope);
+        built != CO_CHECKER_ONLINE_STATUS_OK_V1) {
+      return built;
+    }
+
+    auto evidence = std::make_unique<PreparedEvidence>();
+    evidence->normalized_write_count = envelope.view().write_count();
+    evidence->event_count             = envelope.view().event_count();
+    evidence->declared_read_only =
+        parsed.input->header.read_only != 0U;
+    if (mode_ == NativeMode::CaptureOnly) {
+      evidence->capture_only_batch = std::move(envelope);
+    } else {
+      const auto handoff_started = std::chrono::steady_clock::now();
+      auto prepared = runtime_.prepareCommitted(std::move(envelope));
+      native_handoff_ns_.fetch_add(
+          static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - handoff_started)
+                  .count()),
+          std::memory_order_relaxed);
+      if (!prepared.ok()) {
+        return CO_CHECKER_ONLINE_STATUS_RUNTIME_ERROR_V1;
+      }
+      evidence->runtime_batch = std::move(prepared.prepared);
+    }
+
+    {
+      std::lock_guard state_lock(state_mutex_);
+      const auto attempt_it = attempts_.find(attempt);
+      if (attempt_it == attempts_.end() ||
+          attempt_it->second.phase != AttemptState::Phase::Preparing ||
+          attempt_it->second.prepared != nullptr) {
+        return fail_lifecycle(
+            "prepared ownership no longer matches its native attempt");
+      }
+      attempt_it->second.prepared = std::move(evidence);
+      attempt_it->second.phase    = AttemptState::Phase::Prepared;
+    }
+    prepared_transactions_.fetch_add(1U, std::memory_order_relaxed);
+    return CO_CHECKER_ONLINE_STATUS_OK_V1;
+  }
+
+  [[nodiscard]] co_checker_online_status_v1
+  finalize(const EntityUid &attempt,
+           const co_checker_online_order_token_kind_v1 c_token_kind,
+           const std::uint64_t order_token,
+           const PublicationSeq publication_seq) {
+    std::shared_lock lifecycle_lock(lifecycle_mutex_);
+    if (ordering_protocol_ !=
+        NativeOrderingProtocol::SerializedGlobalLock) {
+      return fail_lifecycle(
+          "two-stage finalize is only valid for serialized-global-lock");
+    }
+    if (const auto status = available_status();
+        status != CO_CHECKER_ONLINE_STATUS_OK_V1) {
+      return status;
+    }
+    const auto token_kind = to_order_token_kind(c_token_kind);
+    if (!token_kind.has_value() ||
+        *token_kind == OrderTokenKind::ReadOnlyStart ||
+        order_token == 0 || publication_seq == kUnassignedPublicationSeq) {
+      return fail_lifecycle("serialized finalization metadata is invalid");
+    }
+
+    std::lock_guard publication_lock(serialized_publication_mutex_);
+    if (publication_sequence_exhausted_ ||
+        publication_seq != next_publication_seq_) {
+      return fail_lifecycle(
+          "serialized PublicationSeq is not the next accepted value");
+    }
+    const CommitOrderToken token{
+        cluster_epoch_, order_token, std::nullopt};
+    if (last_serialized_token_.has_value() &&
+        compareCommitOrderTokens(*last_serialized_token_, token) !=
+            TokenRelation::Less) {
+      return fail_lifecycle(
+          "serialized finalization token did not increase strictly");
+    }
+
+    AttemptIdentity attempt_state;
+    std::unique_ptr<PreparedEvidence> evidence;
+    {
+      std::lock_guard state_lock(state_mutex_);
+      const auto attempt_it = attempts_.find(attempt);
+      if (attempt_it == attempts_.end() ||
+          attempt_it->second.phase != AttemptState::Phase::Prepared ||
+          attempt_it->second.prepared == nullptr) {
+        return fail_lifecycle(
+            "finalize did not match a prepared native attempt");
+      }
+      attempt_state = AttemptIdentity{
+          .attempt_id     = attempt_it->second.attempt_id,
+          .transaction_id = attempt_it->second.transaction_id,
+          .session_id     = attempt_it->second.session_id,
+          .session_seq    = attempt_it->second.session_seq,
+          .start_ts       = attempt_it->second.start_ts,
+      };
+      evidence = std::move(attempt_it->second.prepared);
+      attempt_it->second.phase = AttemptState::Phase::Publishing;
+    }
+
+    const bool is_write = *token_kind == OrderTokenKind::WriteCommit;
+    if ((!is_write && evidence->normalized_write_count != 0U) ||
+        (*token_kind == OrderTokenKind::ReadOnlyCompletion &&
+         !evidence->declared_read_only) ||
+        (is_write && evidence->declared_read_only)) {
+      return fail_lifecycle(
+          "serialized token kind disagrees with prepared final writes");
+    }
+
+    OrderedTxnMeta metadata;
+    metadata.commit_seq       = kUnassignedCommitSeq;
+    metadata.transaction_id   = attempt_state.transaction_id;
+    metadata.attempt_id       = attempt_state.attempt_id;
+    metadata.session_id       = attempt_state.session_id;
+    metadata.session_seq      = attempt_state.session_seq;
+    metadata.commit_token     = token;
+    metadata.order_token_kind = *token_kind;
+    metadata.publication_seq  = publication_seq;
+    metadata.producer_id      = attempt_state.session_id.producer_id;
+    metadata.producer_seq     = publication_seq;
+
+    if (mode_ == NativeMode::CaptureOnly) {
+      if (!evidence->capture_only_batch.valid()) {
+        return fail_lifecycle(
+            "capture-only finalization lost prepared batch ownership");
+      }
+      recycled_transactions_.fetch_add(1U, std::memory_order_relaxed);
+    } else {
+      const auto handoff_started = std::chrono::steady_clock::now();
+      auto submitted = runtime_.submitPrepared(
+          std::move(evidence->runtime_batch), metadata);
+      native_handoff_ns_.fetch_add(
+          static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - handoff_started)
+                  .count()),
+          std::memory_order_relaxed);
+      if (!submitted.ok()) {
+        committed_but_unpublished_.fetch_add(
+            is_write ? 1U : 0U, std::memory_order_relaxed);
+        return CO_CHECKER_ONLINE_STATUS_RUNTIME_ERROR_V1;
+      }
+    }
+
+    last_serialized_token_ = token;
+    if (next_publication_seq_ ==
+        std::numeric_limits<PublicationSeq>::max()) {
+      publication_sequence_exhausted_ = true;
+    } else {
+      ++next_publication_seq_;
+    }
+    accepted_publications_.fetch_add(1U, std::memory_order_relaxed);
+    if (is_write) {
+      successful_write_commits_.fetch_add(1U, std::memory_order_relaxed);
+    } else {
+      completion_transactions_.fetch_add(1U, std::memory_order_relaxed);
+    }
+    update_highest(order_token);
+    {
+      std::lock_guard state_lock(state_mutex_);
+      active_by_transaction_.erase(attempt_state.transaction_id);
+      attempts_.erase(attempt_state.attempt_id);
+      logical_transactions_.erase(attempt_state.transaction_id);
+    }
+    return CO_CHECKER_ONLINE_STATUS_OK_V1;
+  }
+
+  [[nodiscard]] co_checker_online_status_v1
+  publish(const EntityUid &attempt, const void *flat_input,
+          const std::uint64_t flat_input_size) {
+    std::shared_lock lifecycle_lock(lifecycle_mutex_);
+    if (ordering_protocol_ != NativeOrderingProtocol::FrontierReorder) {
+      return fail_lifecycle(
+          "one-stage publish is only valid for frontier-reorder");
+    }
+    if (const auto status = available_status();
+        status != CO_CHECKER_ONLINE_STATUS_OK_V1) {
+      return status;
+    }
+    const auto parse_started = std::chrono::steady_clock::now();
+    const auto parsed = parse_flat_input(
+        flat_input, flat_input_size, chunk_pool_->ordinary_segment_size(),
+        FlatInputPurpose::FrontierCommitted);
+    native_parse_ns_.fetch_add(
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - parse_started)
+                .count()),
+        std::memory_order_relaxed);
+    if (!parsed.input.has_value()) {
+      return fail_malformed(parsed.error);
+    }
+
+    AttemptIdentity attempt_state;
     {
       std::lock_guard state_lock(state_mutex_);
       const auto attempt_it = attempts_.find(attempt);
@@ -688,22 +1038,13 @@ public:
             "published start timestamp disagrees with registration");
       }
       attempt_it->second.phase = AttemptState::Phase::Publishing;
-      attempt_state            = attempt_it->second;
-    }
-
-    const auto reserve_started = std::chrono::steady_clock::now();
-    auto reservation =
-        capture_budget_.reserve(parsed.input->estimated_reserved_bytes);
-    native_reserve_ns_.fetch_add(
-        static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - reserve_started)
-                .count()),
-        std::memory_order_relaxed);
-    if (!reservation.ok()) {
-      return fail_resource(reservation.error.has_value()
-                               ? reservation.error->message
-                               : "native capture reservation failed");
+      attempt_state = AttemptIdentity{
+          .attempt_id     = attempt_it->second.attempt_id,
+          .transaction_id = attempt_it->second.transaction_id,
+          .session_id     = attempt_it->second.session_id,
+          .session_seq    = attempt_it->second.session_seq,
+          .start_ts       = attempt_it->second.start_ts,
+      };
     }
 
     auto *producer =
@@ -735,56 +1076,11 @@ public:
     metadata.producer_id  = attempt_state.session_id.producer_id;
     metadata.producer_seq = producer_sequence;
 
-    const auto build_started = std::chrono::steady_clock::now();
-    ChunkBatchBuilder builder(chunk_pool_, metadata);
-    for (std::size_t index = 0; index < parsed.input->header.event_count;
-         ++index) {
-      const auto event = parsed.input->event(index);
-      const auto key   = parsed.input->blob(event.key_offset, event.key_size);
-      const TaggedBytes tagged =
-          event.value_state == CO_CHECKER_ONLINE_VALUE_PRESENT_V1
-              ? TaggedBytes{PresentBytes{
-                    parsed.input->blob(event.value_offset, event.value_size)}}
-              : TaggedBytes{Absent{}};
-      BatchBuildStatus built;
-      if (event.operation == CO_CHECKER_ONLINE_EVENT_READ_V1) {
-        built = builder.append_read(event.sequence, key, tagged,
-                                    event.read_source ==
-                                            CO_CHECKER_ONLINE_READ_SNAPSHOT_V1
-                                        ? ReadSource::Snapshot
-                                        : ReadSource::Local);
-      } else {
-        built = builder.append_write(event.sequence, key, tagged);
-      }
-      if (!built.ok()) {
-        return fail_malformed("native chunk builder rejected a flat event");
-      }
+    PackedBatchEnvelope envelope;
+    if (const auto built = build_batch(*parsed.input, metadata, envelope);
+        built != CO_CHECKER_ONLINE_STATUS_OK_V1) {
+      return built;
     }
-    auto sealed = builder.seal();
-    if (!sealed.ok()) {
-      return fail_malformed("native chunk builder could not seal its batch");
-    }
-    if (sealed.batch->reserved_bytes() !=
-        parsed.input->estimated_reserved_bytes) {
-      return fail_resource(
-          "native capture reservation disagrees with sealed batch bytes");
-    }
-    native_build_ns_.fetch_add(
-        static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - build_started)
-                .count()),
-        std::memory_order_relaxed);
-
-    PackedBatchEnvelope envelope(std::move(sealed.batch),
-                                 std::move(reservation.lease));
-    captured_transactions_.fetch_add(1U, std::memory_order_relaxed);
-    captured_events_.fetch_add(parsed.input->header.event_count,
-                               std::memory_order_relaxed);
-    captured_used_bytes_.fetch_add(envelope.used_bytes(),
-                                   std::memory_order_relaxed);
-    captured_reserved_bytes_.fetch_add(envelope.reserved_bytes(),
-                                       std::memory_order_relaxed);
 
     if (mode_ != NativeMode::CaptureOnly) {
       const auto handoff_started = std::chrono::steady_clock::now();
@@ -814,6 +1110,10 @@ public:
   [[nodiscard]] co_checker_online_status_v1
   database_frontier(const std::uint64_t timestamp) {
     std::shared_lock lifecycle_lock(lifecycle_mutex_);
+    if (ordering_protocol_ != NativeOrderingProtocol::FrontierReorder) {
+      return fail_lifecycle(
+          "database frontier is only valid for frontier-reorder");
+    }
     if (const auto status = available_status();
         status != CO_CHECKER_ONLINE_STATUS_OK_V1) {
       return status;
@@ -836,6 +1136,10 @@ public:
   producer_frontier(const ProducerId producer_id,
                     const std::uint64_t timestamp) {
     std::shared_lock lifecycle_lock(lifecycle_mutex_);
+    if (ordering_protocol_ != NativeOrderingProtocol::FrontierReorder) {
+      return fail_lifecycle(
+          "producer frontier is only valid for frontier-reorder");
+    }
     if (const auto status = available_status();
         status != CO_CHECKER_ONLINE_STATUS_OK_V1) {
       return status;
@@ -891,36 +1195,45 @@ public:
       }
     }
 
-    if (mode_ != NativeMode::CaptureOnly) {
-      const auto closing_timestamp =
-          highest_observed_timestamp_.load(std::memory_order_acquire);
-      if (closing_timestamp != 0U) {
-        if (!runtime_
-                 .updateDatabaseFrontier(CommitOrderToken{
-                     cluster_epoch_, closing_timestamp, std::nullopt})
-                 .ok()) {
-          (void)runtime_.shutdown();
-          closed_ = true;
-          (void)capture_budget_.close();
-          return CO_CHECKER_ONLINE_STATUS_RUNTIME_ERROR_V1;
-        }
-        for (const auto &[producer_id, producer] : producer_state_) {
-          std::lock_guard producer_lock(producer->mutex);
-          if (!runtime_
-                   .updateProducerDeliveryFrontier(
-                       producer_id,
-                       CommitOrderToken{cluster_epoch_, closing_timestamp,
-                                        std::nullopt},
-                       producer->last_sequence)
-                   .ok()) {
-            (void)runtime_.shutdown();
-            closed_ = true;
-            (void)capture_budget_.close();
-            return CO_CHECKER_ONLINE_STATUS_RUNTIME_ERROR_V1;
-          }
-        }
+    if (mode_ != NativeMode::CaptureOnly &&
+        !runtime_.quiescentBarrier().ok()) {
+      (void)runtime_.shutdown();
+      closed_ = true;
+      (void)capture_budget_.close();
+      return CO_CHECKER_ONLINE_STATUS_RUNTIME_ERROR_V1;
+    }
+
+    if (ordering_protocol_ ==
+        NativeOrderingProtocol::SerializedGlobalLock) {
+      const auto writes =
+          successful_write_commits_.load(std::memory_order_relaxed);
+      const auto completions =
+          completion_transactions_.load(std::memory_order_relaxed);
+      const auto accepted =
+          accepted_publications_.load(std::memory_order_relaxed);
+      const auto recycled =
+          recycled_transactions_.load(std::memory_order_relaxed);
+      bool lifecycle_mismatch = writes + completions != accepted;
+      if (mode_ == NativeMode::CaptureOnly) {
+        lifecycle_mismatch =
+            lifecycle_mismatch || accepted != recycled;
+      } else {
+        const auto runtime_metrics = runtime_.metrics();
+        lifecycle_mismatch =
+            lifecycle_mismatch ||
+            accepted != runtime_metrics.published_transactions ||
+            accepted != runtime_metrics.ordered_transactions ||
+            (mode_ == NativeMode::Full &&
+             accepted != runtime_metrics.checked_transactions);
       }
-      if (!runtime_.quiescentBarrier().ok()) {
+      const auto capture_metrics = capture_budget_.metrics();
+      lifecycle_mismatch =
+          lifecycle_mismatch || capture_metrics.reserved_bytes != 0;
+      if (lifecycle_mismatch) {
+        (void)set_failure(
+            CO_CHECKER_ONLINE_ADAPTER_ERROR_LIFECYCLE_V1, 0,
+            "serialized lifecycle counters do not agree at close",
+            RuntimeErrorCode::IncompletePrefix);
         (void)runtime_.shutdown();
         closed_ = true;
         (void)capture_budget_.close();
@@ -986,10 +1299,26 @@ public:
     }
     std::ostringstream out;
     out << '{' << "\"mode\":" << static_cast<unsigned>(mode_) + 1U << ','
+        << "\"ordering_protocol\":"
+        << static_cast<unsigned>(ordering_protocol_) + 1U << ','
         << "\"closed\":" << (closed_ ? "true" : "false") << ',' << "\"fatal\":"
         << (failure().has_value() || runtime_.error().has_value() ? "true"
                                                                   : "false")
         << ",\"active_attempts\":" << active_attempts
+        << ",\"prepared_transactions\":"
+        << prepared_transactions_.load(std::memory_order_relaxed)
+        << ",\"definitive_aborts\":"
+        << definitive_aborts_.load(std::memory_order_relaxed)
+        << ",\"successful_write_commits\":"
+        << successful_write_commits_.load(std::memory_order_relaxed)
+        << ",\"completion_transactions\":"
+        << completion_transactions_.load(std::memory_order_relaxed)
+        << ",\"accepted_publications\":"
+        << accepted_publications_.load(std::memory_order_relaxed)
+        << ",\"recycled_transactions\":"
+        << recycled_transactions_.load(std::memory_order_relaxed)
+        << ",\"committed_but_unpublished\":"
+        << committed_but_unpublished_.load(std::memory_order_relaxed)
         << ",\"captured_transactions\":"
         << captured_transactions_.load(std::memory_order_relaxed)
         << ",\"captured_events\":"
@@ -1022,6 +1351,10 @@ public:
         << ",\"chunk_cached_segments\":"
         << pool_metrics.cached_ordinary_segments
         << ",\"queue_capacity_bytes\":" << runtime_metrics.queue.capacity_bytes
+        << ",\"queue_reserved_bytes\":"
+        << runtime_metrics.queue.reserved_bytes
+        << ",\"queue_reserved_depth\":"
+        << runtime_metrics.queue.reserved_depth
         << ",\"queue_bytes\":" << runtime_metrics.queue.queued_bytes
         << ",\"queue_peak_bytes\":"
         << runtime_metrics.queue.high_water_queued_bytes
@@ -1064,6 +1397,85 @@ public:
   }
 
 private:
+  [[nodiscard]] co_checker_online_status_v1
+  build_batch(const FlatInputView &input, const OrderedTxnMeta &metadata,
+              PackedBatchEnvelope &output) {
+    const auto reserve_started = std::chrono::steady_clock::now();
+    auto reservation =
+        capture_budget_.reserve(input.estimated_reserved_bytes);
+    native_reserve_ns_.fetch_add(
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - reserve_started)
+                .count()),
+        std::memory_order_relaxed);
+    if (!reservation.ok()) {
+      return fail_resource(reservation.error.has_value()
+                               ? reservation.error->message
+                               : "native capture reservation failed");
+    }
+
+    const auto build_started = std::chrono::steady_clock::now();
+    ChunkBatchBuilder builder(chunk_pool_, metadata);
+    for (std::size_t index = 0; index < input.header.event_count; ++index) {
+      const auto event = input.event(index);
+      const auto key   = input.blob(event.key_offset, event.key_size);
+      const TaggedBytes tagged =
+          event.value_state == CO_CHECKER_ONLINE_VALUE_PRESENT_V1
+              ? TaggedBytes{
+                    PresentBytes{input.blob(event.value_offset,
+                                            event.value_size)}}
+              : TaggedBytes{Absent{}};
+      BatchBuildStatus built;
+      if (event.operation == CO_CHECKER_ONLINE_EVENT_READ_V1) {
+        built = builder.append_read(
+            event.sequence, key, tagged,
+            event.read_source == CO_CHECKER_ONLINE_READ_SNAPSHOT_V1
+                ? ReadSource::Snapshot
+                : ReadSource::Local);
+      } else {
+        built = builder.append_write(event.sequence, key, tagged);
+      }
+      if (!built.ok()) {
+        return fail_malformed("native chunk builder rejected a flat event");
+      }
+    }
+
+    auto sealed = builder.seal();
+    if (!sealed.ok()) {
+      return fail_malformed("native chunk builder could not seal its batch");
+    }
+    if (sealed.batch->reserved_bytes() != input.estimated_reserved_bytes) {
+      return fail_resource(
+          "native capture reservation disagrees with sealed batch bytes");
+    }
+    native_build_ns_.fetch_add(
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - build_started)
+                .count()),
+        std::memory_order_relaxed);
+
+    output = PackedBatchEnvelope(std::move(sealed.batch),
+                                 std::move(reservation.lease));
+    captured_transactions_.fetch_add(1U, std::memory_order_relaxed);
+    captured_events_.fetch_add(input.header.event_count,
+                               std::memory_order_relaxed);
+    captured_used_bytes_.fetch_add(output.used_bytes(),
+                                   std::memory_order_relaxed);
+    captured_reserved_bytes_.fetch_add(output.reserved_bytes(),
+                                       std::memory_order_relaxed);
+    return CO_CHECKER_ONLINE_STATUS_OK_V1;
+  }
+
+  [[nodiscard]] static RuntimeOptions
+  runtime_options(RuntimeOptions options, const RuntimeEpoch &epoch,
+                  const std::uint64_t cluster_epoch) noexcept {
+    options.expected_runtime_epoch = epoch;
+    options.expected_cluster_epoch = cluster_epoch;
+    return options;
+  }
+
   void update_highest(const std::uint64_t timestamp) noexcept {
     auto current = highest_observed_timestamp_.load(std::memory_order_relaxed);
     while (current < timestamp &&
@@ -1126,6 +1538,8 @@ private:
   RuntimeEpoch epoch_;
   std::uint64_t cluster_epoch_ = 0;
   NativeMode mode_             = NativeMode::Full;
+  NativeOrderingProtocol ordering_protocol_ =
+      NativeOrderingProtocol::SerializedGlobalLock;
   std::set<ProducerId> producers_;
   std::map<ProducerId, std::unique_ptr<ProducerState>> producer_state_;
   std::shared_ptr<ChunkPool> chunk_pool_;
@@ -1148,7 +1562,20 @@ private:
 
   mutable std::mutex failure_mutex_;
   std::optional<AdapterFailure> failure_;
+
+  std::mutex serialized_publication_mutex_;
+  PublicationSeq next_publication_seq_ = 1;
+  bool publication_sequence_exhausted_ = false;
+  std::optional<CommitOrderToken> last_serialized_token_;
+
   std::atomic<std::uint64_t> highest_observed_timestamp_{0};
+  std::atomic<std::uint64_t> prepared_transactions_{0};
+  std::atomic<std::uint64_t> definitive_aborts_{0};
+  std::atomic<std::uint64_t> successful_write_commits_{0};
+  std::atomic<std::uint64_t> completion_transactions_{0};
+  std::atomic<std::uint64_t> accepted_publications_{0};
+  std::atomic<std::uint64_t> recycled_transactions_{0};
+  std::atomic<std::uint64_t> committed_but_unpublished_{0};
   std::atomic<std::uint64_t> captured_transactions_{0};
   std::atomic<std::uint64_t> captured_events_{0};
   std::atomic<std::uint64_t> captured_used_bytes_{0};
@@ -1194,7 +1621,7 @@ void co_checker_online_options_init_v1(co_checker_online_options_v1 *options) {
   options->struct_size                   = sizeof(*options);
   options->abi_version                   = CO_CHECKER_ONLINE_ABI_VERSION_V1;
   options->queue_capacity_bytes          = 64U * 1024U * 1024U;
-  options->reorder_capacity_bytes        = 64U * 1024U * 1024U;
+  options->reorder_capacity_bytes        = 0U;
   options->capture_capacity_bytes        = 64U * 1024U * 1024U;
   options->retained_state_capacity_bytes = 256U * 1024U * 1024U;
   options->queue_timeout_ns              = 30U * 1000U * 1000U * 1000U;
@@ -1203,6 +1630,8 @@ void co_checker_online_options_init_v1(co_checker_online_options_v1 *options) {
   options->max_cached_chunk_segments     = 64U;
   options->cluster_epoch                 = 1U;
   options->mode                          = CO_CHECKER_ONLINE_MODE_FULL_V1;
+  options->ordering_protocol =
+      CO_CHECKER_ONLINE_ORDERING_SERIALIZED_GLOBAL_LOCK_V1;
 }
 
 void co_checker_online_txn_input_header_init_v1(
@@ -1226,7 +1655,11 @@ co_checker_online_status_v1 co_checker_online_runtime_create_v1(
   *runtime_out      = nullptr;
   const auto parsed = parse_configuration(options);
   if (!parsed.configuration.has_value() || required_producers == nullptr ||
-      producer_count == 0U) {
+      producer_count == 0U ||
+      (parsed.configuration.has_value() &&
+       parsed.configuration->ordering_protocol ==
+           NativeOrderingProtocol::SerializedGlobalLock &&
+       producer_count != 1U)) {
     return CO_CHECKER_ONLINE_STATUS_INVALID_ARGUMENT_V1;
   }
   try {
@@ -1361,6 +1794,47 @@ co_checker_online_attempt_abort_v1(co_checker_online_runtime_v1 *runtime,
   } catch (...) {
     return runtime->native->unexpected_fatal(
         "unexpected native attempt abort failure");
+  }
+}
+
+co_checker_online_status_v1
+co_checker_online_attempt_prepare_v1(co_checker_online_runtime_v1 *runtime,
+                                     const co_checker_online_uid_v1 *attempt_id,
+                                     const void *flat_input,
+                                     const std::uint64_t flat_input_size) {
+  if (runtime == nullptr || attempt_id == nullptr) {
+    return CO_CHECKER_ONLINE_STATUS_INVALID_ARGUMENT_V1;
+  }
+  try {
+    return runtime->native->prepare(to_uid(*attempt_id), flat_input,
+                                    flat_input_size);
+  } catch (const std::bad_alloc &) {
+    return runtime->native->resource_fatal(
+        "could not allocate prepared native capture state");
+  } catch (...) {
+    return runtime->native->unexpected_fatal(
+        "unexpected native prepare failure");
+  }
+}
+
+co_checker_online_status_v1 co_checker_online_attempt_finalize_v1(
+    co_checker_online_runtime_v1 *runtime,
+    const co_checker_online_uid_v1 *attempt_id,
+    const co_checker_online_order_token_kind_v1 token_kind,
+    const std::uint64_t order_token,
+    const std::uint64_t publication_seq) {
+  if (runtime == nullptr || attempt_id == nullptr) {
+    return CO_CHECKER_ONLINE_STATUS_INVALID_ARGUMENT_V1;
+  }
+  try {
+    return runtime->native->finalize(to_uid(*attempt_id), token_kind,
+                                     order_token, publication_seq);
+  } catch (const std::bad_alloc &) {
+    return runtime->native->resource_fatal(
+        "serialized finalization unexpectedly allocated");
+  } catch (...) {
+    return runtime->native->unexpected_fatal(
+        "unexpected native finalize failure");
   }
 }
 

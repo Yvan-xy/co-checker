@@ -17,6 +17,7 @@
 #include "co_checker/online/order_gate.h"
 #include "co_checker/online/packed_batch.h"
 #include "co_checker/online/result.h"
+#include "co_checker/online/serialized_order.h"
 
 namespace co_checker::online {
 
@@ -41,15 +42,30 @@ struct RuntimeError {
   friend bool operator==(const RuntimeError &, const RuntimeError &) = default;
 };
 
+enum class PipelineMode : std::uint8_t {
+  CaptureOnly = 1,
+  OrderOnly,
+  Full,
+};
+
+enum class OrderingProtocol : std::uint8_t {
+  SerializedGlobalLock = 1,
+  FrontierReorder,
+};
+
 struct RuntimeOptions {
   BoundedQueueOptions queue{
       .capacity_bytes = 64U * 1024U * 1024U,
       .push_timeout   = std::chrono::seconds{30},
   };
-  std::size_t reorder_capacity_bytes = 64U * 1024U * 1024U;
+  std::size_t reorder_capacity_bytes = 0;
   std::size_t retained_state_capacity_bytes =
       std::numeric_limits<std::size_t>::max();
-  bool checking_enabled = true;
+  PipelineMode pipeline_mode       = PipelineMode::Full;
+  OrderingProtocol ordering_protocol =
+      OrderingProtocol::SerializedGlobalLock;
+  RuntimeEpoch expected_runtime_epoch;
+  std::uint64_t expected_cluster_epoch = 0;
 };
 
 enum class PackedBatchBackend : std::uint8_t {
@@ -96,6 +112,36 @@ private:
 static_assert(std::is_nothrow_move_constructible_v<PackedBatchEnvelope>);
 static_assert(std::is_nothrow_move_assignable_v<PackedBatchEnvelope>);
 
+class RuntimePreparedBatchAccess;
+
+class RuntimePreparedBatch final {
+public:
+  RuntimePreparedBatch() noexcept;
+  RuntimePreparedBatch(RuntimePreparedBatch &&other) noexcept;
+  RuntimePreparedBatch &operator=(RuntimePreparedBatch &&other) noexcept;
+  RuntimePreparedBatch(const RuntimePreparedBatch &)            = delete;
+  RuntimePreparedBatch &operator=(const RuntimePreparedBatch &) = delete;
+  ~RuntimePreparedBatch();
+
+  [[nodiscard]] bool valid() const noexcept;
+
+private:
+  friend class OnlineRuntime;
+  friend class RuntimePreparedBatchAccess;
+  struct State;
+  explicit RuntimePreparedBatch(std::unique_ptr<State> state) noexcept;
+
+  std::unique_ptr<State> state_;
+};
+
+struct RuntimePrepareResult {
+  RuntimePreparedBatch prepared;
+  std::optional<RuntimeError> error;
+  PackedBatchEnvelope returned_batch;
+
+  [[nodiscard]] bool ok() const noexcept { return prepared.valid(); }
+};
+
 struct RuntimeBatchSubmitResult {
   bool accepted = false;
   std::optional<RuntimeError> error;
@@ -115,6 +161,10 @@ struct RuntimeMetrics {
   OrderGateMetrics gate;
   SnapshotSOWWMetrics engine;
   std::size_t reorder_capacity_bytes   = 0;
+  PipelineMode pipeline_mode             = PipelineMode::Full;
+  OrderingProtocol ordering_protocol     =
+      OrderingProtocol::SerializedGlobalLock;
+  SerializedOrderMetrics serialized;
   std::uint64_t published_transactions = 0;
   std::uint64_t processed_messages     = 0;
   std::uint64_t processed_controls     = 0;
@@ -147,6 +197,15 @@ public:
   OnlineRuntime(OnlineRuntime &&)                 = delete;
   OnlineRuntime &operator=(OnlineRuntime &&)      = delete;
 
+  // Serialized publication is explicitly two-stage. prepareCommitted()
+  // reserves queue bytes and a preallocated queue node; submitPrepared() is
+  // allocation-free and cannot wait for capacity.
+  [[nodiscard]] RuntimePrepareResult
+  prepareCommitted(PackedBatchEnvelope batch);
+  [[nodiscard]] RuntimeBatchSubmitResult
+  submitPrepared(RuntimePreparedBatch prepared, OrderedTxnMeta final_meta);
+
+  // Frontier publication remains a one-stage producer operation.
   [[nodiscard]] RuntimeBatchSubmitResult
   submitCommitted(PackedBatchEnvelope batch, bool read_only);
   [[nodiscard]] RuntimeBatchSubmitResult

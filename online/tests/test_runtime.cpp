@@ -149,7 +149,24 @@ chunk_write_batch(const std::shared_ptr<ChunkPool> &pool,
   result.queue.capacity_bytes   = queue_capacity;
   result.queue.push_timeout     = 30s;
   result.reorder_capacity_bytes = reorder_capacity;
-  result.checking_enabled       = checking_enabled;
+  result.pipeline_mode =
+      checking_enabled ? PipelineMode::Full : PipelineMode::OrderOnly;
+  result.ordering_protocol = OrderingProtocol::FrontierReorder;
+  return result;
+}
+
+[[nodiscard]] RuntimeOptions
+serialized_options(const std::size_t queue_capacity,
+                   const PipelineMode pipeline_mode = PipelineMode::Full) {
+  RuntimeOptions result;
+  result.queue.capacity_bytes      = queue_capacity;
+  result.queue.push_timeout        = 30s;
+  result.reorder_capacity_bytes    = 0;
+  result.pipeline_mode             = pipeline_mode;
+  result.ordering_protocol         =
+      OrderingProtocol::SerializedGlobalLock;
+  result.expected_runtime_epoch    = RuntimeEpoch{{0xabcU, 0xdefU}};
+  result.expected_cluster_epoch    = 1;
   return result;
 }
 
@@ -539,6 +556,65 @@ void test_invalid_configuration_never_exposes_pass() {
   CHECK(!runtime.shutdown().ok());
 }
 
+
+void test_serialized_prepare_submit_orders_directly() {
+  const auto write_meta = metadata(80, 1, 0, 20, 42, 1);
+  auto write = write_batch(write_meta, "key", "value");
+  const auto read_meta = metadata(81, 1, 0, 30, 42, 2);
+  auto read = read_batch(read_meta, "key",
+                         std::optional<std::string_view>{"value"});
+
+  OnlineRuntime runtime(serialized_options(1U << 20U), {1});
+  auto prepared_write =
+      runtime.prepareCommitted(PackedBatchEnvelope(std::move(write)));
+  CHECK(prepared_write.ok());
+  CHECK(runtime.metrics().queue.reserved_depth == 1U);
+  auto write_final                = write_meta;
+  write_final.order_token_kind    = OrderTokenKind::WriteCommit;
+  write_final.publication_seq     = 1;
+  write_final.producer_seq        = 1;
+  require_accepted(runtime.submitPrepared(
+      std::move(prepared_write.prepared), write_final));
+
+  auto prepared_read =
+      runtime.prepareCommitted(PackedBatchEnvelope(std::move(read)));
+  CHECK(prepared_read.ok());
+  auto read_final                 = read_meta;
+  read_final.order_token_kind     = OrderTokenKind::ReadOnlyCompletion;
+  read_final.publication_seq      = 2;
+  read_final.producer_seq         = 2;
+  require_accepted(runtime.submitPrepared(
+      std::move(prepared_read.prepared), read_final));
+
+  require_ok(runtime.flush());
+  const auto metrics = runtime.metrics();
+  CHECK(metrics.ordering_protocol ==
+        OrderingProtocol::SerializedGlobalLock);
+  CHECK(metrics.published_transactions == 2U);
+  CHECK(metrics.ordered_transactions == 2U);
+  CHECK(metrics.checked_transactions == 2U);
+  CHECK(metrics.serialized.accepted_transactions == 2U);
+  CHECK(metrics.serialized.next_publication_seq == 3U);
+  CHECK(metrics.queue.reserved_depth == 0U);
+  CHECK(runtime.verdict()->status == ConsistencyStatus::Pass);
+  close_cleanly(runtime);
+}
+
+void test_serialized_outstanding_reservation_fails_shutdown() {
+  const auto meta = metadata(82, 1, 0, 20);
+  auto batch      = write_batch(meta, "key", "value");
+  OnlineRuntime runtime(serialized_options(1U << 20U), {1});
+  auto prepared =
+      runtime.prepareCommitted(PackedBatchEnvelope(std::move(batch)));
+  CHECK(prepared.ok());
+  CHECK(runtime.metrics().queue.reserved_depth == 1U);
+  const auto shutdown = runtime.shutdown();
+  CHECK(!shutdown.ok());
+  CHECK(shutdown.error.has_value());
+  CHECK(shutdown.error->code == RuntimeErrorCode::IncompletePrefix);
+  prepared.prepared = RuntimePreparedBatch{};
+}
+
 } // namespace
 
 int run_runtime_tests() {
@@ -554,6 +630,8 @@ int run_runtime_tests() {
     test_shutdown_refuses_incomplete_evidence();
     test_reorder_limit_fails_closed();
     test_invalid_configuration_never_exposes_pass();
+    test_serialized_prepare_submit_orders_directly();
+    test_serialized_outstanding_reservation_fails_shutdown();
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "runtime tests failed: " << error.what() << '\n';

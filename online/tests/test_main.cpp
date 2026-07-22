@@ -22,6 +22,7 @@ int run_order_gate_tests();
 int run_packed_batch_tests();
 int run_repeated_read_table_tests();
 int run_runtime_tests();
+int run_serialized_order_tests();
 
 namespace {
 
@@ -618,6 +619,7 @@ int main() {
   failures += run_packed_batch_tests();
   failures += run_repeated_read_table_tests();
   failures += run_runtime_tests();
+  failures += run_serialized_order_tests();
 
   if (failures != 0) {
     std::cerr << failures << " test failure(s)\n";

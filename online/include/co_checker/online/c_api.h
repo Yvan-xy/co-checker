@@ -55,6 +55,20 @@ enum {
   CO_CHECKER_ONLINE_MODE_FULL_V1         = 3
 };
 
+typedef uint32_t co_checker_online_ordering_protocol_v1;
+enum {
+  CO_CHECKER_ONLINE_ORDERING_SERIALIZED_GLOBAL_LOCK_V1 = 1,
+  CO_CHECKER_ONLINE_ORDERING_FRONTIER_REORDER_V1       = 2
+};
+
+typedef uint32_t co_checker_online_order_token_kind_v1;
+enum {
+  CO_CHECKER_ONLINE_ORDER_TOKEN_WRITE_COMMIT_V1          = 1,
+  CO_CHECKER_ONLINE_ORDER_TOKEN_READ_ONLY_START_V1       = 2,
+  CO_CHECKER_ONLINE_ORDER_TOKEN_READ_ONLY_COMPLETION_V1  = 3,
+  CO_CHECKER_ONLINE_ORDER_TOKEN_NO_WRITE_COMPLETION_V1   = 4
+};
+
 typedef struct co_checker_online_options_v1 {
   uint32_t struct_size;
   uint32_t abi_version;
@@ -68,7 +82,7 @@ typedef struct co_checker_online_options_v1 {
   uint64_t max_cached_chunk_segments;
   uint64_t cluster_epoch;
   uint32_t mode;
-  uint32_t reserved0;
+  uint32_t ordering_protocol;
   uint64_t reserved[3];
 } co_checker_online_options_v1;
 
@@ -204,6 +218,24 @@ co_checker_online_attempt_abort_v1(co_checker_online_runtime_v1 *runtime,
 
 // On success ownership has transferred into the native runtime and the caller
 // may immediately reuse/free the flat input buffer.
+// Serialized two-stage publication. Prepare seals evidence and reserves all
+// native/queue ownership before storage commit. Finalize must be called while
+// the TiDB process-global finalization guard is held and never waits for queue
+// capacity or allocates native batch/queue storage.
+CO_CHECKER_ONLINE_C_API co_checker_online_status_v1
+co_checker_online_attempt_prepare_v1(co_checker_online_runtime_v1 *runtime,
+                                     const co_checker_online_uid_v1 *attempt_id,
+                                     const void *flat_input,
+                                     uint64_t flat_input_size);
+
+CO_CHECKER_ONLINE_C_API co_checker_online_status_v1
+co_checker_online_attempt_finalize_v1(
+    co_checker_online_runtime_v1 *runtime,
+    const co_checker_online_uid_v1 *attempt_id,
+    co_checker_online_order_token_kind_v1 token_kind, uint64_t order_token,
+    uint64_t publication_seq);
+
+// Frontier-reorder keeps its existing one-stage publish operation.
 CO_CHECKER_ONLINE_C_API co_checker_online_status_v1
 co_checker_online_attempt_publish_v1(co_checker_online_runtime_v1 *runtime,
                                      const co_checker_online_uid_v1 *attempt_id,

@@ -16,7 +16,7 @@ int main(const int argc, char **argv) {
     std::cerr << dlerror() << '\n';
     return 1;
   }
-  constexpr std::array<std::string_view, 17> symbols{
+  constexpr std::array<std::string_view, 19> symbols{
       "co_checker_online_options_init_v1",
       "co_checker_online_txn_input_header_init_v1",
       "co_checker_online_runtime_create_v1",
@@ -26,6 +26,8 @@ int main(const int argc, char **argv) {
       "co_checker_online_logical_transaction_create_v1",
       "co_checker_online_attempt_register_v1",
       "co_checker_online_attempt_abort_v1",
+      "co_checker_online_attempt_prepare_v1",
+      "co_checker_online_attempt_finalize_v1",
       "co_checker_online_attempt_publish_v1",
       "co_checker_online_database_frontier_v1",
       "co_checker_online_producer_frontier_v1",

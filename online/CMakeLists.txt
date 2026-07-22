@@ -34,6 +34,7 @@ add_library(co_checker_online
   src/packed_batch.cpp
   src/repeated_read_table.cpp
   src/runtime.cpp
+  src/serialized_order.cpp
 )
 set_target_properties(co_checker_online PROPERTIES
   POSITION_INDEPENDENT_CODE ON
@@ -158,6 +159,7 @@ if(CO_CHECKER_ONLINE_BUILD_TESTING)
     tests/test_packed_batch.cpp
     tests/test_repeated_read_table.cpp
     tests/test_runtime.cpp
+    tests/test_serialized_order.cpp
   )
   target_link_libraries(co_checker_online_tests PRIVATE
     co_checker_online
