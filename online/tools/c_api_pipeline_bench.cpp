@@ -45,6 +45,7 @@ struct Configuration {
   std::uint64_t repetitions         = 3;
   std::uint64_t plateau_batches     = 128;
   std::string mode                  = "all";
+  std::string ordering_protocol     = "frontier-reorder";
   bool run_plateau                  = true;
 };
 
@@ -82,12 +83,16 @@ struct Configuration {
       result.plateau_batches = parse_unsigned(take_value(argument), argument);
     } else if (argument == "--mode") {
       result.mode = take_value(argument);
+    } else if (argument == "--ordering-protocol") {
+      result.ordering_protocol = take_value(argument);
     } else if (argument == "--skip-plateau") {
       result.run_plateau = false;
     } else if (argument == "--help") {
       std::cout << "usage: co_checker_online_c_api_bench [--transactions N] "
                    "[--warmup N] [--frontier-every N] [--repetitions N] "
                    "[--mode all|capture-only|order-only|full] "
+                   "[--ordering-protocol "
+                   "serialized-global-lock|frontier-reorder] "
                    "[--plateau-batches N] [--skip-plateau]\n";
       std::exit(0);
     } else {
@@ -97,10 +102,19 @@ struct Configuration {
   if (result.transactions == 0U || result.frontier_every == 0U ||
       result.repetitions == 0U || result.plateau_batches == 0U ||
       (result.mode != "all" && result.mode != "capture-only" &&
-       result.mode != "order-only" && result.mode != "full")) {
-    throw std::invalid_argument("benchmark counts/mode are invalid");
+       result.mode != "order-only" && result.mode != "full") ||
+      (result.ordering_protocol != "serialized-global-lock" &&
+       result.ordering_protocol != "frontier-reorder")) {
+    throw std::invalid_argument("benchmark counts/mode/protocol are invalid");
   }
   return result;
+}
+
+[[nodiscard]] std::uint32_t
+ordering_protocol_value(const std::string_view protocol) {
+  return protocol == "serialized-global-lock"
+             ? CO_CHECKER_ONLINE_ORDERING_SERIALIZED_GLOBAL_LOCK_V1
+             : CO_CHECKER_ONLINE_ORDERING_FRONTIER_REORDER_V1;
 }
 
 [[nodiscard]] std::string error_text(co_checker_online_runtime_v1 *runtime) {
@@ -166,15 +180,17 @@ void require_json_fragment(const std::string_view json,
   }
 }
 
-[[nodiscard]] RuntimeOwner create_runtime(const std::uint32_t mode,
-                                          const std::uint64_t capture_bytes,
-                                          const std::uint64_t reorder_bytes,
-                                          const std::uint64_t timeout_ns) {
+[[nodiscard]] RuntimeOwner
+create_runtime(const std::uint32_t mode, const std::uint64_t capture_bytes,
+               const std::uint64_t reorder_bytes,
+               const std::uint64_t timeout_ns,
+               const std::uint32_t ordering_protocol) {
   co_checker_online_options_v1 options{};
   co_checker_online_options_init_v1(&options);
   options.mode                          = mode;
   options.queue_capacity_bytes          = 16U * 1024U * 1024U;
   options.reorder_capacity_bytes        = reorder_bytes;
+  options.ordering_protocol             = ordering_protocol;
   options.capture_capacity_bytes        = capture_bytes;
   options.retained_state_capacity_bytes = 512U * 1024U * 1024U;
   options.queue_timeout_ns              = timeout_ns;
@@ -260,10 +276,15 @@ struct Mode {
 
 void run_pipeline(const Mode mode, const std::uint64_t transaction_count,
                   const std::uint64_t frontier_every,
-                  const std::uint64_t repetition, const bool report) {
-  auto runtime =
-      create_runtime(mode.value, 64U * 1024U * 1024U, 64U * 1024U * 1024U,
-                     30U * 1000U * 1000U * 1000U);
+                  const std::uint64_t repetition, const bool report,
+                  const std::string_view ordering_protocol_name,
+                  const std::uint32_t ordering_protocol) {
+  const auto reorder_bytes =
+      ordering_protocol == CO_CHECKER_ONLINE_ORDERING_FRONTIER_REORDER_V1
+          ? 64U * 1024U * 1024U
+          : 0U;
+  auto runtime = create_runtime(mode.value, 64U * 1024U * 1024U, reorder_bytes,
+                                30U * 1000U * 1000U * 1000U, ordering_protocol);
   co_checker_online_session_v1 session{};
   require_status(
       co_checker_online_session_create_v1(runtime.runtime, 1, &session),
@@ -272,6 +293,8 @@ void run_pipeline(const Mode mode, const std::uint64_t transaction_count,
   std::chrono::nanoseconds identity_register_time{};
   std::chrono::nanoseconds pack_time{};
   std::chrono::nanoseconds publish_time{};
+  std::chrono::nanoseconds prepare_time{};
+  std::chrono::nanoseconds finalize_time{};
   std::chrono::nanoseconds frontier_time{};
   const auto run_started       = Clock::now();
   std::uint64_t last_commit_ts = 0;
@@ -295,19 +318,45 @@ void run_pipeline(const Mode mode, const std::uint64_t transaction_count,
                                                              identity_started);
 
     const auto pack_started = Clock::now();
-    auto input = pack_point_transaction(index, start_ts, commit_ts);
+    auto input              = pack_point_transaction(
+        index, start_ts,
+        ordering_protocol ==
+                CO_CHECKER_ONLINE_ORDERING_SERIALIZED_GLOBAL_LOCK_V1
+                         ? 0U
+                         : commit_ts);
     pack_time += std::chrono::duration_cast<std::chrono::nanoseconds>(
         Clock::now() - pack_started);
-    const auto publish_started = Clock::now();
-    require_status(co_checker_online_attempt_publish_v1(
-                       runtime.runtime, &attempt, input.data(), input.size()),
-                   CO_CHECKER_ONLINE_STATUS_OK_V1, runtime.runtime,
-                   "attempt publish");
-    publish_time += std::chrono::duration_cast<std::chrono::nanoseconds>(
-        Clock::now() - publish_started);
+    if (ordering_protocol ==
+        CO_CHECKER_ONLINE_ORDERING_SERIALIZED_GLOBAL_LOCK_V1) {
+      const auto prepare_started = Clock::now();
+      require_status(co_checker_online_attempt_prepare_v1(
+                         runtime.runtime, &attempt, input.data(), input.size()),
+                     CO_CHECKER_ONLINE_STATUS_OK_V1, runtime.runtime,
+                     "attempt prepare");
+      prepare_time += std::chrono::duration_cast<std::chrono::nanoseconds>(
+          Clock::now() - prepare_started);
+      const auto finalize_started = Clock::now();
+      require_status(co_checker_online_attempt_finalize_v1(
+                         runtime.runtime, &attempt,
+                         CO_CHECKER_ONLINE_ORDER_TOKEN_WRITE_COMMIT_V1,
+                         commit_ts, index + 1U),
+                     CO_CHECKER_ONLINE_STATUS_OK_V1, runtime.runtime,
+                     "attempt finalize");
+      finalize_time += std::chrono::duration_cast<std::chrono::nanoseconds>(
+          Clock::now() - finalize_started);
+    } else {
+      const auto publish_started = Clock::now();
+      require_status(co_checker_online_attempt_publish_v1(
+                         runtime.runtime, &attempt, input.data(), input.size()),
+                     CO_CHECKER_ONLINE_STATUS_OK_V1, runtime.runtime,
+                     "attempt publish");
+      publish_time += std::chrono::duration_cast<std::chrono::nanoseconds>(
+          Clock::now() - publish_started);
+    }
     last_commit_ts = commit_ts;
 
-    if ((index + 1U) % frontier_every == 0U) {
+    if (ordering_protocol == CO_CHECKER_ONLINE_ORDERING_FRONTIER_REORDER_V1 &&
+        (index + 1U) % frontier_every == 0U) {
       const auto frontier_started = Clock::now();
       require_status(
           co_checker_online_database_frontier_v1(runtime.runtime, commit_ts),
@@ -319,7 +368,8 @@ void run_pipeline(const Mode mode, const std::uint64_t transaction_count,
           Clock::now() - frontier_started);
     }
   }
-  if (transaction_count % frontier_every != 0U) {
+  if (ordering_protocol == CO_CHECKER_ONLINE_ORDERING_FRONTIER_REORDER_V1 &&
+      transaction_count % frontier_every != 0U) {
     const auto frontier_started = Clock::now();
     require_status(
         co_checker_online_database_frontier_v1(runtime.runtime, last_commit_ts),
@@ -358,6 +408,7 @@ void run_pipeline(const Mode mode, const std::uint64_t transaction_count,
   require_metric_value(metrics, "captured_events", events);
   require_metric_value(metrics, "queue_bytes", 0U);
   require_metric_value(metrics, "reorder_bytes", 0U);
+  require_metric_value(metrics, "ordering_protocol", ordering_protocol);
   require_json_fragment(metrics, "\"fatal\":false");
   if (mode.value == CO_CHECKER_ONLINE_MODE_CAPTURE_ONLY_V1) {
     require_metric_value(metrics, "ordered_transactions", 0U);
@@ -379,6 +430,7 @@ void run_pipeline(const Mode mode, const std::uint64_t transaction_count,
   const auto seconds = std::chrono::duration<double>(wall_time).count();
   std::cout << std::fixed << std::setprecision(2) << "RESULT_JSON {\"mode\":\""
             << mode.name << "\",\"repetition\":" << repetition
+            << ",\"ordering_protocol\":\"" << ordering_protocol_name << "\""
             << ",\"transactions\":" << transaction_count
             << ",\"events\":" << events << ",\"wall_ns\":" << wall_time.count()
             << ",\"txn_per_s\":"
@@ -387,6 +439,8 @@ void run_pipeline(const Mode mode, const std::uint64_t transaction_count,
             << ",\"identity_register_ns\":" << identity_register_time.count()
             << ",\"pack_ns\":" << pack_time.count()
             << ",\"publish_call_ns\":" << publish_time.count()
+            << ",\"prepare_call_ns\":" << prepare_time.count()
+            << ",\"finalize_call_ns\":" << finalize_time.count()
             << ",\"frontier_call_ns\":" << frontier_time.count()
             << ",\"close_ns\":" << close_time.count()
             << ",\"native_metrics\":" << metrics << "}\n";
@@ -399,7 +453,8 @@ void run_plateau(const std::uint64_t batch_count) {
       chunk_size * 2U;
   const auto capacity = reserved_per_batch * batch_count;
   auto runtime = create_runtime(CO_CHECKER_ONLINE_MODE_ORDER_ONLY_V1, capacity,
-                                capacity, 50U * 1000U * 1000U);
+                                capacity, 50U * 1000U * 1000U,
+                                CO_CHECKER_ONLINE_ORDERING_FRONTIER_REORDER_V1);
   co_checker_online_session_v1 session{};
   require_status(
       co_checker_online_session_create_v1(runtime.runtime, 1, &session),
@@ -476,6 +531,8 @@ void run_plateau(const std::uint64_t batch_count) {
 int main(const int argc, char **argv) {
   try {
     const auto configuration = parse_arguments(argc, argv);
+    const auto ordering_protocol =
+        ordering_protocol_value(configuration.ordering_protocol);
     constexpr std::array<Mode, 3> modes{
         Mode{"capture-only", CO_CHECKER_ONLINE_MODE_CAPTURE_ONLY_V1},
         Mode{"order-only", CO_CHECKER_ONLINE_MODE_ORDER_ONLY_V1},
@@ -486,22 +543,26 @@ int main(const int argc, char **argv) {
               << ",\"frontier_every\":" << configuration.frontier_every
               << ",\"repetitions\":" << configuration.repetitions
               << ",\"plateau_batches\":" << configuration.plateau_batches
-              << "}\n";
+              << ",\"ordering_protocol\":\"" << configuration.ordering_protocol
+              << "\"}\n";
     for (const auto mode : modes) {
       if (configuration.mode != "all" && configuration.mode != mode.name) {
         continue;
       }
       if (configuration.warmup_transactions != 0U) {
         run_pipeline(mode, configuration.warmup_transactions,
-                     configuration.frontier_every, 0, false);
+                     configuration.frontier_every, 0, false,
+                     configuration.ordering_protocol, ordering_protocol);
       }
       for (std::uint64_t repetition = 1;
            repetition <= configuration.repetitions; ++repetition) {
         run_pipeline(mode, configuration.transactions,
-                     configuration.frontier_every, repetition, true);
+                     configuration.frontier_every, repetition, true,
+                     configuration.ordering_protocol, ordering_protocol);
       }
     }
-    if (configuration.run_plateau) {
+    if (configuration.run_plateau &&
+        ordering_protocol == CO_CHECKER_ONLINE_ORDERING_FRONTIER_REORDER_V1) {
       run_plateau(configuration.plateau_batches);
     }
     return 0;
