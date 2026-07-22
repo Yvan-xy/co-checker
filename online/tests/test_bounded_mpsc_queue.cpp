@@ -377,6 +377,71 @@ void test_many_producers_have_no_loss_or_duplicates() {
   CHECK(lifetime->destroyed.load(std::memory_order_relaxed) == total_items);
 }
 
+
+void test_reserved_node_publishes_without_capacity_wait() {
+  auto lifetime = std::make_shared<LifetimeState>();
+  {
+    Queue queue(BoundedQueueOptions{.capacity_bytes = 16, .push_timeout = 5s});
+    auto reservation = queue.reserveData(16);
+    CHECK(reservation.ok());
+    CHECK(reservation.reservation->valid());
+    auto metrics = queue.metrics();
+    CHECK(metrics.reserved_bytes == 16);
+    CHECK(metrics.reserved_depth == 1);
+    CHECK(metrics.queued_bytes == 0);
+
+    queue.closeDataAdmission();
+    auto rejected = queue.reserveData(1);
+    CHECK(!rejected.ok());
+    CHECK(rejected.error.has_value());
+    CHECK(rejected.error->code == QueueErrorCode::Shutdown);
+    CHECK(!queue.error().has_value());
+
+    auto data = makeItem(1, lifetime);
+    const auto submitted = queue.pushReserved(
+        std::move(data), std::move(*reservation.reservation));
+    CHECK(submitted.ok());
+    CHECK(!data);
+    metrics = queue.metrics();
+    CHECK(metrics.reserved_bytes == 0);
+    CHECK(metrics.reserved_depth == 0);
+    CHECK(metrics.queued_bytes == 16);
+    CHECK(metrics.queued_depth == 1);
+
+    auto control = makeItem(2, lifetime);
+    CHECK(queue.pushControl(std::move(control)).ok());
+    (void)queue.close();
+
+    auto first = queue.waitPop();
+    CHECK(first.hasEntry());
+    CHECK(first.entry->value->id == 1);
+    CHECK(first.entry->enqueue_sequence == 0);
+    auto second = queue.waitPop();
+    CHECK(second.hasEntry());
+    CHECK(second.entry->value->id == 2);
+    CHECK(second.entry->enqueue_sequence == 1);
+    CHECK(queue.waitPop().isTerminal());
+  }
+  CHECK(lifetime->destroyed.load(std::memory_order_relaxed) == 2);
+}
+
+void test_destroying_reservation_releases_admission() {
+  Queue queue(BoundedQueueOptions{.capacity_bytes = 8, .push_timeout = 1s});
+  {
+    auto reservation = queue.reserveData(8);
+    CHECK(reservation.ok());
+    CHECK(queue.metrics().reserved_bytes == 8);
+  }
+  CHECK(queue.metrics().reserved_bytes == 0);
+  CHECK(queue.metrics().reserved_depth == 0);
+
+  auto replacement = queue.reserveData(8);
+  CHECK(replacement.ok());
+  replacement.reservation->reset();
+  CHECK(queue.metrics().reserved_bytes == 0);
+  (void)queue.close();
+}
+
 } // namespace
 
 int run_bounded_queue_tests() {
@@ -386,6 +451,8 @@ int run_bounded_queue_tests() {
   test_oversized_and_invalid_charge_preserve_caller_ownership();
   test_producer_failure_is_sticky_after_accepted_drain();
   test_many_producers_have_no_loss_or_duplicates();
+  test_reserved_node_publishes_without_capacity_wait();
+  test_destroying_reservation_releases_admission();
   return failures;
 }
 
