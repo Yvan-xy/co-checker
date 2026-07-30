@@ -714,6 +714,10 @@ void test_serialized_full_prepare_finalize_and_completion() {
   CHECK(metrics.find("\"completion_transactions\":1") !=
         std::string::npos);
   CHECK(metrics.find("\"accepted_publications\":2") != std::string::npos);
+  CHECK(metrics.find("\"accepted_events\":2") != std::string::npos);
+  CHECK(metrics.find("\"queue_peak_depth\":") != std::string::npos);
+  CHECK(metrics.find("\"total_queue_lag_ns\":") !=
+        std::string::npos);
   CHECK(metrics.find("\"ordered_transactions\":2") != std::string::npos);
   CHECK(metrics.find("\"checked_transactions\":2") != std::string::npos);
   CHECK(metrics.find("\"queue_reserved_depth\":0") != std::string::npos);
@@ -773,6 +777,7 @@ void test_serialized_prepared_abort_releases_reservations() {
   CHECK(co_checker_online_attempt_abort_v1(owner.runtime, &attempt.attempt) ==
         CO_CHECKER_ONLINE_STATUS_OK_V1);
   const auto metrics = metrics_json(owner.runtime);
+  CHECK(metrics.find("\"accepted_events\":0") != std::string::npos);
   CHECK(metrics.find("\"queue_reserved_depth\":0") != std::string::npos);
   CHECK(metrics.find("\"capture_active_bytes\":0") != std::string::npos);
   CHECK(metrics.find("\"definitive_aborts\":1") != std::string::npos);

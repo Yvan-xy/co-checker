@@ -66,3 +66,10 @@ Regenerate the trace fixtures with:
 By default this expects the instrumented TiDB checkout at `../tidb`, writes YAML
 fixtures into `./traces`, and writes binary fixtures into `./bin_traces`. See
 `trace-gen/README.md` for path overrides and manual preprocessing commands.
+
+## Online Engine Design
+
+See the [online engine implementation plan](doc/online_engine_plan.md) and its
+[architecture figure](doc/online_checker_architecture.svg) for the proposed
+embedded asynchronous runtime, storage backends, commit-order gate, validation,
+and rollout phases.

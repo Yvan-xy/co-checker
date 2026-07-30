@@ -52,11 +52,21 @@ STABILIZE_SECONDS=${STABILIZE_SECONDS:-30}
 TIDB_CPUSET=${TIDB_CPUSET:-0-7}
 CLIENT_CPUSET=${CLIENT_CPUSET:-8-15}
 DSN_PARAMS=${DSN_PARAMS:-tidb_enable_async_commit=0&tidb_enable_1pc=0&tidb_txn_mode=optimistic&tidb_low_resolution_tso=0}
+FRONTIER_INTERVAL=${FRONTIER_INTERVAL:-10ms}
 
-# These are admission ceilings, not eager allocations. UniStore does not
-# advance a resolved frontier, so order/full mode retains the complete epoch
-# until the graceful close barrier. The defaults leave headroom on the
-# recorded 62 GiB host while preserving fail-closed boundedness.
+# A live result must have only a short residual tail when the workload stops.
+# These gates are fingerprinted with the run and may be tightened for a larger
+# experiment. The percentage is applied independently to transactions and
+# events; the absolute floors keep short lifecycle smoke tests practical.
+LIVE_TAIL_MAX_PERCENT=${LIVE_TAIL_MAX_PERCENT:-0.1}
+LIVE_TAIL_MIN_TRANSACTIONS=${LIVE_TAIL_MIN_TRANSACTIONS:-1000}
+LIVE_TAIL_MIN_EVENTS=${LIVE_TAIL_MIN_EVENTS:-100000}
+LIVE_BACKLOG_MAX_BYTES=${LIVE_BACKLOG_MAX_BYTES:-67108864}
+LIVE_QUEUE_MAX_DEPTH=${LIVE_QUEUE_MAX_DEPTH:-1024}
+
+# These are fail-closed admission ceilings, not eager allocations. A valid
+# order/full run must advance the live frontier and remain far below them; the
+# pre-close gates below reject a run that merely accumulates work for shutdown.
 QUEUE_CAPACITY_BYTES=${QUEUE_CAPACITY_BYTES:-2147483648}
 REORDER_CAPACITY_BYTES=${REORDER_CAPACITY_BYTES:-34359738368}
 CAPTURE_CAPACITY_BYTES=${CAPTURE_CAPACITY_BYTES:-34359738368}
@@ -87,7 +97,8 @@ clear_online_checker_environment() {
     TIDB_ONLINE_CHECKER_QUEUE_TIMEOUT \
     TIDB_ONLINE_CHECKER_CAPTURE_TIMEOUT \
     TIDB_ONLINE_CHECKER_CHUNK_SEGMENT_BYTES \
-    TIDB_ONLINE_CHECKER_MAX_CACHED_CHUNK_SEGMENTS
+    TIDB_ONLINE_CHECKER_MAX_CACHED_CHUNK_SEGMENTS \
+    TIDB_ONLINE_CHECKER_FRONTIER_INTERVAL
   do
     unset "$name"
   done
@@ -315,6 +326,18 @@ test -r "$NATIVE_LIBRARY"
 test -d "$TEMPLATE/store"
 test "$(git -C "$CHECKER" branch --show-current)" = online-checker
 test "$(git -C "$TIDB" branch --show-current)" = online-checker
+python3 - "$LIVE_TAIL_MAX_PERCENT" "$LIVE_TAIL_MIN_TRANSACTIONS" \
+  "$LIVE_TAIL_MIN_EVENTS" "$LIVE_BACKLOG_MAX_BYTES" \
+  "$LIVE_QUEUE_MAX_DEPTH" <<'PY'
+import sys
+
+percent = float(sys.argv[1])
+integers = [int(value) for value in sys.argv[2:]]
+if not 0 < percent <= 1:
+    raise SystemExit("LIVE_TAIL_MAX_PERCENT must be in (0, 1]")
+if any(value < 0 for value in integers):
+    raise SystemExit("live-tail and backlog limits must be nonnegative")
+PY
 test ! -e "$MODE_DIR"
 if [[ -n "$(ss -H -ltn "sport = :$SQL_PORT")" ]]; then
   echo "SQL port $SQL_PORT is already listening" >&2
@@ -335,6 +358,8 @@ export RUNNER_PATH
 export TRIAL MODE_DIR SQL_HOST SQL_PORT STATUS_PORT DATABASE WAREHOUSES
 export PREPARE_THREADS RUN_THREADS WARMUP_TIME RUN_TIME OUTPUT_INTERVAL
 export STABILIZE_SECONDS TIDB_CPUSET CLIENT_CPUSET DSN_PARAMS
+export FRONTIER_INTERVAL LIVE_TAIL_MAX_PERCENT LIVE_TAIL_MIN_TRANSACTIONS
+export LIVE_TAIL_MIN_EVENTS LIVE_BACKLOG_MAX_BYTES LIVE_QUEUE_MAX_DEPTH
 export QUEUE_CAPACITY_BYTES REORDER_CAPACITY_BYTES CAPTURE_CAPACITY_BYTES
 export RETAINED_STATE_CAPACITY_BYTES QUEUE_TIMEOUT CAPTURE_TIMEOUT
 export CHUNK_SEGMENT_BYTES MAX_CACHED_CHUNK_SEGMENTS MONITOR_INTERVAL_SECONDS
@@ -364,6 +389,8 @@ integer_names = {
     "REORDER_CAPACITY_BYTES", "CAPTURE_CAPACITY_BYTES",
     "RETAINED_STATE_CAPACITY_BYTES", "CHUNK_SEGMENT_BYTES",
     "MAX_CACHED_CHUNK_SEGMENTS", "MONITOR_INTERVAL_SECONDS",
+    "LIVE_TAIL_MIN_TRANSACTIONS", "LIVE_TAIL_MIN_EVENTS",
+    "LIVE_BACKLOG_MAX_BYTES", "LIVE_QUEUE_MAX_DEPTH",
 }
 setting_names = [
     "MODE", "TRIAL", "SQL_HOST", "SQL_PORT", "STATUS_PORT", "DATABASE",
@@ -373,7 +400,10 @@ setting_names = [
     "REORDER_CAPACITY_BYTES", "CAPTURE_CAPACITY_BYTES",
     "RETAINED_STATE_CAPACITY_BYTES", "QUEUE_TIMEOUT", "CAPTURE_TIMEOUT",
     "CHUNK_SEGMENT_BYTES", "MAX_CACHED_CHUNK_SEGMENTS",
-    "MONITOR_INTERVAL_SECONDS",
+    "MONITOR_INTERVAL_SECONDS", "FRONTIER_INTERVAL",
+    "LIVE_TAIL_MAX_PERCENT", "LIVE_TAIL_MIN_TRANSACTIONS",
+    "LIVE_TAIL_MIN_EVENTS", "LIVE_BACKLOG_MAX_BYTES",
+    "LIVE_QUEUE_MAX_DEPTH",
 ]
 settings = {
     name.lower(): int(os.environ[name]) if name in integer_names else os.environ[name]
@@ -438,6 +468,7 @@ if [[ "$MODE" != baseline ]]; then
   export TIDB_ONLINE_CHECKER_CAPTURE_TIMEOUT=$CAPTURE_TIMEOUT
   export TIDB_ONLINE_CHECKER_CHUNK_SEGMENT_BYTES=$CHUNK_SEGMENT_BYTES
   export TIDB_ONLINE_CHECKER_MAX_CACHED_CHUNK_SEGMENTS=$MAX_CACHED_CHUNK_SEGMENTS
+  export TIDB_ONLINE_CHECKER_FRONTIER_INTERVAL=$FRONTIER_INTERVAL
 fi
 
 start_server "$MODE_DIR/server.txt" "$MODE_DIR/server-stdout.txt" \
@@ -508,15 +539,26 @@ if [[ "$MODE" = baseline ]]; then
     >checker-result-validation.json
 else
   test -s checker-result.json
-  python3 - "$MODE" checker-result.json >checker-result-validation.json <<'PY'
+  python3 - "$MODE" checker-result.json \
+    "$LIVE_TAIL_MAX_PERCENT" "$LIVE_TAIL_MIN_TRANSACTIONS" \
+    "$LIVE_TAIL_MIN_EVENTS" "$LIVE_BACKLOG_MAX_BYTES" \
+    "$LIVE_QUEUE_MAX_DEPTH" >checker-result-validation.json <<'PY'
 import json
+import math
 import pathlib
 import sys
 
 mode = sys.argv[1]
 result = json.loads(pathlib.Path(sys.argv[2]).read_text())
+tail_max_percent = float(sys.argv[3])
+tail_min_transactions = int(sys.argv[4])
+tail_min_events = int(sys.argv[5])
+backlog_max_bytes = int(sys.argv[6])
+queue_max_depth = int(sys.argv[7])
 adapter = result["adapter_metrics"]
 native = result["native_metrics"]
+preclose = result.get("native_metrics_before_close")
+frontier = result.get("frontier_metrics")
 expected = {
     "capture-only": "capture-only-complete",
     "order-only": "order-only-complete",
@@ -526,6 +568,14 @@ expected = {
 def require(condition, message):
     if not condition:
         raise SystemExit(message)
+
+def integer(record, field):
+    value = record.get(field) if isinstance(record, dict) else None
+    require(isinstance(value, int) and not isinstance(value, bool), f"missing integer {field}")
+    return value
+
+def tail_limit(total, minimum, percent):
+    return max(minimum, math.ceil(total * percent / 100.0))
 
 require(result.get("format_version") == 1, "unexpected result format")
 require(result.get("mode") == mode, "result mode mismatch")
@@ -540,13 +590,72 @@ require(adapter["fatal_calls"] == 0 and adapter["publish_errors"] == 0 and adapt
 require(native["capture_backpressure_wait_count"] == 0, "capture backpressure occurred")
 require(native["queue_backpressure_wait_count"] == 0, "queue backpressure occurred")
 require(native["queue_depth"] == 0 and native["reorder_bytes"] == 0, "runtime did not drain at close")
+require(isinstance(preclose, dict), "native pre-close metrics are missing")
+require(integer(result, "native_close_nanoseconds") >= 0, "native close duration is missing")
+require(preclose.get("fatal") is False, "native runtime was fatal before close")
+require(integer(preclose, "captured_transactions") == native["captured_transactions"], "transactions were captured after the pre-close snapshot")
+require(integer(preclose, "captured_events") == native["captured_events"], "events were captured after the pre-close snapshot")
 if mode in {"order-only", "full"}:
     require(native["ordered_transactions"] == native["captured_transactions"], "captured/ordered mismatch")
+    require(isinstance(frontier, dict), "live frontier metrics are missing")
+    require(integer(frontier, "updates") > 0, "no successful live frontier update")
+    require(integer(frontier, "errors") == 0, "live frontier errors were recorded")
+    require(integer(frontier, "ticks") >= frontier["updates"], "frontier update count exceeds ticks")
+    require(integer(frontier, "skipped_pending") >= 0, "invalid skipped-frontier count")
+    require(integer(frontier, "total_ns") >= 0, "invalid total frontier time")
+    require(integer(frontier, "max_ns") >= 0, "invalid maximum frontier time")
+    require(integer(frontier, "last_timestamp") > 0, "live frontier never published a timestamp")
+    require(integer(preclose, "captured_transactions") > 0, "pre-close snapshot captured no transactions")
+    require(integer(preclose, "ordered_transactions") > 0, "ordering did not run before close")
+    ordered_tail = preclose["captured_transactions"] - preclose["ordered_transactions"]
+    require(ordered_tail >= 0, "pre-close ordered count exceeds captured count")
+    ordered_limit = tail_limit(
+        preclose["captured_transactions"],
+        tail_min_transactions,
+        tail_max_percent,
+    )
+    require(ordered_tail <= ordered_limit, f"pre-close ordering tail {ordered_tail} exceeds {ordered_limit}")
+    require(integer(preclose, "queue_depth") <= queue_max_depth, "pre-close queue depth is too large")
+    require(integer(preclose, "queue_bytes") <= backlog_max_bytes, "pre-close queue bytes are too large")
+    require(integer(preclose, "reorder_bytes") <= backlog_max_bytes, "pre-close reorder bytes are too large")
+    require(integer(preclose, "capture_active_bytes") <= backlog_max_bytes, "pre-close capture bytes are too large")
 if mode == "full":
     require(native["checked_transactions"] == native["captured_transactions"], "captured/checked transaction mismatch")
     require(native["checked_events"] == native["captured_events"], "captured/checked event mismatch")
     require(native["violating_transactions"] == 0, "consistency violation requires investigation")
     require(result.get("verdict", {}).get("status") == "pass", "full checker verdict is not Pass")
+    require(integer(preclose, "checked_transactions") > 0, "checking did not run before close")
+    require(integer(preclose, "checked_events") > 0, "event checking did not run before close")
+    checked_tail = preclose["captured_transactions"] - preclose["checked_transactions"]
+    event_tail = integer(preclose, "captured_events") - preclose["checked_events"]
+    require(checked_tail >= 0, "pre-close checked count exceeds captured count")
+    require(event_tail >= 0, "pre-close checked event count exceeds captured count")
+    checked_limit = tail_limit(
+        preclose["captured_transactions"],
+        tail_min_transactions,
+        tail_max_percent,
+    )
+    event_limit = tail_limit(
+        preclose["captured_events"],
+        tail_min_events,
+        tail_max_percent,
+    )
+    require(checked_tail <= checked_limit, f"pre-close checking tail {checked_tail} exceeds {checked_limit}")
+    require(event_tail <= event_limit, f"pre-close event tail {event_tail} exceeds {event_limit}")
+
+preclose_summary = None
+if isinstance(preclose, dict):
+    preclose_summary = {
+        "captured_transactions": preclose.get("captured_transactions"),
+        "captured_events": preclose.get("captured_events"),
+        "ordered_transactions": preclose.get("ordered_transactions"),
+        "checked_transactions": preclose.get("checked_transactions"),
+        "checked_events": preclose.get("checked_events"),
+        "queue_depth": preclose.get("queue_depth"),
+        "queue_bytes": preclose.get("queue_bytes"),
+        "reorder_bytes": preclose.get("reorder_bytes"),
+        "capture_active_bytes": preclose.get("capture_active_bytes"),
+    }
 
 print(json.dumps({
     "mode": mode,
@@ -560,6 +669,16 @@ print(json.dumps({
     "violating_transactions": native["violating_transactions"],
     "capture_backpressure_wait_count": native["capture_backpressure_wait_count"],
     "queue_backpressure_wait_count": native["queue_backpressure_wait_count"],
+    "frontier_metrics": frontier,
+    "native_metrics_before_close": preclose_summary,
+    "native_close_nanoseconds": result.get("native_close_nanoseconds"),
+    "live_tail_limits": {
+        "maximum_percent": tail_max_percent,
+        "minimum_transactions": tail_min_transactions,
+        "minimum_events": tail_min_events,
+        "maximum_backlog_bytes": backlog_max_bytes,
+        "maximum_queue_depth": queue_max_depth,
+    },
 }, indent=2, sort_keys=True))
 PY
 fi

@@ -648,19 +648,140 @@ def checker_validation_passed(mode: str, record: Any) -> bool:
         return False
     if record.get("queue_backpressure_wait_count") != 0:
         return False
-    captured = record.get("captured_transactions")
-    if mode in {"order-only", "full"} and record.get("ordered_transactions") != captured:
+    preclose = record.get("native_metrics_before_close")
+    if not isinstance(preclose, dict):
         return False
+    if as_int(record.get("native_close_nanoseconds")) is None:
+        return False
+    captured = record.get("captured_transactions")
+    if mode in {"order-only", "full"}:
+        frontier = record.get("frontier_metrics")
+        if not isinstance(frontier, dict):
+            return False
+        if as_int(frontier.get("updates")) is None or frontier["updates"] <= 0:
+            return False
+        if frontier.get("errors") != 0:
+            return False
+        if record.get("ordered_transactions") != captured:
+            return False
     if mode == "full":
         return (
             record.get("checked_transactions") == captured
             and record.get("checked_events") == record.get("captured_events")
             and record.get("violating_transactions") == 0
+            and as_int(preclose.get("checked_transactions")) is not None
+            and preclose["checked_transactions"] > 0
+            and as_int(preclose.get("checked_events")) is not None
+            and preclose["checked_events"] > 0
         )
     return True
 
 
-def raw_checker_evidence(mode: str, result: Any, result_path_exists: bool) -> dict[str, Any]:
+def live_tail_limits(settings: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "maximum_percent": as_float(settings.get("live_tail_max_percent")),
+        "minimum_transactions": as_int(
+            settings.get("live_tail_min_transactions")
+        ),
+        "minimum_events": as_int(settings.get("live_tail_min_events")),
+        "maximum_backlog_bytes": as_int(
+            settings.get("live_backlog_max_bytes")
+        ),
+        "maximum_queue_depth": as_int(settings.get("live_queue_max_depth")),
+    }
+
+
+def allowed_tail(total: int | None, minimum: int | None, percent: float | None) -> int | None:
+    if total is None or minimum is None or percent is None:
+        return None
+    if total < 0 or minimum < 0 or not 0 < percent <= 1:
+        return None
+    return max(minimum, math.ceil(total * percent / 100.0))
+
+
+def checker_execution_model(mode: str, result: Any) -> str:
+    if mode == "baseline":
+        return "disabled"
+    if mode == "capture-only":
+        return "capture-only"
+    record = result if isinstance(result, dict) else {}
+    preclose = record.get("native_metrics_before_close")
+    frontier = record.get("frontier_metrics")
+    if (
+        isinstance(preclose, dict)
+        and isinstance(frontier, dict)
+        and (as_int(frontier.get("updates")) or 0) > 0
+        and frontier.get("errors") == 0
+    ):
+        return "live-frontier"
+    if isinstance(record.get("native_metrics"), dict):
+        return "legacy-deferred" if mode == "full" else "legacy-quiescent-ordering"
+    return "unproven"
+
+
+def checker_completion_tail(result: Any) -> dict[str, Any]:
+    record = result if isinstance(result, dict) else {}
+    final = record.get("native_metrics")
+    before = record.get("native_metrics_before_close")
+    final = final if isinstance(final, dict) else {}
+    before = before if isinstance(before, dict) else {}
+
+    def difference(total_field: str, completed_field: str) -> int | None:
+        total = as_int(before.get(total_field))
+        completed = as_int(before.get(completed_field))
+        return total - completed if total is not None and completed is not None else None
+
+    captured_transactions = as_int(before.get("captured_transactions"))
+    captured_events = as_int(before.get("captured_events"))
+    ordered_tail = difference("captured_transactions", "ordered_transactions")
+    checked_tail = difference("captured_transactions", "checked_transactions")
+    checked_event_tail = difference("captured_events", "checked_events")
+    native_close_ns = as_int(record.get("native_close_nanoseconds"))
+    return {
+        "preclose_metrics_present": bool(before),
+        "captured_transactions_before_close": captured_transactions,
+        "captured_events_before_close": captured_events,
+        "ordered_transactions_before_close": as_int(
+            before.get("ordered_transactions")
+        ),
+        "checked_transactions_before_close": as_int(
+            before.get("checked_transactions")
+        ),
+        "checked_events_before_close": as_int(before.get("checked_events")),
+        "ordering_transaction_tail": ordered_tail,
+        "checking_transaction_tail": checked_tail,
+        "checking_event_tail": checked_event_tail,
+        "checking_transaction_tail_percent": round_number(
+            checked_tail * 100.0 / captured_transactions
+            if checked_tail is not None and captured_transactions
+            else None
+        ),
+        "checking_event_tail_percent": round_number(
+            checked_event_tail * 100.0 / captured_events
+            if checked_event_tail is not None and captured_events
+            else None
+        ),
+        "queue_depth_before_close": as_int(before.get("queue_depth")),
+        "queue_bytes_before_close": as_int(before.get("queue_bytes")),
+        "reorder_bytes_before_close": as_int(before.get("reorder_bytes")),
+        "capture_active_bytes_before_close": as_int(
+            before.get("capture_active_bytes")
+        ),
+        "final_checked_transactions": as_int(final.get("checked_transactions")),
+        "final_checked_events": as_int(final.get("checked_events")),
+        "native_close_nanoseconds": native_close_ns,
+        "native_close_seconds": round_number(
+            native_close_ns / 1e9 if native_close_ns is not None else None
+        ),
+    }
+
+
+def raw_checker_evidence(
+    mode: str,
+    result: Any,
+    result_path_exists: bool,
+    settings: dict[str, Any],
+) -> dict[str, Any]:
     if mode == "baseline":
         checks = {"checker_result_absent": not result_path_exists}
         return {
@@ -678,13 +799,50 @@ def raw_checker_evidence(mode: str, result: Any, result_path_exists: bool) -> di
     record = result if isinstance(result, dict) else {}
     adapter = record.get("adapter_metrics")
     native = record.get("native_metrics")
+    preclose = record.get("native_metrics_before_close")
+    frontier = record.get("frontier_metrics")
     adapter = adapter if isinstance(adapter, dict) else {}
     native = native if isinstance(native, dict) else {}
+    preclose = preclose if isinstance(preclose, dict) else {}
+    frontier = frontier if isinstance(frontier, dict) else {}
+    limits = live_tail_limits(settings)
     registered = as_int(adapter.get("attempts_registered"))
     published = as_int(adapter.get("attempts_published"))
     aborted = as_int(adapter.get("attempts_aborted"))
     captured_transactions = as_int(native.get("captured_transactions"))
     captured_events = as_int(native.get("captured_events"))
+    before_captured_transactions = as_int(preclose.get("captured_transactions"))
+    before_captured_events = as_int(preclose.get("captured_events"))
+    before_ordered_transactions = as_int(preclose.get("ordered_transactions"))
+    before_checked_transactions = as_int(preclose.get("checked_transactions"))
+    before_checked_events = as_int(preclose.get("checked_events"))
+    ordering_tail = (
+        before_captured_transactions - before_ordered_transactions
+        if before_captured_transactions is not None
+        and before_ordered_transactions is not None
+        else None
+    )
+    checking_tail = (
+        before_captured_transactions - before_checked_transactions
+        if before_captured_transactions is not None
+        and before_checked_transactions is not None
+        else None
+    )
+    checking_event_tail = (
+        before_captured_events - before_checked_events
+        if before_captured_events is not None and before_checked_events is not None
+        else None
+    )
+    transaction_tail_limit = allowed_tail(
+        before_captured_transactions,
+        limits["minimum_transactions"],
+        limits["maximum_percent"],
+    )
+    event_tail_limit = allowed_tail(
+        before_captured_events,
+        limits["minimum_events"],
+        limits["maximum_percent"],
+    )
     checks = {
         "checker_result_is_object": isinstance(result, dict),
         "format_version": record.get("format_version") == 1,
@@ -720,11 +878,62 @@ def raw_checker_evidence(mode: str, result: Any, result_path_exists: bool) -> di
         "no_queue_backpressure": native.get("queue_backpressure_wait_count") == 0,
         "queue_drained": native.get("queue_depth") == 0,
         "reorder_drained": native.get("reorder_bytes") == 0,
+        "native_preclose_metrics_present": bool(preclose),
+        "native_close_duration_present": (
+            as_int(record.get("native_close_nanoseconds")) is not None
+        ),
+        "no_capture_after_preclose_snapshot": bool(
+            before_captured_transactions is not None
+            and before_captured_transactions == captured_transactions
+            and before_captured_events is not None
+            and before_captured_events == captured_events
+        ),
     }
     if mode in {"order-only", "full"}:
-        checks["captured_equals_ordered"] = (
-            captured_transactions is not None
-            and as_int(native.get("ordered_transactions")) == captured_transactions
+        ticks = as_int(frontier.get("ticks"))
+        updates = as_int(frontier.get("updates"))
+        checks.update(
+            {
+                "captured_equals_ordered": (
+                    captured_transactions is not None
+                    and as_int(native.get("ordered_transactions"))
+                    == captured_transactions
+                ),
+                "frontier_metrics_present": bool(frontier),
+                "frontier_updates_succeeded": bool(
+                    updates is not None
+                    and updates > 0
+                    and frontier.get("errors") == 0
+                    and ticks is not None
+                    and ticks >= updates
+                    and (as_int(frontier.get("last_timestamp")) or 0) > 0
+                ),
+                "ordering_ran_before_close": bool(
+                    before_ordered_transactions is not None
+                    and before_ordered_transactions > 0
+                ),
+                "ordering_tail_within_limit": bool(
+                    ordering_tail is not None
+                    and ordering_tail >= 0
+                    and transaction_tail_limit is not None
+                    and ordering_tail <= transaction_tail_limit
+                ),
+                "preclose_backlog_within_limits": bool(
+                    limits["maximum_queue_depth"] is not None
+                    and (as_int(preclose.get("queue_depth")) or 0)
+                    <= limits["maximum_queue_depth"]
+                    and limits["maximum_backlog_bytes"] is not None
+                    and all(
+                        value is not None
+                        and 0 <= value <= limits["maximum_backlog_bytes"]
+                        for value in (
+                            as_int(preclose.get("queue_bytes")),
+                            as_int(preclose.get("reorder_bytes")),
+                            as_int(preclose.get("capture_active_bytes")),
+                        )
+                    )
+                ),
+            }
         )
     if mode == "full":
         checks.update(
@@ -743,10 +952,34 @@ def raw_checker_evidence(mode: str, result: Any, result_path_exists: bool) -> di
                     isinstance(record.get("verdict"), dict)
                     and record["verdict"].get("status") == "pass"
                 ),
+                "checking_ran_before_close": bool(
+                    before_checked_transactions is not None
+                    and before_checked_transactions > 0
+                    and before_checked_events is not None
+                    and before_checked_events > 0
+                ),
+                "checking_tail_within_limit": bool(
+                    checking_tail is not None
+                    and checking_tail >= 0
+                    and transaction_tail_limit is not None
+                    and checking_tail <= transaction_tail_limit
+                    and checking_event_tail is not None
+                    and checking_event_tail >= 0
+                    and event_tail_limit is not None
+                    and checking_event_tail <= event_tail_limit
+                ),
             }
         )
     problems = [name for name, passed in checks.items() if passed is not True]
-    return {"checks": checks, "passed": not problems, "problems": problems}
+    return {
+        "execution_model": checker_execution_model(mode, result),
+        "live_tail_limits": limits,
+        "transaction_tail_limit": transaction_tail_limit,
+        "event_tail_limit": event_tail_limit,
+        "checks": checks,
+        "passed": not problems,
+        "problems": problems,
+    }
 
 
 def flattened_checker_matches_raw(mode: str, flattened: Any, raw: Any) -> bool:
@@ -761,7 +994,14 @@ def flattened_checker_matches_raw(mode: str, flattened: Any, raw: Any) -> bool:
         return False
     adapter = raw.get("adapter_metrics")
     native = raw.get("native_metrics")
-    if not isinstance(adapter, dict) or not isinstance(native, dict):
+    preclose = raw.get("native_metrics_before_close")
+    flattened_preclose = flattened.get("native_metrics_before_close")
+    if (
+        not isinstance(adapter, dict)
+        or not isinstance(native, dict)
+        or not isinstance(preclose, dict)
+        or not isinstance(flattened_preclose, dict)
+    ):
         return False
     fields = (
         "captured_transactions",
@@ -782,11 +1022,32 @@ def flattened_checker_matches_raw(mode: str, flattened: Any, raw: Any) -> bool:
         and aborted is not None
         and registered == published + aborted
     )
+    preclose_fields = (
+        "captured_transactions",
+        "captured_events",
+        "ordered_transactions",
+        "checked_transactions",
+        "checked_events",
+        "queue_depth",
+        "queue_bytes",
+        "reorder_bytes",
+        "capture_active_bytes",
+    )
     return bool(
         flattened.get("mode") == mode
         and flattened.get("outcome") == raw.get("outcome")
         and flattened.get("attempt_conservation") == conservation
         and all(flattened.get(field) == native.get(field) for field in fields)
+        and flattened.get("native_close_nanoseconds")
+        == raw.get("native_close_nanoseconds")
+        and all(
+            flattened_preclose.get(field) == preclose.get(field)
+            for field in preclose_fields
+        )
+        and (
+            mode == "capture-only"
+            or flattened.get("frontier_metrics") == raw.get("frontier_metrics")
+        )
     )
 
 
@@ -815,6 +1076,12 @@ FINGERPRINT_SETTINGS = (
     "chunk_segment_bytes",
     "max_cached_chunk_segments",
     "monitor_interval_seconds",
+    "frontier_interval",
+    "live_tail_max_percent",
+    "live_tail_min_transactions",
+    "live_tail_min_events",
+    "live_backlog_max_bytes",
+    "live_queue_max_depth",
 )
 
 
@@ -969,8 +1236,13 @@ def parse_mode(mode_dir: pathlib.Path, root: pathlib.Path, mode: str) -> dict[st
             "at least floor(requested workload seconds / monitor interval) - 1"
         ),
     }
+    execution_model = checker_execution_model(mode, checker_result)
+    completion_tail = checker_completion_tail(checker_result)
+    completion_tail["server_shutdown_seconds"] = checked_shutdown.get(
+        "shutdown_seconds"
+    )
     raw_checker = raw_checker_evidence(
-        mode, checker_result, checker_result_path.exists()
+        mode, checker_result, checker_result_path.exists(), settings
     )
     runner_validation_passed = checker_validation_passed(
         mode, checker_runner_validation
@@ -1051,6 +1323,36 @@ def parse_mode(mode_dir: pathlib.Path, root: pathlib.Path, mode: str) -> dict[st
         warnings.append("configuration.json is missing or unreadable")
     if not completion_marker_valid:
         warnings.append("the mode does not have a valid completed.json marker")
+    if execution_model in {"legacy-deferred", "legacy-quiescent-ordering"}:
+        warnings.append(
+            "legacy result has no live-frontier/pre-close evidence; its measured "
+            "throughput is not complete online-checker overhead"
+        )
+
+    if mode == "full" and execution_model == "live-frontier":
+        throughput_scope = (
+            "measured phase includes TiDB execution, capture, packing, queueing, "
+            "live commit ordering, and SOWW rule checking"
+        )
+    elif mode == "full":
+        throughput_scope = (
+            "legacy measured phase includes capture, packing, queueing, and reorder "
+            "retention; live rule checking is unproven and was deferred in the old schema"
+        )
+    elif mode == "order-only" and execution_model == "live-frontier":
+        throughput_scope = (
+            "measured phase includes TiDB execution, capture, packing, queueing, "
+            "and live commit ordering"
+        )
+    elif mode == "order-only":
+        throughput_scope = (
+            "legacy measured phase includes TiDB execution, capture, packing, "
+            "queueing, and reorder retention; live ordering is unproven"
+        )
+    elif mode == "capture-only":
+        throughput_scope = "measured phase includes TiDB execution and capture/packing"
+    else:
+        throughput_scope = "measured phase is TiDB execution with checker disabled"
 
     return {
         "mode": mode,
@@ -1058,22 +1360,11 @@ def parse_mode(mode_dir: pathlib.Path, root: pathlib.Path, mode: str) -> dict[st
         "state": state,
         "configuration": configuration,
         "benchmark_fingerprint": fingerprint,
-        "throughput_measurement_scope": (
-            "measured phase includes TiDB execution, capture, packing, queueing, "
-            "and reorder retention; full checking is deferred to checked shutdown"
-            if mode == "full"
-            else (
-                "measured phase includes TiDB execution, capture, packing, queueing, "
-                "and reorder retention"
-                if mode == "order-only"
-                else (
-                    "measured phase includes TiDB execution and capture/packing"
-                    if mode == "capture-only"
-                    else "measured phase is TiDB execution with checker disabled"
-                )
-            )
-        ),
-        "checking_deferred_to_shutdown": mode == "full",
+        "throughput_measurement_scope": throughput_scope,
+        "checker_execution_model": execution_model,
+        "live_frontier_verified": execution_model == "live-frontier",
+        "checking_deferred_to_shutdown": execution_model == "legacy-deferred",
+        "completion_tail": completion_tail,
         "workload": workload,
         "warmup": warmup,
         "timings": timings,
@@ -1170,7 +1461,9 @@ def compare_to_baseline(
         "overhead_percent": None,
         "method": (
             "whole-run measured-phase go-tpc tpmC compared with the baseline from "
-            "the same trial; full-mode checking is deferred to checked shutdown"
+            "the same trial; this is steady-state throughput overhead. For a "
+            "live-frontier full run, rule checking executes concurrently. Native "
+            "close and server shutdown are reported separately as end-to-verdict tail."
         ),
         "checked_measurement_scope": checked["throughput_measurement_scope"],
     }
@@ -1286,9 +1579,9 @@ def analyze(root: pathlib.Path) -> dict[str, Any]:
             "comparison": (
                 "Each checked mode is compared only with a complete, fingerprint-"
                 "compatible whole-run baseline from the same trial. Positive "
-                "overhead means lower measured-phase throughput. Full-mode tpmC "
-                "includes capture, queueing, and reorder retention; checking is "
-                "deferred to checked shutdown and reported separately."
+                "overhead means lower measured-phase throughput. A headline-eligible "
+                "full run must prove that the live frontier advanced, rule checking "
+                "ran before close, and only a small bounded tail remained."
             ),
             "interval_windows": INTERVAL_NOTE,
             "partial_results": (
@@ -1302,12 +1595,19 @@ def analyze(root: pathlib.Path) -> dict[str, Any]:
             ),
             "resource_scope": (
                 "pidstat CPU, RSS, and I/O are sampled only during the measured "
-                "workload; shutdown and deferred-checker resource use are excluded."
+                "workload, so concurrent ordering/checking is included. Native-close "
+                "and whole-server shutdown durations are separate end-to-verdict "
+                "measurements and are not folded into tpmC."
             ),
             "checker_counter_scope": (
                 "Checker counters cover the TiDB server lifetime, including prepare, "
                 "warm-up, and measured phases. Without phase-boundary counters they "
                 "must not be attributed solely to measured NewOrder transactions."
+            ),
+            "legacy_results": (
+                "Results without native_metrics_before_close and successful "
+                "frontier_metrics are labeled legacy deferred/quiescent runs and "
+                "are excluded from complete online-order/full overhead headlines."
             ),
         },
         "trials": trials,
@@ -1340,6 +1640,8 @@ def markdown(summary: dict[str, Any]) -> str:
         "",
         summary["methodology"]["checker_counter_scope"],
         "",
+        summary["methodology"]["legacy_results"],
+        "",
     ]
     if summary["warnings"]:
         lines.extend(["## Root warnings", ""])
@@ -1368,8 +1670,8 @@ def markdown(summary: dict[str, Any]) -> str:
                     client_cpus=settings.get("client_cpuset", "unknown"),
                 ),
                 "",
-                "| Mode | State | Measured-phase tpmC | Qualified vs baseline | Errors | Error rate | NEW_ORDER p99 | TiDB CPU mean | Sampled measured-phase TiDB max RSS | Checked shutdown | Native checking | Post-check |",
-                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+                "| Mode | State | Checker execution | Measured-phase tpmC | Steady-state overhead vs baseline | Errors | Error rate | NEW_ORDER p99 | TiDB CPU mean | Sampled measured-phase TiDB max RSS | Server shutdown/end-to-result | Native close tail | Post-check |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
         for mode in trial["modes"]:
@@ -1385,13 +1687,7 @@ def markdown(summary: dict[str, Any]) -> str:
             rss = pidstat.get("rss_kib", {}).get("maximum")
             rss_mib = rss / 1024.0 if rss is not None else None
             shutdown = mode["validation"]["checked_shutdown"].get("shutdown_seconds")
-            native = (
-                mode["checker_result"].get("native_metrics", {})
-                if isinstance(mode.get("checker_result"), dict)
-                else {}
-            )
-            checking_ns = as_float(native.get("checking_ns"))
-            checking_seconds = checking_ns / 1e9 if checking_ns is not None else None
+            native_close = mode["completion_tail"].get("native_close_seconds")
             p99 = workload.get("operations", {}).get("NEW_ORDER", {}).get(
                 "p99_latency_ms"
             )
@@ -1399,9 +1695,10 @@ def markdown(summary: dict[str, Any]) -> str:
             error_rate = workload.get("new_order_error_percent")
             post = "pass" if mode["validation"]["checks"]["post_check_complete"] else "incomplete"
             lines.append(
-                "| {mode} | {state} | {tpm} | {overhead} | {errors} | {error_rate} | {p99} | {cpu} | {rss} | {shutdown} | {checking} | {post} |".format(
+                "| {mode} | {state} | {execution} | {tpm} | {overhead} | {errors} | {error_rate} | {p99} | {cpu} | {rss} | {shutdown} | {native_close} | {post} |".format(
                     mode=mode["mode"],
                     state=mode["state"],
+                    execution=mode["checker_execution_model"],
                     tpm=format_number(workload.get("tpm_c")),
                     overhead=overhead,
                     errors=errors if errors is not None else "—",
@@ -1410,16 +1707,17 @@ def markdown(summary: dict[str, Any]) -> str:
                     cpu=format_number(cpu, 2, "%"),
                     rss=format_number(rss_mib, 1, " MiB"),
                     shutdown=format_number(shutdown, 3, " s"),
-                    checking=format_number(checking_seconds, 3, " s"),
+                    native_close=format_number(native_close, 3, " s"),
                     post=post,
                 )
             )
         lines.extend(
             [
                 "",
-                "Full-mode tpmC covers the measured capture + queue + reorder phase. "
-                "Checking is deferred to graceful shutdown, so native checking time "
-                "and total checked-shutdown time are reported separately above.",
+                "For `live-frontier` full mode, measured tpmC includes concurrent "
+                "capture, ordering, and rule checking. Native close and whole-server "
+                "shutdown are end-to-verdict tail latencies, shown separately instead "
+                "of being silently folded into steady-state tpmC.",
                 "",
             ]
         )

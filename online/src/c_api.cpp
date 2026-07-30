@@ -983,6 +983,8 @@ public:
       ++next_publication_seq_;
     }
     accepted_publications_.fetch_add(1U, std::memory_order_relaxed);
+    accepted_events_.fetch_add(evidence->event_count,
+                               std::memory_order_relaxed);
     if (is_write) {
       successful_write_commits_.fetch_add(1U, std::memory_order_relaxed);
     } else {
@@ -1211,6 +1213,8 @@ public:
           completion_transactions_.load(std::memory_order_relaxed);
       const auto accepted =
           accepted_publications_.load(std::memory_order_relaxed);
+      const auto accepted_events =
+          accepted_events_.load(std::memory_order_relaxed);
       const auto recycled =
           recycled_transactions_.load(std::memory_order_relaxed);
       bool lifecycle_mismatch = writes + completions != accepted;
@@ -1224,7 +1228,8 @@ public:
             accepted != runtime_metrics.published_transactions ||
             accepted != runtime_metrics.ordered_transactions ||
             (mode_ == NativeMode::Full &&
-             accepted != runtime_metrics.checked_transactions);
+             (accepted != runtime_metrics.checked_transactions ||
+              accepted_events != runtime_metrics.checked_events));
       }
       const auto capture_metrics = capture_budget_.metrics();
       lifecycle_mismatch =
@@ -1315,6 +1320,8 @@ public:
         << completion_transactions_.load(std::memory_order_relaxed)
         << ",\"accepted_publications\":"
         << accepted_publications_.load(std::memory_order_relaxed)
+        << ",\"accepted_events\":"
+        << accepted_events_.load(std::memory_order_relaxed)
         << ",\"recycled_transactions\":"
         << recycled_transactions_.load(std::memory_order_relaxed)
         << ",\"committed_but_unpublished\":"
@@ -1358,6 +1365,8 @@ public:
         << ",\"queue_bytes\":" << runtime_metrics.queue.queued_bytes
         << ",\"queue_peak_bytes\":"
         << runtime_metrics.queue.high_water_queued_bytes
+        << ",\"queue_peak_depth\":"
+        << runtime_metrics.queue.high_water_queued_depth
         << ",\"queue_depth\":" << runtime_metrics.queue.queued_depth
         << ",\"queue_backpressure_wait_count\":"
         << runtime_metrics.queue.backpressure_wait_count
@@ -1377,6 +1386,8 @@ public:
         << ",\"ordering_ns\":" << runtime_metrics.total_ordering_time.count()
         << ",\"checking_ns\":" << runtime_metrics.total_checking_time.count()
         << ",\"max_checking_ns\":" << runtime_metrics.max_checking_time.count()
+        << ",\"total_queue_lag_ns\":"
+        << runtime_metrics.total_queue_lag.count()
         << ",\"current_commit_token_lag\":"
         << runtime_metrics.current_commit_token_lag
         << ",\"max_commit_token_lag\":" << runtime_metrics.max_commit_token_lag
@@ -1573,6 +1584,7 @@ private:
   std::atomic<std::uint64_t> definitive_aborts_{0};
   std::atomic<std::uint64_t> successful_write_commits_{0};
   std::atomic<std::uint64_t> completion_transactions_{0};
+  std::atomic<std::uint64_t> accepted_events_{0};
   std::atomic<std::uint64_t> accepted_publications_{0};
   std::atomic<std::uint64_t> recycled_transactions_{0};
   std::atomic<std::uint64_t> committed_but_unpublished_{0};

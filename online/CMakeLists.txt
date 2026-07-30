@@ -211,5 +211,10 @@ if(CO_CHECKER_ONLINE_BUILD_TESTING)
       COMMAND ${Python3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_layout_sampler.py
     )
+    add_test(
+      NAME co_checker_online_tpcc_global_lock_analyzer_tests
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_analyze_tpcc_global_lock.py
+    )
   endif()
 endif()
