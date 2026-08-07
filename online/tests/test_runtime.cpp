@@ -316,7 +316,25 @@ void test_write_token_kind_allows_zero_normalized_writes() {
   require_ok(runtime.updateDatabaseFrontier(token(20)));
   require_ok(runtime.updateProducerDeliveryFrontier(1, token(20), 1));
   require_ok(runtime.flush());
-  CHECK(runtime.metrics().checked_transactions == 1U);
+  const auto metrics = runtime.metrics();
+  CHECK(metrics.checked_transactions == 1U);
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
+  CHECK(metrics.checking_duration_samples == 1U);
+  CHECK(metrics.checking_p50_bucket_upper_bound ==
+        metrics.checking_p95_bucket_upper_bound);
+  CHECK(metrics.checking_p95_bucket_upper_bound ==
+        metrics.checking_p99_bucket_upper_bound);
+  CHECK(metrics.checking_p99_bucket_upper_bound >= metrics.max_checking_time);
+  CHECK(metrics.slowest_check.has_value());
+  if (metrics.slowest_check.has_value()) {
+    CHECK(metrics.slowest_check->commit_seq == 0U);
+    CHECK(metrics.slowest_check->transaction_id == meta.transaction_id);
+    CHECK(metrics.slowest_check->event_count == 0U);
+  }
+#else
+  CHECK(metrics.checking_duration_samples == 0U);
+  CHECK(!metrics.slowest_check.has_value());
+#endif
   CHECK(runtime.verdict()->status == ConsistencyStatus::Pass);
   close_cleanly(runtime);
 }

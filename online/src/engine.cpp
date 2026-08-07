@@ -26,6 +26,11 @@ public:
   using std::length_error::length_error;
 };
 
+struct EventCounts {
+  std::size_t snapshot_reads = 0;
+  std::size_t writes         = 0;
+};
+
 [[nodiscard]] bool equal_bytes(const ByteView lhs,
                                const ByteView rhs) noexcept {
   return lhs.size() == rhs.size() &&
@@ -276,15 +281,17 @@ public:
   [[nodiscard]] ConsumeResult consume(const OrderedTxnMeta &meta,
                                       const std::span<const EventView> events) {
     return guarded_consume(meta.commit_seq, [&] {
-      return consume_range(meta, events, events.size());
+      return consume_range(meta, events, std::nullopt);
     });
   }
 
   [[nodiscard]] ConsumeResult consume(const ValidatedTxnView &transaction) {
     const auto events = transaction.events();
     return guarded_consume(transaction.meta().commit_seq, [&] {
-      return consume_range(transaction.meta(), events,
-                           transaction.event_count());
+      return consume_range(
+          transaction.meta(), events,
+          EventCounts{static_cast<std::size_t>(transaction.read_count()),
+                      static_cast<std::size_t>(transaction.write_count())});
     });
   }
 
@@ -307,9 +314,9 @@ private:
   }
 
   template <typename EventRange>
-  [[nodiscard]] ConsumeResult consume_range(const OrderedTxnMeta &meta,
-                                            const EventRange &events,
-                                            const std::size_t event_count) {
+  [[nodiscard]] ConsumeResult
+  consume_range(const OrderedTxnMeta &meta, const EventRange &events,
+                const std::optional<EventCounts> validated_counts) {
     if (sticky_error_.has_value()) {
       return error_result();
     }
@@ -330,20 +337,26 @@ private:
                   std::nullopt);
     }
 
-    if (const auto validation_error = validate_events(meta, events);
+    EventCounts derived_counts;
+    auto *counts_to_derive =
+        validated_counts.has_value() ? nullptr : &derived_counts;
+    if (const auto validation_error =
+            validate_events(meta, events, counts_to_derive);
         validation_error.has_value()) {
       sticky_error_ = *validation_error;
       return error_result();
     }
+    const auto event_counts = validated_counts.value_or(derived_counts);
 
     ReadMap reads;
     std::vector<PendingRead> pending_reads;
     std::vector<OwnedBytes> permanently_wrong_keys;
     FinalWriteMap final_writes;
-    reads.reserve(event_count);
-    pending_reads.reserve(event_count);
-    final_writes.reserve(event_count);
-    repeated_reads_.reset(event_count);
+    reads.reserve(event_counts.snapshot_reads);
+    pending_reads.reserve(event_counts.snapshot_reads);
+    permanently_wrong_keys.reserve(event_counts.snapshot_reads);
+    final_writes.reserve(event_counts.writes);
+    repeated_reads_.reset(event_counts.snapshot_reads);
 
     struct BorrowedReadGuard {
       RepeatedReadTable &table;
@@ -355,12 +368,33 @@ private:
       if (event.op == EventOp::Read &&
           event.read_source == ReadSource::Snapshot) {
         const auto repeated = repeated_reads_.insert(event);
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
+        const auto marginal_packed_bytes =
+            static_cast<std::uint64_t>(sizeof(EventDescriptorV1)) +
+            static_cast<std::uint64_t>(event.key.size()) +
+            static_cast<std::uint64_t>(event.value.size());
+        ++snapshot_read_events_;
+        snapshot_read_packed_bytes_ += marginal_packed_bytes;
+#endif
         if (repeated.kind == RepeatedReadInsertKind::Inserted) {
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
+          ++unique_snapshot_reads_;
+#endif
           pending_reads.push_back(PendingRead{
               event.key, ReadObservation{.result = borrowed_tagged_value(event),
                                          .first_sequence = event.sequence}});
           continue;
         }
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
+        duplicate_snapshot_read_packed_bytes_ += marginal_packed_bytes;
+        if (repeated.kind == RepeatedReadInsertKind::SameResult) {
+          ++identical_snapshot_repeats_;
+          identical_snapshot_repeat_packed_bytes_ += marginal_packed_bytes;
+        } else {
+          ++conflicting_snapshot_repeats_;
+          conflicting_snapshot_repeat_packed_bytes_ += marginal_packed_bytes;
+        }
+#endif
         if (repeated.kind == RepeatedReadInsertKind::ConflictingResult) {
           const auto key = copy_bytes(event.key);
           if (!repeated_read_violation.has_value()) {
@@ -514,6 +548,23 @@ public:
         .history_entries               = history_.size(),
         .history_deltas                = history_deltas_,
         .history_logical_bytes         = history_logical_bytes_,
+        .snapshot_read_events          = snapshot_read_events_,
+        .unique_snapshot_reads         = unique_snapshot_reads_,
+        .identical_snapshot_repeats    = identical_snapshot_repeats_,
+        .conflicting_snapshot_repeats  = conflicting_snapshot_repeats_,
+        .snapshot_read_packed_bytes    = snapshot_read_packed_bytes_,
+        .duplicate_snapshot_read_packed_bytes =
+            duplicate_snapshot_read_packed_bytes_,
+        .identical_snapshot_repeat_packed_bytes =
+            identical_snapshot_repeat_packed_bytes_,
+        .conflicting_snapshot_repeat_packed_bytes =
+            conflicting_snapshot_repeat_packed_bytes_,
+        .compatible_snapshot_checks      = compatible_snapshot_checks_,
+        .history_entries_visited         = history_entries_visited_,
+        .history_deltas_visited          = history_deltas_visited_,
+        .history_relevant_deltas_visited = history_relevant_deltas_visited_,
+        .max_history_entries_visited     = max_history_entries_visited_,
+        .max_history_deltas_visited      = max_history_deltas_visited_,
         .repeated_reads                = repeated_reads_.metrics(),
     };
   }
@@ -532,7 +583,11 @@ private:
 
   template <typename EventRange>
   [[nodiscard]] std::optional<EngineError>
-  validate_events(const OrderedTxnMeta &meta, const EventRange &events) const {
+  validate_events(const OrderedTxnMeta &meta, const EventRange &events,
+                  EventCounts *derived_counts) const {
+    if (derived_counts != nullptr) {
+      *derived_counts = EventCounts{};
+    }
     std::optional<EventSeq> previous_sequence;
     for (const auto event : events) {
       if (previous_sequence.has_value() &&
@@ -578,6 +633,14 @@ private:
             .event_sequence = event.sequence,
         };
       }
+      if (derived_counts != nullptr) {
+        if (event.op == EventOp::Read &&
+            event.read_source == ReadSource::Snapshot) {
+          ++derived_counts->snapshot_reads;
+        } else if (event.op == EventOp::Write) {
+          ++derived_counts->writes;
+        }
+      }
     }
     return std::nullopt;
   }
@@ -585,7 +648,22 @@ private:
   [[nodiscard]] bool
   has_compatible_snapshot(const ReadMap &reads,
                           const std::optional<CommitSeq> lower_bound,
-                          WrongKeySet &wrong_keys) const {
+                          WrongKeySet &wrong_keys) {
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
+    ++compatible_snapshot_checks_;
+    std::uint64_t entries_visited = 0;
+    std::uint64_t deltas_visited = 0;
+    std::uint64_t relevant_deltas_visited = 0;
+    const auto record_traversal = [&] {
+      history_entries_visited_ += entries_visited;
+      history_deltas_visited_ += deltas_visited;
+      history_relevant_deltas_visited_ += relevant_deltas_visited;
+      max_history_entries_visited_ =
+          std::max(max_history_entries_visited_, entries_visited);
+      max_history_deltas_visited_ =
+          std::max(max_history_deltas_visited_, deltas_visited);
+    };
+#endif
     wrong_keys.clear();
     wrong_keys.reserve(reads.size());
     for (const auto &[key, observation] : reads) {
@@ -595,6 +673,9 @@ private:
       }
     }
     if (wrong_keys.empty()) {
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
+      record_traversal();
+#endif
       return true;
     }
 
@@ -607,11 +688,20 @@ private:
         break;
       }
 
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
+      ++entries_visited;
+#endif
       for (const auto &delta : history_it->delta) {
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
+        ++deltas_visited;
+#endif
         const auto read_it = reads.find(delta.key);
         if (read_it == reads.end()) {
           continue;
         }
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
+        ++relevant_deltas_visited;
+#endif
         if (matches_old_value(read_it->second.result, delta.old_value,
                               values_)) {
           wrong_keys.erase(delta.key);
@@ -620,9 +710,15 @@ private:
         }
       }
       if (wrong_keys.empty()) {
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
+        record_traversal();
+#endif
         return true;
       }
     }
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
+    record_traversal();
+#endif
     return false;
   }
 
@@ -771,6 +867,20 @@ private:
   std::size_t current_snapshot_keys_     = 0;
   std::size_t history_deltas_            = 0;
   std::size_t history_logical_bytes_     = 0;
+  std::uint64_t snapshot_read_events_                     = 0;
+  std::uint64_t unique_snapshot_reads_                    = 0;
+  std::uint64_t identical_snapshot_repeats_               = 0;
+  std::uint64_t conflicting_snapshot_repeats_             = 0;
+  std::uint64_t snapshot_read_packed_bytes_               = 0;
+  std::uint64_t duplicate_snapshot_read_packed_bytes_     = 0;
+  std::uint64_t identical_snapshot_repeat_packed_bytes_   = 0;
+  std::uint64_t conflicting_snapshot_repeat_packed_bytes_ = 0;
+  std::uint64_t compatible_snapshot_checks_               = 0;
+  std::uint64_t history_entries_visited_                  = 0;
+  std::uint64_t history_deltas_visited_                   = 0;
+  std::uint64_t history_relevant_deltas_visited_          = 0;
+  std::uint64_t max_history_entries_visited_              = 0;
+  std::uint64_t max_history_deltas_visited_               = 0;
   std::optional<Violation> first_violation_;
   std::optional<EngineError> sticky_error_;
 };

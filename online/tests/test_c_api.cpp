@@ -359,6 +359,45 @@ void test_full_lifecycle_retry_ownership_and_clean_close() {
   CHECK(metrics.find("\"ordering_ns\":") != std::string::npos);
   CHECK(metrics.find("\"checking_ns\":") != std::string::npos);
   CHECK(metrics.find("\"max_checking_ns\":") != std::string::npos);
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
+  CHECK(metrics.find("\"detailed_profiling_enabled\":true") !=
+        std::string::npos);
+  CHECK(metrics.find("\"checking_duration_samples\":2") != std::string::npos);
+#else
+  CHECK(metrics.find("\"detailed_profiling_enabled\":false") !=
+        std::string::npos);
+  CHECK(metrics.find("\"checking_duration_samples\":0") != std::string::npos);
+#endif
+  CHECK(metrics.find("\"checking_p50_bucket_upper_bound_ns\":") !=
+        std::string::npos);
+  CHECK(metrics.find("\"checking_p95_bucket_upper_bound_ns\":") !=
+        std::string::npos);
+  CHECK(metrics.find("\"checking_p99_bucket_upper_bound_ns\":") !=
+        std::string::npos);
+  CHECK(metrics.find("\"slowest_check_commit_seq\":") != std::string::npos);
+  CHECK(metrics.find("\"slowest_check_transaction_uid_word0\":") !=
+        std::string::npos);
+  CHECK(metrics.find("\"slowest_check_event_count\":") != std::string::npos);
+  CHECK(metrics.find("\"snapshot_read_events\":") != std::string::npos);
+  CHECK(metrics.find("\"unique_snapshot_reads\":") != std::string::npos);
+  CHECK(metrics.find("\"identical_snapshot_repeats\":") != std::string::npos);
+  CHECK(metrics.find("\"conflicting_snapshot_repeats\":") != std::string::npos);
+  CHECK(metrics.find("\"duplicate_snapshot_read_packed_bytes\":") !=
+        std::string::npos);
+  CHECK(metrics.find("\"history_entries_visited\":") != std::string::npos);
+  CHECK(metrics.find("\"history_deltas_visited\":") != std::string::npos);
+  CHECK(metrics.find("\"repeated_read_table_capacity\":") != std::string::npos);
+  CHECK(metrics.find("\"repeated_read_touched_capacity\":") !=
+        std::string::npos);
+  CHECK(metrics.find("\"repeated_read_shrinks\":") != std::string::npos);
+  CHECK(metrics.find("\"repeated_read_shrink_failures\":") !=
+        std::string::npos);
+  CHECK(metrics.find("\"repeated_read_max_shrink_rebuild_ns\":") !=
+        std::string::npos);
+  CHECK(metrics.find("\"repeated_read_clear_slot_visits\":") !=
+        std::string::npos);
+  CHECK(metrics.find("\"repeated_read_clear_control_bytes_filled\":") !=
+        std::string::npos);
 }
 
 void test_live_frontiers_check_before_quiescent_close() {

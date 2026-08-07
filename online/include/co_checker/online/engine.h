@@ -31,6 +31,20 @@ struct SnapshotSOWWMetrics {
   std::size_t history_entries               = 0;
   std::size_t history_deltas                = 0;
   std::size_t history_logical_bytes         = 0;
+  std::uint64_t snapshot_read_events                     = 0;
+  std::uint64_t unique_snapshot_reads                    = 0;
+  std::uint64_t identical_snapshot_repeats               = 0;
+  std::uint64_t conflicting_snapshot_repeats             = 0;
+  std::uint64_t snapshot_read_packed_bytes               = 0;
+  std::uint64_t duplicate_snapshot_read_packed_bytes     = 0;
+  std::uint64_t identical_snapshot_repeat_packed_bytes   = 0;
+  std::uint64_t conflicting_snapshot_repeat_packed_bytes = 0;
+  std::uint64_t compatible_snapshot_checks               = 0;
+  std::uint64_t history_entries_visited                  = 0;
+  std::uint64_t history_deltas_visited                   = 0;
+  std::uint64_t history_relevant_deltas_visited          = 0;
+  std::uint64_t max_history_entries_visited              = 0;
+  std::uint64_t max_history_deltas_visited               = 0;
   RepeatedReadTableMetrics repeated_reads;
 };
 

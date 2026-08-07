@@ -1297,6 +1297,8 @@ public:
     const auto runtime_metrics  = runtime_.metrics();
     const auto capture_metrics  = capture_budget_.metrics();
     const auto pool_metrics     = chunk_pool_->stats();
+    const auto slowest_check =
+        runtime_metrics.slowest_check.value_or(SlowestCheckMetrics{});
     std::size_t active_attempts = 0;
     {
       std::lock_guard state_lock(state_mutex_);
@@ -1386,6 +1388,24 @@ public:
         << ",\"ordering_ns\":" << runtime_metrics.total_ordering_time.count()
         << ",\"checking_ns\":" << runtime_metrics.total_checking_time.count()
         << ",\"max_checking_ns\":" << runtime_metrics.max_checking_time.count()
+        << ",\"detailed_profiling_enabled\":"
+        << (runtime_metrics.engine.repeated_reads.detailed_profiling_enabled
+                ? "true"
+                : "false")
+        << ",\"checking_duration_samples\":"
+        << runtime_metrics.checking_duration_samples
+        << ",\"checking_p50_bucket_upper_bound_ns\":"
+        << runtime_metrics.checking_p50_bucket_upper_bound.count()
+        << ",\"checking_p95_bucket_upper_bound_ns\":"
+        << runtime_metrics.checking_p95_bucket_upper_bound.count()
+        << ",\"checking_p99_bucket_upper_bound_ns\":"
+        << runtime_metrics.checking_p99_bucket_upper_bound.count()
+        << ",\"slowest_check_commit_seq\":" << slowest_check.commit_seq
+        << ",\"slowest_check_transaction_uid_word0\":"
+        << slowest_check.transaction_id.words[0]
+        << ",\"slowest_check_transaction_uid_word1\":"
+        << slowest_check.transaction_id.words[1]
+        << ",\"slowest_check_event_count\":" << slowest_check.event_count
         << ",\"total_queue_lag_ns\":"
         << runtime_metrics.total_queue_lag.count()
         << ",\"current_commit_token_lag\":"
@@ -1403,6 +1423,72 @@ public:
         << runtime_metrics.engine.interned_value_bytes
         << ",\"history_entries\":" << runtime_metrics.engine.history_entries
         << ",\"history_deltas\":" << runtime_metrics.engine.history_deltas
+        << ",\"snapshot_read_events\":"
+        << runtime_metrics.engine.snapshot_read_events
+        << ",\"unique_snapshot_reads\":"
+        << runtime_metrics.engine.unique_snapshot_reads
+        << ",\"identical_snapshot_repeats\":"
+        << runtime_metrics.engine.identical_snapshot_repeats
+        << ",\"conflicting_snapshot_repeats\":"
+        << runtime_metrics.engine.conflicting_snapshot_repeats
+        << ",\"snapshot_read_packed_bytes\":"
+        << runtime_metrics.engine.snapshot_read_packed_bytes
+        << ",\"duplicate_snapshot_read_packed_bytes\":"
+        << runtime_metrics.engine.duplicate_snapshot_read_packed_bytes
+        << ",\"identical_snapshot_repeat_packed_bytes\":"
+        << runtime_metrics.engine.identical_snapshot_repeat_packed_bytes
+        << ",\"conflicting_snapshot_repeat_packed_bytes\":"
+        << runtime_metrics.engine.conflicting_snapshot_repeat_packed_bytes
+        << ",\"compatible_snapshot_checks\":"
+        << runtime_metrics.engine.compatible_snapshot_checks
+        << ",\"history_entries_visited\":"
+        << runtime_metrics.engine.history_entries_visited
+        << ",\"history_deltas_visited\":"
+        << runtime_metrics.engine.history_deltas_visited
+        << ",\"history_relevant_deltas_visited\":"
+        << runtime_metrics.engine.history_relevant_deltas_visited
+        << ",\"max_history_entries_visited\":"
+        << runtime_metrics.engine.max_history_entries_visited
+        << ",\"max_history_deltas_visited\":"
+        << runtime_metrics.engine.max_history_deltas_visited
+        << ",\"repeated_read_table_size\":"
+        << runtime_metrics.engine.repeated_reads.size
+        << ",\"repeated_read_table_capacity\":"
+        << runtime_metrics.engine.repeated_reads.capacity
+        << ",\"repeated_read_touched_size\":"
+        << runtime_metrics.engine.repeated_reads.touched_size
+        << ",\"repeated_read_touched_capacity\":"
+        << runtime_metrics.engine.repeated_reads.touched_capacity
+        << ",\"repeated_read_probe_groups\":"
+        << runtime_metrics.engine.repeated_reads.probe_groups
+        << ",\"repeated_read_key_comparisons\":"
+        << runtime_metrics.engine.repeated_reads.key_comparisons
+        << ",\"repeated_read_resizes\":"
+        << runtime_metrics.engine.repeated_reads.resizes
+        << ",\"repeated_read_shrinks\":"
+        << runtime_metrics.engine.repeated_reads.shrinks
+        << ",\"repeated_read_shrink_attempts\":"
+        << runtime_metrics.engine.repeated_reads.shrink_attempts
+        << ",\"repeated_read_shrink_failures\":"
+        << runtime_metrics.engine.repeated_reads.shrink_failures
+        << ",\"repeated_read_max_shrink_rebuild_ns\":"
+        << runtime_metrics.engine.repeated_reads.max_shrink_rebuild_ns
+        << ",\"repeated_read_reset_calls\":"
+        << runtime_metrics.engine.repeated_reads.reset_calls
+        << ",\"repeated_read_reset_expected_events\":"
+        << runtime_metrics.engine.repeated_reads.reset_expected_events
+        << ",\"repeated_read_max_reset_expected_events\":"
+        << runtime_metrics.engine.repeated_reads.max_reset_expected_events
+        << ",\"repeated_read_clear_calls\":"
+        << runtime_metrics.engine.repeated_reads.clear_calls
+        << ",\"repeated_read_clear_slot_visits\":"
+        << runtime_metrics.engine.repeated_reads.clear_slot_visits
+        << ",\"repeated_read_clear_control_bytes_filled\":"
+        << runtime_metrics.engine.repeated_reads.clear_control_bytes_filled
+        << ",\"repeated_read_clear_occupied_slots_reset\":"
+        << runtime_metrics.engine.repeated_reads.clear_occupied_slots_reset
+        << ",\"repeated_read_probe_mode\":"
+        << static_cast<unsigned>(runtime_metrics.engine.repeated_reads.mode)
         << '}';
     return out.str();
   }

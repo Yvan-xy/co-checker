@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <bit>
+#include <cassert>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -18,7 +20,9 @@
 namespace co_checker::online {
 namespace {
 
-constexpr std::uint8_t kEmpty = 0x80U;
+constexpr std::uint8_t kEmpty                  = 0x80U;
+constexpr std::size_t kShrinkRatio             = 8U;
+constexpr std::size_t kShrinkGraceTransactions = 64U;
 
 struct ProbeMasks {
   std::uint32_t candidates = 0;
@@ -195,41 +199,109 @@ RepeatedReadProbeMode default_repeated_read_probe_mode() noexcept {
 
 class RepeatedReadTable::Impl {
 public:
-  Impl(const RepeatedReadProbeMode requested_mode, RepeatedReadHash hash)
-      : mode_(mode_supported(requested_mode) ? requested_mode
+  Impl(const RepeatedReadProbeMode requested_mode, RepeatedReadHash hash,
+       std::pmr::memory_resource *memory_resource)
+      : memory_resource_(memory_resource == nullptr
+                             ? std::pmr::get_default_resource()
+                             : memory_resource),
+        mode_(mode_supported(requested_mode) ? requested_mode
                                              : RepeatedReadProbeMode::Scalar),
         hash_(hash == nullptr ? repeated_read_hash : hash),
-        group_width_(mode_ == RepeatedReadProbeMode::AVX2 ? 32U : 16U) {}
+        group_width_(mode_ == RepeatedReadProbeMode::AVX2 ? 32U : 16U),
+        control_(memory_resource_), slots_(memory_resource_),
+        touched_(memory_resource_) {}
 
   void reset(const std::size_t expected) {
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
+    ++reset_calls_;
+    reset_expected_events_ += static_cast<std::uint64_t>(expected);
+    max_reset_expected_events_ = std::max(max_reset_expected_events_, expected);
+#endif
     clear();
     const auto required_capacity = next_capacity(expected, group_width_);
     if (capacity_ < required_capacity) {
-      allocate(required_capacity);
+      allocate(required_capacity, expected);
+      reset_shrink_policy();
+      return;
     }
+
+    if (capacity_ > group_width_ &&
+        required_capacity <= capacity_ / kShrinkRatio) {
+      ++underutilized_resets_;
+      shrink_window_max_required_capacity_ =
+          std::max(shrink_window_max_required_capacity_, required_capacity);
+      shrink_window_max_expected_ =
+          std::max(shrink_window_max_expected_, expected);
+      if (underutilized_resets_ == kShrinkGraceTransactions) {
+        attempt_shrink();
+        return;
+      }
+    } else {
+      reset_shrink_policy();
+    }
+    touched_.reserve(expected);
   }
 
   void clear() noexcept {
-    for (std::size_t index = 0; index < capacity_; ++index) {
-      if (control_[index] != kEmpty) {
-        slots_[index] = Slot{};
-      }
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
+    ++clear_calls_;
+    clear_slot_visits_ += static_cast<std::uint64_t>(touched_.size());
+    clear_occupied_slots_reset_ +=
+        static_cast<std::uint64_t>(touched_.size());
+#endif
+    assert(touched_.size() == size_);
+    if (touched_.empty()) {
+      assert(size_ == 0);
+      return;
     }
-    std::fill(control_.begin(), control_.end(), kEmpty);
+
+    for (const auto index : touched_) {
+      assert(index < capacity_);
+      assert(control_[index] != kEmpty);
+      slots_[index] = Slot{};
+      set_control(index, kEmpty);
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
+      ++clear_control_bytes_filled_;
+      if (index < group_width_) {
+        ++clear_control_bytes_filled_;
+      }
+#endif
+    }
+    touched_.clear();
     size_ = 0;
   }
 
   [[nodiscard]] RepeatedReadInsertResult insert(const EventView &read) {
-    if (capacity_ == 0 || size_ >= capacity_ - capacity_ / 8U) {
+    if (capacity_ == 0) {
       grow();
     }
     const auto hash = hash_(read.key);
-    return insert_with_hash(read, hash, true);
+    return insert_with_hash(read, hash, true, true);
   }
 
   [[nodiscard]] RepeatedReadTableMetrics metrics() const noexcept {
     return RepeatedReadTableMetrics{
-        size_, capacity_, probe_groups_, key_comparisons_, resizes_, mode_};
+        .detailed_profiling_enabled = CO_CHECKER_ENABLE_DETAILED_PROFILING != 0,
+        .size                       = size_,
+        .capacity                   = capacity_,
+        .touched_size               = touched_.size(),
+        .touched_capacity           = touched_.capacity(),
+        .probe_groups               = probe_groups_,
+        .key_comparisons            = key_comparisons_,
+        .resizes                    = resizes_,
+        .shrinks                    = shrinks_,
+        .shrink_attempts            = shrink_attempts_,
+        .shrink_failures            = shrink_failures_,
+        .max_shrink_rebuild_ns      = max_shrink_rebuild_ns_,
+        .reset_calls                = reset_calls_,
+        .reset_expected_events      = reset_expected_events_,
+        .max_reset_expected_events  = max_reset_expected_events_,
+        .clear_calls                = clear_calls_,
+        .clear_slot_visits          = clear_slot_visits_,
+        .clear_control_bytes_filled = clear_control_bytes_filled_,
+        .clear_occupied_slots_reset = clear_occupied_slots_reset_,
+        .mode                       = mode_,
+    };
   }
 
 private:
@@ -269,26 +341,35 @@ private:
     }
     return scalar_masks(bytes, group_width_, fingerprint);
   }
+  [[nodiscard]] std::size_t maximum_load() const noexcept {
+    return capacity_ - capacity_ / 8U;
+  }
 
   [[nodiscard]] RepeatedReadInsertResult
   insert_with_hash(const EventView &read, const std::uint64_t hash,
-                   const bool count_metrics) {
+                   const bool count_metrics, const bool allow_grow) {
     const auto fingerprint = static_cast<std::uint8_t>((hash >> 57U) & 0x7fU);
     auto start             = static_cast<std::size_t>(hash) & (capacity_ - 1U);
     for (;;) {
       const auto found = masks(start, fingerprint);
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
       if (count_metrics) {
         ++probe_groups_;
       }
+#else
+      (void)count_metrics;
+#endif
       auto candidates = found.candidates;
       while (candidates != 0) {
         const auto lane =
             static_cast<std::size_t>(std::countr_zero(candidates));
         const auto slot_index = (start + lane) & (capacity_ - 1U);
         const auto &slot      = slots_[slot_index];
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
         if (count_metrics) {
           ++key_comparisons_;
         }
+#endif
         if (slot.hash == hash && bytes_equal(slot.key, read.key)) {
           return RepeatedReadInsertResult{
               result_equal(slot.state, slot.value, read.value_state, read.value)
@@ -299,13 +380,19 @@ private:
         candidates &= candidates - 1U;
       }
       if (found.empty != 0) {
+        if (allow_grow && size_ == maximum_load()) {
+          grow();
+          return insert_with_hash(read, hash, count_metrics, true);
+        }
         const auto lane =
             static_cast<std::size_t>(std::countr_zero(found.empty));
         const auto slot_index = (start + lane) & (capacity_ - 1U);
+        touched_.push_back(slot_index);
         slots_[slot_index] =
             Slot{hash, read.key, read.value_state, read.value, read.sequence};
         set_control(slot_index, fingerprint);
         ++size_;
+        assert(touched_.size() == size_);
         return RepeatedReadInsertResult{RepeatedReadInsertKind::Inserted,
                                         read.sequence};
       }
@@ -320,17 +407,70 @@ private:
     }
   }
 
-  void allocate(const std::size_t capacity) {
-    // Allocate both arrays before changing any member. In particular, an
-    // allocation failure must not leave capacity_ describing larger arrays
-    // than control_/slots_; clear() is called by the engine's unwind guard.
-    std::vector<std::uint8_t> new_control(capacity + group_width_, kEmpty);
-    std::vector<Slot> new_slots(capacity);
-    control_  = std::move(new_control);
-    slots_    = std::move(new_slots);
+  void swap_storage(Impl &other) noexcept {
+    assert(memory_resource_ == other.memory_resource_);
+    std::swap(capacity_, other.capacity_);
+    std::swap(size_, other.size_);
+    control_.swap(other.control_);
+    slots_.swap(other.slots_);
+    touched_.swap(other.touched_);
+  }
+
+  void allocate(const std::size_t capacity,
+                const std::size_t touched_reserve) {
+    assert(size_ == 0);
+    assert(touched_.empty());
+
+    std::pmr::vector<std::uint8_t> new_control(memory_resource_);
+    new_control.resize(capacity + group_width_, kEmpty);
+    std::pmr::vector<Slot> new_slots(memory_resource_);
+    new_slots.resize(capacity);
+    std::pmr::vector<std::size_t> new_touched(memory_resource_);
+    new_touched.reserve(touched_reserve);
+
+    control_.swap(new_control);
+    slots_.swap(new_slots);
+    touched_.swap(new_touched);
     capacity_ = capacity;
     size_     = 0;
     ++resizes_;
+  }
+
+  void reset_shrink_policy() noexcept {
+    underutilized_resets_                = 0;
+    shrink_window_max_required_capacity_ = 0;
+    shrink_window_max_expected_          = 0;
+  }
+
+  void attempt_shrink() noexcept {
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
+    ++shrink_attempts_;
+    const auto started = std::chrono::steady_clock::now();
+#endif
+    try {
+      Impl replacement(mode_, hash_, memory_resource_);
+      replacement.allocate(shrink_window_max_required_capacity_,
+                           shrink_window_max_expected_);
+      swap_storage(replacement);
+      ++resizes_;
+      ++shrinks_;
+    } catch (const std::bad_alloc &) {
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
+      ++shrink_failures_;
+#endif
+    } catch (const std::length_error &) {
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
+      ++shrink_failures_;
+#endif
+    }
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - started)
+                             .count();
+    max_shrink_rebuild_ns_ =
+        std::max(max_shrink_rebuild_ns_, static_cast<std::uint64_t>(elapsed));
+#endif
+    reset_shrink_policy();
   }
 
   void grow() {
@@ -343,48 +483,65 @@ private:
     const auto new_capacity =
         old_capacity == 0 ? group_width_ : old_capacity * 2U;
 
-    // Establish the potentially throwing allocations before moving the old
-    // table out. This gives grow() the strong guarantee for allocation
-    // failures and keeps borrowed slots clearable during stack unwinding.
-    std::vector<std::uint8_t> new_control(new_capacity + group_width_, kEmpty);
-    std::vector<Slot> new_slots(new_capacity);
-    auto old_control    = std::move(control_);
-    auto old_slots      = std::move(slots_);
+    Impl replacement(mode_, hash_, memory_resource_);
+    replacement.allocate(new_capacity, size_ + 1U);
     const auto old_size = size_;
-    control_            = std::move(new_control);
-    slots_              = std::move(new_slots);
-    capacity_           = new_capacity;
-    size_               = 0;
-    ++resizes_;
-    for (std::size_t index = 0; index < old_capacity; ++index) {
-      if (old_control[index] == kEmpty) {
-        continue;
-      }
-      const auto &slot = old_slots[index];
+    for (const auto index : touched_) {
+      assert(index < old_capacity);
+      assert(control_[index] != kEmpty);
+      const auto &slot = slots_[index];
       const EventView read{slot.first_sequence,  EventOp::Read, slot.state,
                            ReadSource::Snapshot, slot.key,      slot.value};
-      (void)insert_with_hash(read, slot.hash, false);
+      const auto inserted =
+          replacement.insert_with_hash(read, slot.hash, false, false);
+      if (inserted.kind != RepeatedReadInsertKind::Inserted) {
+        throw std::logic_error(
+            "repeated-read table rehash produced a duplicate");
+      }
     }
-    if (size_ != old_size) {
+    if (replacement.size_ != old_size ||
+        replacement.touched_.size() != old_size) {
       throw std::logic_error("repeated-read table rehash lost an entry");
     }
+
+    swap_storage(replacement);
+    ++resizes_;
+    reset_shrink_policy();
+    assert(touched_.size() == size_);
   }
 
+  std::pmr::memory_resource *memory_resource_;
   RepeatedReadProbeMode mode_;
   RepeatedReadHash hash_;
   std::size_t group_width_ = 16;
   std::size_t capacity_    = 0;
   std::size_t size_        = 0;
-  std::vector<std::uint8_t> control_;
-  std::vector<Slot> slots_;
-  std::uint64_t probe_groups_    = 0;
-  std::uint64_t key_comparisons_ = 0;
-  std::uint64_t resizes_         = 0;
+  std::pmr::vector<std::uint8_t> control_;
+  std::pmr::vector<Slot> slots_;
+  std::pmr::vector<std::size_t> touched_;
+  std::uint64_t probe_groups_                      = 0;
+  std::uint64_t key_comparisons_                   = 0;
+  std::uint64_t resizes_                           = 0;
+  std::uint64_t shrinks_                           = 0;
+  std::uint64_t shrink_attempts_                   = 0;
+  std::uint64_t shrink_failures_                   = 0;
+  std::uint64_t max_shrink_rebuild_ns_             = 0;
+  std::size_t underutilized_resets_                = 0;
+  std::size_t shrink_window_max_required_capacity_ = 0;
+  std::size_t shrink_window_max_expected_          = 0;
+  std::uint64_t reset_calls_                       = 0;
+  std::uint64_t reset_expected_events_             = 0;
+  std::size_t max_reset_expected_events_           = 0;
+  std::uint64_t clear_calls_                       = 0;
+  std::uint64_t clear_slot_visits_                 = 0;
+  std::uint64_t clear_control_bytes_filled_        = 0;
+  std::uint64_t clear_occupied_slots_reset_        = 0;
 };
 
-RepeatedReadTable::RepeatedReadTable(const RepeatedReadProbeMode mode,
-                                     RepeatedReadHash hash)
-    : impl_(std::make_unique<Impl>(mode, hash)) {}
+RepeatedReadTable::RepeatedReadTable(
+    const RepeatedReadProbeMode mode, RepeatedReadHash hash,
+    std::pmr::memory_resource *memory_resource)
+    : impl_(std::make_unique<Impl>(mode, hash, memory_resource)) {}
 
 RepeatedReadTable::~RepeatedReadTable()                             = default;
 RepeatedReadTable::RepeatedReadTable(RepeatedReadTable &&) noexcept = default;

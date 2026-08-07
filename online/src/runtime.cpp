@@ -3,6 +3,8 @@
 #include "co_checker/online/engine.h"
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cassert>
 #include <condition_variable>
 #include <exception>
@@ -22,6 +24,80 @@ template <typename... Callables> struct Overloaded : Callables... {
 };
 template <typename... Callables>
 Overloaded(Callables...) -> Overloaded<Callables...>;
+
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
+constexpr std::size_t kCheckingDurationSubBuckets = 8U;
+constexpr std::size_t kCheckingDurationHistogramBuckets =
+    1U +
+    std::numeric_limits<std::uint64_t>::digits * kCheckingDurationSubBuckets;
+using CheckingDurationHistogram =
+    std::array<std::uint64_t, kCheckingDurationHistogramBuckets>;
+
+[[nodiscard]] std::size_t
+checking_duration_bucket(const std::uint64_t nanoseconds) noexcept {
+  if (nanoseconds == 0) {
+    return 0;
+  }
+  const auto exponent = static_cast<unsigned>(std::bit_width(nanoseconds)) - 1U;
+  const auto base     = std::uint64_t{1} << exponent;
+  std::uint64_t sub_bucket = 0;
+  if (exponent < 3U) {
+    sub_bucket = nanoseconds - base;
+  } else {
+    sub_bucket = (nanoseconds - base) / (base / 8U);
+  }
+  return 1U + static_cast<std::size_t>(exponent) * kCheckingDurationSubBuckets +
+         static_cast<std::size_t>(sub_bucket);
+}
+
+[[nodiscard]] std::uint64_t
+checking_duration_bucket_upper_bound(const std::size_t bucket) noexcept {
+  if (bucket == 0) {
+    return 0;
+  }
+  const auto normalized = bucket - 1U;
+  const auto exponent =
+      static_cast<unsigned>(normalized / kCheckingDurationSubBuckets);
+  const auto sub_bucket =
+      static_cast<std::uint64_t>(normalized % kCheckingDurationSubBuckets);
+  const auto base = std::uint64_t{1} << exponent;
+  if (exponent < 3U) {
+    return base + sub_bucket;
+  }
+  const auto width     = base / 8U;
+  const auto increment = (sub_bucket + 1U) * width - 1U;
+  if (increment > std::numeric_limits<std::uint64_t>::max() - base) {
+    return std::numeric_limits<std::uint64_t>::max();
+  }
+  return base + increment;
+}
+
+[[nodiscard]] std::chrono::nanoseconds
+checking_duration_percentile(const CheckingDurationHistogram &histogram,
+                             const std::uint64_t samples,
+                             const std::uint64_t percentage) noexcept {
+  if (samples == 0) {
+    return {};
+  }
+  const auto target = (samples / 100U) * percentage +
+                      ((samples % 100U) * percentage + 99U) / 100U;
+  std::uint64_t cumulative = 0;
+  for (std::size_t bucket = 0; bucket < histogram.size(); ++bucket) {
+    cumulative += histogram[bucket];
+    if (cumulative < target) {
+      continue;
+    }
+    const auto upper_bound = std::min(
+        checking_duration_bucket_upper_bound(bucket),
+        static_cast<std::uint64_t>(
+            std::numeric_limits<std::chrono::nanoseconds::rep>::max()));
+    return std::chrono::nanoseconds{
+        static_cast<std::chrono::nanoseconds::rep>(upper_bound)};
+  }
+  return std::chrono::nanoseconds{
+      std::numeric_limits<std::chrono::nanoseconds::rep>::max()};
+}
+#endif
 
 class ControlAcknowledgement final {
 public:
@@ -681,6 +757,16 @@ public:
       result.total_ordering_time      = total_ordering_time_;
       result.total_checking_time      = total_checking_time_;
       result.max_checking_time        = max_checking_time_;
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
+      result.checking_duration_samples       = checking_duration_samples_;
+      result.checking_p50_bucket_upper_bound = checking_duration_percentile(
+          checking_duration_histogram_, checking_duration_samples_, 50U);
+      result.checking_p95_bucket_upper_bound = checking_duration_percentile(
+          checking_duration_histogram_, checking_duration_samples_, 95U);
+      result.checking_p99_bucket_upper_bound = checking_duration_percentile(
+          checking_duration_histogram_, checking_duration_samples_, 99U);
+      result.slowest_check = slowest_check_;
+#endif
       result.current_commit_token_lag = current_commit_token_lag_;
       result.max_commit_token_lag     = max_commit_token_lag_;
       result.highest_observed_token   = highest_observed_token_;
@@ -1030,7 +1116,23 @@ private:
     {
       std::lock_guard lock(state_mutex_);
       total_checking_time_ += checking_elapsed;
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
+      checking_duration_histogram_[checking_duration_bucket(
+          static_cast<std::uint64_t>(checking_elapsed.count()))] += 1U;
+      if (checking_duration_samples_ == 0 ||
+          checking_elapsed > max_checking_time_) {
+        max_checking_time_ = checking_elapsed;
+        slowest_check_     = SlowestCheckMetrics{
+                .commit_seq     = ordered_view.meta().commit_seq,
+                .transaction_id = ordered_view.meta().transaction_id,
+                .event_count =
+                static_cast<std::uint64_t>(ordered_view.event_count()),
+        };
+      }
+      ++checking_duration_samples_;
+#else
       max_checking_time_ = std::max(max_checking_time_, checking_elapsed);
+#endif
     }
     if (!result.ok()) {
       (void)record_error(engine_error(*result.error));
@@ -1171,6 +1273,11 @@ private:
   std::chrono::nanoseconds total_ordering_time_{};
   std::chrono::nanoseconds total_checking_time_{};
   std::chrono::nanoseconds max_checking_time_{};
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
+  CheckingDurationHistogram checking_duration_histogram_{};
+  std::uint64_t checking_duration_samples_ = 0;
+  std::optional<SlowestCheckMetrics> slowest_check_;
+#endif
   std::optional<CommitOrderToken> highest_observed_token_;
   std::optional<CommitOrderToken> last_ordered_token_;
   std::optional<CommitOrderToken> last_checked_token_;

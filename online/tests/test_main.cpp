@@ -1,4 +1,5 @@
 #include "co_checker/online/engine.h"
+#include "co_checker/online/packed_batch.h"
 #include "reference_model.h"
 
 #include <algorithm>
@@ -212,6 +213,22 @@ void test_present_empty_is_distinct_from_absent() {
         std::vector<OwnedBytes>{bytes({1})});
   CHECK(result.transaction_violation->first_event_sequence == 1);
   CHECK(result.transaction_violation->conflicting_event_sequence == 2);
+  const auto metrics             = engine.metrics();
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
+  const auto marginal_read_bytes = sizeof(EventDescriptorV1) + 1U;
+  CHECK(metrics.snapshot_read_events == 2U);
+  CHECK(metrics.unique_snapshot_reads == 1U);
+  CHECK(metrics.identical_snapshot_repeats == 0U);
+  CHECK(metrics.conflicting_snapshot_repeats == 1U);
+  CHECK(metrics.snapshot_read_packed_bytes == marginal_read_bytes * 2U);
+  CHECK(metrics.duplicate_snapshot_read_packed_bytes == marginal_read_bytes);
+  CHECK(metrics.identical_snapshot_repeat_packed_bytes == 0U);
+  CHECK(metrics.conflicting_snapshot_repeat_packed_bytes ==
+        marginal_read_bytes);
+#else
+  CHECK(metrics.snapshot_read_events == 0U);
+  CHECK(metrics.conflicting_snapshot_repeats == 0U);
+#endif
 
   engine.reset();
   const std::vector<OwnedEvent> present_empty{
@@ -234,6 +251,57 @@ void test_local_reads_are_ignored() {
   CHECK(result.verdict->status == ConsistencyStatus::Pass);
 }
 
+void test_scratch_sizing_uses_snapshot_reads_and_writes() {
+  constexpr std::size_t event_count = 100U;
+
+  SnapshotSOWWEngine local_read_engine;
+  std::vector<OwnedEvent> local_reads;
+  local_reads.reserve(event_count);
+  for (std::size_t index = 0; index < event_count; ++index) {
+    local_reads.push_back(read(
+        static_cast<EventSeq>(index + 1U),
+        bytes({static_cast<unsigned int>(index)}), absent(),
+        ReadSource::Local));
+  }
+  expect_transaction_pass(
+      consume(local_read_engine, meta(0, session(1), 1), local_reads));
+  CHECK(local_read_engine.metrics().repeated_reads.capacity == 16U);
+
+  SnapshotSOWWEngine write_engine;
+  std::vector<OwnedEvent> writes;
+  writes.reserve(event_count);
+  for (std::size_t index = 0; index < event_count; ++index) {
+    writes.push_back(write(
+        static_cast<EventSeq>(index + 1U),
+        bytes({static_cast<unsigned int>(index)}), present(bytes({1U}))));
+  }
+  expect_transaction_pass(
+      consume(write_engine, meta(0, session(2), 1), writes));
+  CHECK(write_engine.metrics().repeated_reads.capacity == 16U);
+
+  SnapshotSOWWEngine snapshot_read_engine;
+  std::vector<OwnedEvent> snapshot_reads;
+  snapshot_reads.reserve(event_count);
+  for (std::size_t index = 0; index < event_count; ++index) {
+    snapshot_reads.push_back(read(
+        static_cast<EventSeq>(index + 1U),
+        bytes({static_cast<unsigned int>(index)}), absent()));
+  }
+  expect_transaction_pass(
+      consume(snapshot_read_engine, meta(0, session(3), 1), snapshot_reads));
+  CHECK(snapshot_read_engine.metrics().repeated_reads.capacity == 128U);
+
+  SnapshotSOWWEngine duplicate_read_engine;
+  std::vector<OwnedEvent> duplicate_reads;
+  duplicate_reads.reserve(event_count);
+  for (std::size_t index = 0; index < event_count; ++index) {
+    duplicate_reads.push_back(
+        read(static_cast<EventSeq>(index + 1U), bytes({42U}), absent()));
+  }
+  expect_transaction_pass(
+      consume(duplicate_read_engine, meta(0, session(4), 1), duplicate_reads));
+  CHECK(duplicate_read_engine.metrics().repeated_reads.capacity == 128U);
+}
 void test_final_write_per_key() {
   SnapshotSOWWEngine engine;
   const auto key = bytes({1});
@@ -310,6 +378,37 @@ void test_all_reads_must_match_one_prefix() {
   expect_transaction_violation(
       consume(engine, meta(3, session(4), 1), impossible),
       ViolationKind::NoCompatibleSnapshot);
+}
+
+void test_compatible_snapshot_history_traversal_metrics() {
+  SnapshotSOWWEngine engine;
+  const auto a = bytes({1});
+  const auto b = bytes({2});
+  const auto c = bytes({3});
+  expect_transaction_pass(consume(engine, meta(0, session(1), 1),
+                                  std::vector<OwnedEvent>{
+                                      write(1, a, present(bytes({10}))),
+                                      write(2, b, present(bytes({20}))),
+                                  }));
+  expect_transaction_pass(
+      consume(engine, meta(1, session(2), 1),
+              std::vector<OwnedEvent>{write(1, c, present(bytes({30})))}));
+  expect_transaction_pass(
+      consume(engine, meta(2, session(3), 1),
+              std::vector<OwnedEvent>{read(1, a, absent())}));
+
+  const auto metrics = engine.metrics();
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
+  CHECK(metrics.compatible_snapshot_checks == 3U);
+  CHECK(metrics.history_entries_visited == 2U);
+  CHECK(metrics.history_deltas_visited == 3U);
+  CHECK(metrics.history_relevant_deltas_visited == 1U);
+  CHECK(metrics.max_history_entries_visited == 2U);
+  CHECK(metrics.max_history_deltas_visited == 3U);
+#else
+  CHECK(metrics.compatible_snapshot_checks == 0U);
+  CHECK(metrics.history_entries_visited == 0U);
+#endif
 }
 
 void test_writes_apply_after_violation_and_verdict_is_sticky() {
@@ -477,8 +576,25 @@ void test_interned_state_metrics_and_hard_limit() {
         measured_metrics.interned_key_bytes +
             measured_metrics.interned_value_bytes +
             measured_metrics.history_logical_bytes);
+#if CO_CHECKER_ENABLE_DETAILED_PROFILING
   CHECK(measured_metrics.repeated_reads.size == 0U);
   CHECK(measured_metrics.repeated_reads.probe_groups > 0U);
+  CHECK(measured_metrics.snapshot_read_events == 2U);
+  CHECK(measured_metrics.unique_snapshot_reads == 1U);
+  CHECK(measured_metrics.identical_snapshot_repeats == 1U);
+  CHECK(measured_metrics.conflicting_snapshot_repeats == 0U);
+  const auto marginal_read_bytes = sizeof(EventDescriptorV1) + 2U;
+  CHECK(measured_metrics.snapshot_read_packed_bytes ==
+        marginal_read_bytes * 2U);
+  CHECK(measured_metrics.duplicate_snapshot_read_packed_bytes ==
+        marginal_read_bytes);
+  CHECK(measured_metrics.identical_snapshot_repeat_packed_bytes ==
+        marginal_read_bytes);
+#else
+  CHECK(measured_metrics.repeated_reads.probe_groups == 0U);
+  CHECK(measured_metrics.snapshot_read_events == 0U);
+#endif
+  CHECK(measured_metrics.conflicting_snapshot_repeat_packed_bytes == 0U);
 
   SnapshotSOWWEngine exact_limit(SnapshotSOWWOptions{
       .retained_state_capacity_bytes = measured_metrics.retained_state_bytes,
@@ -601,10 +717,12 @@ int main() {
   test_empty_initial_state_and_first_read_only_checked();
   test_present_empty_is_distinct_from_absent();
   test_local_reads_are_ignored();
+  test_scratch_sizing_uses_snapshot_reads_and_writes();
   test_final_write_per_key();
   test_session_order_lower_bound();
   test_write_write_lower_bound();
   test_all_reads_must_match_one_prefix();
+  test_compatible_snapshot_history_traversal_metrics();
   test_writes_apply_after_violation_and_verdict_is_sticky();
   test_delete_and_present_empty_state();
   test_borrowed_event_storage_is_not_retained();

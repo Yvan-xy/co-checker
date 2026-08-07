@@ -150,6 +150,12 @@ struct RuntimeBatchSubmitResult {
   [[nodiscard]] bool ok() const noexcept { return accepted; }
 };
 
+struct SlowestCheckMetrics {
+  CommitSeq commit_seq = 0;
+  TransactionUid transaction_id;
+  std::uint64_t event_count = 0;
+};
+
 struct RuntimeControlResult {
   std::optional<RuntimeError> error;
 
@@ -177,6 +183,11 @@ struct RuntimeMetrics {
   std::chrono::nanoseconds total_ordering_time{};
   std::chrono::nanoseconds total_checking_time{};
   std::chrono::nanoseconds max_checking_time{};
+  std::uint64_t checking_duration_samples = 0;
+  std::chrono::nanoseconds checking_p50_bucket_upper_bound{};
+  std::chrono::nanoseconds checking_p95_bucket_upper_bound{};
+  std::chrono::nanoseconds checking_p99_bucket_upper_bound{};
+  std::optional<SlowestCheckMetrics> slowest_check;
   std::uint64_t current_commit_token_lag = 0;
   std::uint64_t max_commit_token_lag     = 0;
   std::optional<CommitOrderToken> highest_observed_token;

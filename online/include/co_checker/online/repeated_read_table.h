@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <memory_resource>
 #include <span>
 #include <vector>
 
@@ -36,12 +37,26 @@ struct RepeatedReadInsertResult {
 };
 
 struct RepeatedReadTableMetrics {
-  std::size_t size              = 0;
-  std::size_t capacity          = 0;
-  std::uint64_t probe_groups    = 0;
-  std::uint64_t key_comparisons = 0;
-  std::uint64_t resizes         = 0;
-  RepeatedReadProbeMode mode    = RepeatedReadProbeMode::Scalar;
+  bool detailed_profiling_enabled          = false;
+  std::size_t size                         = 0;
+  std::size_t capacity                     = 0;
+  std::size_t touched_size                 = 0;
+  std::size_t touched_capacity             = 0;
+  std::uint64_t probe_groups               = 0;
+  std::uint64_t key_comparisons            = 0;
+  std::uint64_t resizes                    = 0;
+  std::uint64_t shrinks                    = 0;
+  std::uint64_t shrink_attempts            = 0;
+  std::uint64_t shrink_failures            = 0;
+  std::uint64_t max_shrink_rebuild_ns      = 0;
+  std::uint64_t reset_calls                = 0;
+  std::uint64_t reset_expected_events      = 0;
+  std::size_t max_reset_expected_events    = 0;
+  std::uint64_t clear_calls                = 0;
+  std::uint64_t clear_slot_visits          = 0;
+  std::uint64_t clear_control_bytes_filled = 0;
+  std::uint64_t clear_occupied_slots_reset = 0;
+  RepeatedReadProbeMode mode               = RepeatedReadProbeMode::Scalar;
 };
 
 // Transaction-local insert-only table. All byte views are borrowed from the
@@ -51,7 +66,9 @@ class RepeatedReadTable final {
 public:
   explicit RepeatedReadTable(
       RepeatedReadProbeMode mode = default_repeated_read_probe_mode(),
-      RepeatedReadHash hash      = repeated_read_hash);
+      RepeatedReadHash hash      = repeated_read_hash,
+      std::pmr::memory_resource *memory_resource =
+          std::pmr::get_default_resource());
   ~RepeatedReadTable();
 
   RepeatedReadTable(RepeatedReadTable &&) noexcept;

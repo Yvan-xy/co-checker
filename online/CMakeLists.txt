@@ -10,6 +10,8 @@ option(CO_CHECKER_ONLINE_BUILD_TESTING "Build the online checker tests" ON)
 option(CO_CHECKER_ONLINE_ENABLE_ASAN "Enable AddressSanitizer" OFF)
 option(CO_CHECKER_ONLINE_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
 option(CO_CHECKER_ONLINE_ENABLE_TSAN "Enable ThreadSanitizer" OFF)
+option(CO_CHECKER_ENABLE_DETAILED_PROFILING
+       "Enable detailed online-checker hot-path profiling" OFF)
 
 if(CO_CHECKER_ONLINE_ENABLE_ASAN AND CO_CHECKER_ONLINE_ENABLE_TSAN)
   message(FATAL_ERROR "ASan and TSan cannot be enabled in the same build")
@@ -45,6 +47,11 @@ set_target_properties(co_checker_online PROPERTIES
 target_include_directories(co_checker_online
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_compile_definitions(co_checker_online
+  PUBLIC
+    CO_CHECKER_ENABLE_DETAILED_PROFILING=$<BOOL:${CO_CHECKER_ENABLE_DETAILED_PROFILING}>
 )
 
 target_link_libraries(co_checker_online
