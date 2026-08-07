@@ -6,7 +6,226 @@ an empty user keyspace, and closes checked results only through graceful TiDB
 shutdown. Commands below use the paths and 16-vCPU layout of the recorded test
 host; override the variables rather than editing the commands.
 
-## Current sustained benchmark
+## Supported full-mix runner
+
+Use `online/scripts/run_tpcc_global_lock_comparison.sh`. It builds immutable
+Release artifacts for the checker, instrumented TiDB, a deterministic patched
+go-tpc v1.0.12, and the SQL validation helper. It also creates a detached
+pristine TiDB worktree at commit
+`b94006d3abffd428634ecc5c499f4bcb7b4d06d1` under `/tmp`; it never switches,
+resets, or cleans either development worktree.
+
+The runner executes these modes sequentially:
+
+1. `baseline-original`
+2. `serialized-capture-only`
+3. `serialized-order-only`
+4. `serialized-full`
+
+The default NewOrder, Payment, OrderStatus, Delivery, and StockLevel weights are
+`45,43,4,4,4`. Measured comparisons keep that mix fixed. Short diagnostic smoke
+runs may override it with five nonnegative weights summing to 100, provided the
+NewOrder weight remains positive so go-tpc still emits its tpmC record. The
+runner records the exact weights and rejects the override outside `--smoke`.
+For example, an eight-warehouse exact NewOrder-only baseline/full diagnostic is:
+
+```sh
+SMOKE_WAREHOUSES=8 \
+online/scripts/run_tpcc_global_lock_comparison.sh \
+  --smoke \
+  --baseline-full-only \
+  --transaction-weights 100,0,0,0,0 \
+  --result-root /absolute/path/to/new-order-diagnostic \
+  --tidb /home/dyf/code/db-consistency/tidb-online \
+  --go-tpc /home/dyf/go/bin/go-tpc \
+  --tidb-cpus 0-7 \
+  --client-cpus 8-15
+```
+
+Use a positive NewOrder remainder for a near-isolated non-NewOrder type, such as
+`1,96,1,1,1` for Payment. These smoke diagnostics are not headline throughput
+comparisons.
+
+Set `TIDB_ONLINE_CHECKER_DUPLICATE_READ_DIAGNOSTICS=1` on the runner invocation
+to enable the opt-in duplicate audit. The runner records that setting in the
+experiment and checked-server environment, clears it for schema bootstrap and
+post-check servers, and leaves it disabled by default.
+
+A short validation run is:
+
+```sh
+online/scripts/run_tpcc_global_lock_comparison.sh \
+  --smoke \
+  --result-root /absolute/path/to/tpcc-smoke \
+  --tidb /home/dyf/code/db-consistency/tidb-online \
+  --go-tpc /home/dyf/go/bin/go-tpc \
+  --tidb-cpus 0-7 \
+  --client-cpus 8-15
+```
+
+A measured comparison is:
+
+```sh
+online/scripts/run_tpcc_global_lock_comparison.sh \
+  --trials 5 \
+  --warmup-time 60s \
+  --run-time 600s \
+  --warehouses 8 \
+  --threads 16 \
+  --prepare-threads 1 \
+  --result-root /absolute/path/to/tpcc-results \
+  --tidb /home/dyf/code/db-consistency/tidb-online \
+  --go-tpc /home/dyf/go/bin/go-tpc \
+  --tidb-cpus 0-7 \
+  --client-cpus 8-15
+```
+
+A normal measured invocation first gates on its own exact four-mode smoke suite
+under `RESULT_ROOT/smoke`. For a direct pristine-versus-full comparison, add:
+
+```sh
+  --baseline-full-only
+```
+
+That profile permits only the ordered pair `baseline-original`,
+`serialized-full`; it records the same pair in both the measured and smoke
+manifests and still starts each mode from an empty store. Arbitrary subsets and
+reordered pairs fail closed. The four-mode matrix remains the default required
+by the complete plan.
+
+`--resume` requires an identical experiment and artifact manifest, preserves
+previous attempts, and skips only modes that the analyzer proves valid.
+
+## Schema and deterministic preparation boundary
+
+Every mode creates a new empty physical UniStore directory. Schema bootstrap and
+data preparation use two explicit server lifecycles:
+
+1. With every checker environment variable cleared, patched go-tpc runs
+   `prepare --ddl-only`. The runner proves that all nine TPC-C tables are empty,
+   records the exact schema/bootstrap digest, and stops the server.
+2. The runner starts pristine TiDB for the baseline or instrumented TiDB with a
+   fresh checker for a checked mode. Patched go-tpc then runs
+   `prepare --skip-ddl` using one worker, seed `20260804`, load time
+   `2024-01-01 00:00:00`, retries disabled, and a fixed SQL/write order.
+
+The ordered preparation manifest hashes every successful data-load SQL sink
+flush. The runner also records and compares exact schema, data, and combined
+database digests against the same-trial pristine reference. It drains the
+checked pipeline after preparation before warm-up. Preparation, validation,
+drains, stabilization, warm-up, shutdown, and post-check are all outside the
+measured interval.
+
+Schema DDL is an explicit capability boundary: checked history starts with the
+deterministic user-data load, not system or TPC-C schema bootstrap. Fresh
+`CREATE TABLE` under an active checked user session fails closed, while TiDB's
+DDL job and worker transactions are internal and are not capture-backed. Only
+`CREATE TABLE IF NOT EXISTS` for an already-existing table is accepted as a
+proven no-op. Digest equality proves identical initialized state; it is not DDL
+read/write evidence.
+
+## Fixed comparison controls and gates
+
+All modes use the same fixed preparation/workload seeds and weighted deck,
+optimistic repeatable-read transactions, disabled async commit/1PC/low-resolution
+TSO, zero coprocessor cache capacity, disabled store batching and BatchCop, one
+preparation worker, identical CPU affinity, compiler settings, and storage
+settings. Foreign keys and partitioning are disabled. The measured and warm-up
+runs keep generic go-tpc `--ignore-error` disabled and enable the patched
+strict continuation policy, which accepts only a concrete MySQL Error 9007,
+plus silence so ordinary optimistic write conflicts do not terminate workers
+or add mode-dependent per-error logging overhead. For the standard full-mix
+comparison, all five structured success and `*_ERR` summaries remain mandatory,
+and the analyzer reports both counts and error rates. A smoke-only diagnostic
+weight of zero suppresses that operation's go-tpc summaries; the validator
+requires summaries only for positive-weight operations and records explicit
+zero counts for the others. Throughput is computed from successful NewOrder
+transactions only, so diagnostic weights must keep NewOrder positive.
+The runner requires one versioned policy record, zero rejected run errors, and
+exact equality between its classified Error 9007 count and the sum of all five
+`*_ERR` counts; every other client error remains fatal.
+
+This does not relax checker failures: capture/runtime fatal and error metrics,
+server fatal markers, process status, lifecycle conservation, live
+drain/verdict gates, and the post-workload TPC-C check must all still pass.
+
+After preparation, `tidb-sql -action tpcc-gate` checks the session variables
+and text/prepared plan variants used by all five transaction types. The runner
+drains after preparation, warm-up, and measured work; requires complete
+summaries and positive successes for every positive-weight transaction type,
+conserved structured conflict counts, and valid elapsed and
+interval accounting; gracefully closes the checked server; then restarts with
+capture disabled solely for the standard post-workload `go-tpc tpcc check`
+(conditions 1–10 and 12; condition 11 is initialization-only and changes
+after successful Delivery transactions).
+
+Mode-specific acceptance is:
+
+- baseline: go-tpc and the complete TPC-C post-check pass;
+- capture-only: capture, fragment, and publication lifecycles advance and
+  balance;
+- order-only: capture and ordering lifecycles advance and balance;
+- full: capture, ordering, and checking lifecycles balance and the final verdict
+  is `pass`.
+
+Every instrumented mode must have no fatal error, zero active attempts and
+finalizers, and zero remaining fragment, queue, or reorder ownership.
+
+After each complete configured mode matrix, the analyzer atomically refreshes
+`tpcc-trials.csv`, the compact paper-oriented `tpcc-performance.csv`,
+`tpcc-summary.csv`, `tpcc-summary.json`, and `tpcc-report.md`. The compact
+CSV contains only median end-to-verdict throughput/overhead plus mode and
+valid/invalid trial counts. For the pristine baseline, which has no checker
+verdict, the completion boundary is workload-client exit; checked modes include
+the complete drain through verdict availability.
+
+Throughput is reported with two distinct denominators. Let `T` be the actual
+measured client interval, `D` the time from client exit until the checked
+pipeline has drained and its all-work-complete result is available, `B` the
+baseline NewOrder success count, and `C` the checked NewOrder success count.
+For checked modes, `D` ends only after every accepted publication and event
+has reached that mode's terminal target and all fragment, queue, reorder,
+attempt, and finalizer ownership is zero:
+
+```text
+baseline fixed NO/min = (B / T) * 60
+checked fixed NO/min  = (C / T) * 60
+checked E2V NO/min    = (C / (T + D)) * 60
+fixed overhead        = 1 - checked fixed / baseline fixed
+E2V overhead          = 1 - checked E2V / baseline fixed
+```
+
+The fixed-window go-tpc `tpmC` remains the database-facing TPC-C metric. The
+second rate is labeled end-to-verdict NewOrder/min and is never called tpmC.
+It is calculated directly from client start to checker completion, not by
+substituting the configured 600-second window. An earlier full-mode prefix
+verdict cannot end the denominator. The complete checker drain/result tail is
+included; TiDB shutdown and TPC-C post-check validation occur afterward and are
+excluded. A tail over 1%, a drain over 30 seconds, or sustained backlog growth
+is reported as a failed live-sustainability diagnostic, but does not invalidate
+an exactly drained run or remove the tail from end-to-verdict throughput.
+
+## Capability and interpretation limits
+
+Supported execution is one TiDB process, one producer, and in-process UniStore.
+Capture-backed reads include PointGet/BatchPointGet and ordinary TiKV DAG
+TableReader, IndexReader, IndexLookupReader, validated UPDATE/DELETE readers,
+and validated join child readers. Marked storage processors cover table/index
+scan, pushed index lookup, selection, Limit, TopN, hash/stream aggregation, and
+projection.
+
+TiFlash, external TiKV, streaming, BatchCop, IndexMerge, partitioned scan
+shapes, analyze/checksum/background/internal readers, stale/RC reads,
+unsupported DML, and dynamic foreign-key cascades fail closed. Evidence contains
+only point KVs consumed by supported operators; the checker does not interpret
+predicates, ranges, or phantom semantics. Post-check runs outside the epoch so
+its diagnostic reads cannot alter checked evidence.
+
+`online/scripts/run_tpcc_long_mode.sh` and the remaining instructions below
+are retained only as historical NewOrder-only V1 evidence. They are not the
+supported full-mix workflow.
+
+## Historical NewOrder-only workflow
 
 Use `online/scripts/run_tpcc_long_mode.sh` for performance comparisons. Its
 defaults reproduce the sustained benchmark under
@@ -27,14 +246,9 @@ defaults reproduce the sustained benchmark under
 - `pidstat`, `mpstat`, and `iostat` sampling during the measured phase, with no
   concurrent `perf` or pprof collection in a headline throughput run.
 
-The runner always passes both `--ignore-error` and `--silence` to go-tpc.
-`--ignore-error` is required for a valid concurrency comparison: optimistic
-write conflicts are expected under load, and without it each affected worker
-returns instead of continuing for the requested duration. `--silence` removes
-per-conflict logging overhead while go-tpc's structured `NEW_ORDER_ERR` summary
-still records every failed attempt. The runner validates the requested elapsed
-time, interval count, exactly one `Finished` marker, clean checker close, count
-conservation, zero capture/backpressure errors, and all 12 TPC-C post-check
+The historical runner likewise validates the requested elapsed time, interval
+count, exactly one `Finished` marker, clean checker close, count conservation,
+zero capture/backpressure errors, and all 12 TPC-C post-check
 conditions for each of the eight warehouses.
 
 The recorded run used one four-mode trial and a reverse-order full/baseline

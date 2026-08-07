@@ -1,0 +1,786 @@
+diff --git a/cmd/go-tpc/tpcc.go b/cmd/go-tpc/tpcc.go
+index 8573f45..4a0730c 100644
+--- a/cmd/go-tpc/tpcc.go
++++ b/cmd/go-tpc/tpcc.go
+@@ -10,6 +10,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/pingcap/go-tpc/pkg/measurement"
++	"github.com/pingcap/go-tpc/pkg/sink"
+ 	"github.com/pingcap/go-tpc/pkg/workload"
+ 	"github.com/pingcap/go-tpc/tpcc"
+ 	"github.com/prometheus/client_golang/prometheus/promhttp"
+@@ -51,6 +52,24 @@ func executeTpcc(action string) {
+ 	tpccConfig.DBName = dbName
+ 	tpccConfig.Threads = threads
+ 	tpccConfig.Isolation = isolationLevel
++	if action == "prepare" && tpccConfig.PrepareManifest != "" {
++		finish, err := sink.StartPreparationManifest(
++			tpccConfig.PrepareManifest,
++			tpccConfig.PrepareSeed,
++			tpccConfig.PrepareLoadTime,
++			tpccConfig.Threads,
++		)
++		if err != nil {
++			fmt.Printf("Failed to start preparation manifest: %v\n", err)
++			os.Exit(1)
++		}
++		defer func() {
++			if err := finish(); err != nil {
++				fmt.Printf("Failed to finish preparation manifest: %v\n", err)
++				os.Exit(1)
++			}
++		}()
++	}
+ 	var (
+ 		w   workload.Workloader
+ 		err error
+@@ -87,0 +107,3 @@ func executeTpcc(action string) {
++	if action == "run" {
++		outputRunErrorPolicy()
++	}
+@@ -112,6 +134,11 @@ func registerTpcc(root *cobra.Command) {
+ 		"generating file, separated by ','. Valid only if output is set. If this flag is not set, generate all tables by default")
+ 	cmdPrepare.PersistentFlags().IntVar(&tpccConfig.PrepareRetryCount, "retry-count", 50, "Retry count when errors occur")
+ 	cmdPrepare.PersistentFlags().DurationVar(&tpccConfig.PrepareRetryInterval, "retry-interval", 10*time.Second, "The interval for each retry")
++	cmdPrepare.PersistentFlags().Int64Var(&tpccConfig.PrepareSeed, "seed", 0, "Deterministic preparation seed (requires --manifest)")
++	cmdPrepare.PersistentFlags().StringVar(&tpccConfig.PrepareLoadTime, "load-time", "", "Fixed preparation timestamp (requires --manifest)")
++	cmdPrepare.PersistentFlags().StringVar(&tpccConfig.PrepareManifest, "manifest", "", "Ordered preparation transaction/write manifest path")
++	cmdPrepare.PersistentFlags().BoolVar(&tpccConfig.PrepareSkipDDL, "skip-ddl", false, "Require an existing empty TPC-C schema and load data only")
++	cmdPrepare.PersistentFlags().BoolVar(&tpccConfig.PrepareDDLOnly, "ddl-only", false, "Create the TPC-C schema without loading rows")
+ 
+ 	var cmdRun = &cobra.Command{
+ 		Use:   "run",
+@@ -123,6 +147,7 @@ func registerTpcc(root *cobra.Command) {
+ 	cmdRun.PersistentFlags().BoolVar(&tpccConfig.Wait, "wait", false, "including keying & thinking time described on TPC-C Standard Specification")
+ 	cmdRun.PersistentFlags().DurationVar(&tpccConfig.MaxMeasureLatency, "max-measure-latency", measurement.DefaultMaxLatency, "max measure latency in millisecond")
+ 	cmdRun.PersistentFlags().IntSliceVar(&tpccConfig.Weight, "weight", []int{45, 43, 4, 4, 4}, "Weight for NewOrder, Payment, OrderStatus, Delivery, StockLevel")
++	cmdRun.PersistentFlags().Int64Var(&tpccConfig.RunSeed, "seed", 0, "Deterministic per-worker workload seed")
+ 	cmdRun.Flags().DurationVar(&tpccConfig.ConnRefreshInterval, "conn-refresh-interval", 0, "automatically refresh database connections at specified intervals to balance traffic across new replicas (0 = disabled, e.g., 10s)")
+ 
+ 	var cmdCleanup = &cobra.Command{
+diff --git a/pkg/sink/preparation_manifest.go b/pkg/sink/preparation_manifest.go
+new file mode 100644
+index 0000000..381e77a
+--- /dev/null
++++ b/pkg/sink/preparation_manifest.go
+@@ -0,0 +1,154 @@
++package sink
++
++import (
++	"crypto/sha256"
++	"encoding/binary"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"hash"
++	"os"
++	"path/filepath"
++	"sync"
++)
++
++type preparationTransaction struct {
++	Sequence  uint64 `json:"sequence"`
++	Rows      int    `json:"logical_write_count"`
++	SQLBytes  int    `json:"sql_bytes"`
++	SQLSHA256 string `json:"sql_sha256"`
++}
++
++type preparationManifest struct {
++	FormatVersion         int                      `json:"format_version"`
++	Generator             string                   `json:"generator"`
++	Seed                  int64                    `json:"seed"`
++	LoadTime              string                   `json:"load_time"`
++	WorkerCount           int                      `json:"worker_count"`
++	TransactionCount      uint64                   `json:"transaction_count"`
++	LogicalWriteCount     uint64                   `json:"logical_write_count"`
++	OrderedManifestSHA256 string                   `json:"ordered_manifest_sha256"`
++	Transactions          []preparationTransaction `json:"transactions"`
++}
++
++type preparationRecorder struct {
++	mu       sync.Mutex
++	path     string
++	manifest preparationManifest
++	digest   hash.Hash
++	closed   bool
++}
++
++var activePreparation struct {
++	sync.Mutex
++	recorder *preparationRecorder
++}
++
++// StartPreparationManifest enables ordered recording for a single-worker
++// preparation run. Each successful SQLSink flush is one autocommit transaction;
++// its exact SQL bytes frame the manifest hash and contain every logical row
++// write in execution order.
++func StartPreparationManifest(path string, seed int64, loadTime string, workers int) (func() error, error) {
++	if path == "" || seed == 0 || loadTime == "" || workers != 1 {
++		return nil, fmt.Errorf("manifest path, nonzero seed, fixed load time, and one worker are required")
++	}
++	activePreparation.Lock()
++	defer activePreparation.Unlock()
++	if activePreparation.recorder != nil {
++		return nil, fmt.Errorf("preparation manifest is already active")
++	}
++	recorder := &preparationRecorder{
++		path:   path,
++		digest: sha256.New(),
++		manifest: preparationManifest{
++			FormatVersion: 1,
++			Generator:     "github.com/pingcap/go-tpc@v1.0.12+co-checker-deterministic-prepare-v1",
++			Seed:          seed,
++			LoadTime:      loadTime,
++			WorkerCount:   workers,
++			Transactions:  make([]preparationTransaction, 0, 1024),
++		},
++	}
++	activePreparation.recorder = recorder
++	return func() error { return recorder.finish() }, nil
++}
++
++func recordPreparationStatement(statement string, rows int) error {
++	activePreparation.Lock()
++	recorder := activePreparation.recorder
++	activePreparation.Unlock()
++	if recorder == nil {
++		return nil
++	}
++	return recorder.record(statement, rows)
++}
++
++func (r *preparationRecorder) record(statement string, rows int) error {
++	if rows <= 0 {
++		return fmt.Errorf("preparation statement has no logical writes")
++	}
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	if r.closed {
++		return fmt.Errorf("preparation manifest is closed")
++	}
++	sequence := uint64(len(r.manifest.Transactions) + 1)
++	statementBytes := []byte(statement)
++	statementDigest := sha256.Sum256(statementBytes)
++	var frame [24]byte
++	binary.LittleEndian.PutUint64(frame[0:8], sequence)
++	binary.LittleEndian.PutUint64(frame[8:16], uint64(rows))
++	binary.LittleEndian.PutUint64(frame[16:24], uint64(len(statementBytes)))
++	_, _ = r.digest.Write(frame[:])
++	_, _ = r.digest.Write(statementBytes)
++	r.manifest.Transactions = append(r.manifest.Transactions, preparationTransaction{
++		Sequence:  sequence,
++		Rows:      rows,
++		SQLBytes:  len(statementBytes),
++		SQLSHA256: hex.EncodeToString(statementDigest[:]),
++	})
++	r.manifest.TransactionCount++
++	r.manifest.LogicalWriteCount += uint64(rows)
++	return nil
++}
++
++func (r *preparationRecorder) finish() error {
++	r.mu.Lock()
++	if r.closed {
++		r.mu.Unlock()
++		return nil
++	}
++	r.closed = true
++	r.manifest.OrderedManifestSHA256 = hex.EncodeToString(r.digest.Sum(nil))
++	contents, err := json.MarshalIndent(r.manifest, "", "  ")
++	r.mu.Unlock()
++	activePreparation.Lock()
++	if activePreparation.recorder == r {
++		activePreparation.recorder = nil
++	}
++	activePreparation.Unlock()
++	if err != nil {
++		return err
++	}
++	contents = append(contents, '\n')
++	directory := filepath.Dir(r.path)
++	if err := os.MkdirAll(directory, 0755); err != nil {
++		return err
++	}
++	temporary, err := os.CreateTemp(directory, ".preparation-manifest-*.tmp")
++	if err != nil {
++		return err
++	}
++	name := temporary.Name()
++	defer os.Remove(name)
++	if _, err = temporary.Write(contents); err == nil {
++		err = temporary.Sync()
++	}
++	if closeErr := temporary.Close(); err == nil {
++		err = closeErr
++	}
++	if err != nil {
++		return err
++	}
++	return os.Rename(name, r.path)
++}
+diff --git a/pkg/sink/preparation_manifest_test.go b/pkg/sink/preparation_manifest_test.go
+new file mode 100644
+index 0000000..6b84611
+--- /dev/null
++++ b/pkg/sink/preparation_manifest_test.go
+@@ -0,0 +1,91 @@
++package sink
++
++import (
++	"encoding/json"
++	"fmt"
++	"math/rand"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++func renderPreparationManifest(t *testing.T, seed int64) ([]byte, preparationManifest) {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), "manifest.json")
++	finish, err := StartPreparationManifest(path, seed, "2024-01-01 00:00:00", 1)
++	if err != nil {
++		t.Fatalf("start manifest: %v", err)
++	}
++	random := rand.New(rand.NewSource(seed))
++	for sequence := 0; sequence < 4; sequence++ {
++		statement := fmt.Sprintf(
++			"INSERT INTO t VALUES (%d, %d)", sequence, random.Int63(),
++		)
++		if err := recordPreparationStatement(statement, sequence+1); err != nil {
++			t.Fatalf("record statement %d: %v", sequence, err)
++		}
++	}
++	if err := finish(); err != nil {
++		t.Fatalf("finish manifest: %v", err)
++	}
++	contents, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatalf("read manifest: %v", err)
++	}
++	var manifest preparationManifest
++	if err := json.Unmarshal(contents, &manifest); err != nil {
++		t.Fatalf("decode manifest: %v", err)
++	}
++	return contents, manifest
++}
++
++func TestPreparationManifestDeterminism(t *testing.T) {
++	firstBytes, first := renderPreparationManifest(t, 41)
++	secondBytes, second := renderPreparationManifest(t, 41)
++	differentBytes, different := renderPreparationManifest(t, 42)
++
++	if string(firstBytes) != string(secondBytes) {
++		t.Fatal("same seed and load time produced different manifests")
++	}
++	if first.OrderedManifestSHA256 != second.OrderedManifestSHA256 {
++		t.Fatal("same seed produced different ordered manifest hashes")
++	}
++	if string(firstBytes) == string(differentBytes) {
++		t.Fatal("different seeds produced identical manifests")
++	}
++	if first.OrderedManifestSHA256 == different.OrderedManifestSHA256 {
++		t.Fatal("different seeds produced identical ordered manifest hashes")
++	}
++}
++
++func TestPreparationManifestRequiresFixedSingleWorker(t *testing.T) {
++	tests := []struct {
++		name     string
++		path     string
++		seed     int64
++		loadTime string
++		workers  int
++	}{
++		{name: "path", seed: 1, loadTime: "2024-01-01 00:00:00", workers: 1},
++		{name: "seed", path: "manifest.json", loadTime: "2024-01-01 00:00:00", workers: 1},
++		{name: "load time", path: "manifest.json", seed: 1, workers: 1},
++		{name: "worker count", path: "manifest.json", seed: 1, loadTime: "2024-01-01 00:00:00", workers: 2},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			path := test.path
++			if path != "" {
++				path = filepath.Join(t.TempDir(), path)
++			}
++			finish, err := StartPreparationManifest(path, test.seed, test.loadTime, test.workers)
++			if err == nil {
++				_ = finish()
++				t.Fatal("invalid deterministic preparation configuration succeeded")
++			}
++			if !strings.Contains(err.Error(), "one worker") {
++				t.Fatalf("unexpected guard error: %v", err)
++			}
++		})
++	}
++}
+diff --git a/pkg/sink/sql.go b/pkg/sink/sql.go
+index f08ed19..868915f 100644
+--- a/pkg/sink/sql.go
++++ b/pkg/sink/sql.go
+@@ -125,6 +125,7 @@ func (s *SQLSink) Flush(ctx context.Context) error {
+ 			if i == 0 {
+ 				return fmt.Errorf("exec statement error: %v", err)
+ 			}
++			err = nil
+ 			break
+ 		}
+ 		if i < s.retryCount {
+@@ -132,6 +133,12 @@ func (s *SQLSink) Flush(ctx context.Context) error {
+ 			time.Sleep(s.retryInterval)
+ 		}
+ 	}
++	if err != nil {
++		return err
++	}
++	if err := recordPreparationStatement(s.buf.String(), s.bufferedRows); err != nil {
++		return err
++	}
+ 
+ 	s.bufferedRows = 0
+ 	s.buf.Reset()
+diff --git a/pkg/workload/base.go b/pkg/workload/base.go
+index 9f9eabf..03b37ed 100644
+--- a/pkg/workload/base.go
++++ b/pkg/workload/base.go
+@@ -33,6 +33,13 @@ func (t *TpcState) RefreshConn(ctx context.Context) error {
+ 
+ // NewTpcState creates a base TpcState
+ func NewTpcState(ctx context.Context, db *sql.DB) *TpcState {
++	return NewTpcStateWithSeed(ctx, db, time.Now().UnixNano())
++}
++
++// NewTpcStateWithSeed creates a base TPC state with an explicit random seed.
++// Preparation tools use this entry point to make row generation reproducible;
++// ordinary workloads retain NewTpcState's time-based behavior.
++func NewTpcStateWithSeed(ctx context.Context, db *sql.DB, seed int64) *TpcState {
+ 	var conn *sql.Conn
+ 	var err error
+ 	if db != nil {
+@@ -42,7 +49,7 @@ func NewTpcState(ctx context.Context, db *sql.DB) *TpcState {
+ 		}
+ 	}
+ 
+-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
++	r := rand.New(rand.NewSource(seed))
+ 
+ 	s := &TpcState{
+ 		DB:   db,
+diff --git a/tpcc/load.go b/tpcc/load.go
+index a3db65c..f4a0c64 100644
+--- a/tpcc/load.go
++++ b/tpcc/load.go
+@@ -4,7 +4,6 @@ import (
+ 	"context"
+ 	"database/sql"
+ 	"fmt"
+-	"math/rand"
+ 
+ 	"github.com/pingcap/go-tpc/pkg/sink"
+ )
+@@ -242,7 +241,7 @@ o_carrier_id, o_ol_cnt, o_all_local) VALUES `
+ 
+ 	l := sink.NewSQLSink(w.db, hint, w.cfg.PrepareRetryCount, w.cfg.PrepareRetryInterval)
+ 
+-	cids := rand.Perm(orderPerDistrict)
++	cids := s.R.Perm(orderPerDistrict)
+ 	s.R.Shuffle(len(cids), func(i, j int) {
+ 		cids[i], cids[j] = cids[j], cids[i]
+ 	})
+diff --git a/tpcc/rand.go b/tpcc/rand.go
+index c02c93e..dee5580 100644
+--- a/tpcc/rand.go
++++ b/tpcc/rand.go
+@@ -145,3 +145,10 @@ func randCustomerID(r *rand.Rand) int {
+ func randItemID(r *rand.Rand) int {
+ 	return ((r.Intn(8190) | (r.Intn(100000) + 1) + cItemID) % 100000) + 1
+ }
++
++func setLoadRandomConstants(seed int64) {
++	r := rand.New(rand.NewSource(seed ^ 0x5deece66d))
++	cLoad = r.Intn(256)
++	cItemID = r.Intn(1024)
++	cCustomerID = r.Intn(8192)
++}
+diff --git a/tpcc/workload.go b/tpcc/workload.go
+index 491ce0f..ad7005c 100644
+--- a/tpcc/workload.go
++++ b/tpcc/workload.go
+@@ -84,6 +84,12 @@ type Config struct {
+ 	// connection, retry count when commiting statement fails, default 0
+ 	PrepareRetryCount    int
+ 	PrepareRetryInterval time.Duration
++	PrepareSeed          int64
++	PrepareLoadTime      string
++	PrepareManifest      string
++	PrepareSkipDDL       bool
++	PrepareDDLOnly       bool
++	RunSeed              int64
+ 
+ 	// output style
+ 	OutputStyle string
+@@ -123,6 +129,21 @@ func NewWorkloader(db *sql.DB, cfg *Config) (workload.Workloader, error) {
+ 	if cfg.PartitionType < PartitionTypeHash || cfg.PartitionType > PartitionTypeListAsRange {
+ 		panic(fmt.Errorf("Unknown partition type %d", cfg.PartitionType))
+ 	}
++	if cfg.PrepareSkipDDL && cfg.PrepareDDLOnly {
++		return nil, fmt.Errorf("prepare cannot combine skip-ddl and ddl-only")
++	}
++	if cfg.PrepareManifest != "" {
++		if cfg.PrepareSeed == 0 {
++			return nil, fmt.Errorf("deterministic preparation requires a nonzero seed")
++		}
++		if cfg.PrepareLoadTime == "" {
++			return nil, fmt.Errorf("deterministic preparation requires a fixed load time")
++		}
++		if cfg.Threads != 1 {
++			return nil, fmt.Errorf("deterministic preparation requires exactly one worker")
++		}
++		setLoadRandomConstants(cfg.PrepareSeed)
++	}
+ 	switch l := len(cfg.Weight); l {
+ 	case 0:
+ 		cfg.Weight = []int{45, 43, 4, 4, 4}
+@@ -142,10 +163,14 @@ func NewWorkloader(db *sql.DB, cfg *Config) (workload.Workloader, error) {
+ 		m.MaxLatency = cfg.MaxMeasureLatency
+ 	}
+ 
++	loadTime := time.Now().Format(timeFormat)
++	if cfg.PrepareLoadTime != "" {
++		loadTime = cfg.PrepareLoadTime
++	}
+ 	w := &Workloader{
+ 		db:                  db,
+ 		cfg:                 cfg,
+-		initLoadTime:        time.Now().Format(timeFormat),
++		initLoadTime:        loadTime,
+ 		ddlManager:          newDDLManager(cfg.Parts, cfg.UseFK, cfg.Warehouses, cfg.PartitionType),
+ 		rtMeasurement:       measurement.NewMeasurement(resetMaxLat),
+ 		waitTimeMeasurement: measurement.NewMeasurement(resetMaxLat),
+@@ -159,7 +184,7 @@ func NewWorkloader(db *sql.DB, cfg *Config) (workload.Workloader, error) {
+ 		{name: "stock_level", action: w.runStockLevel, weight: cfg.Weight[4], keyingTime: 2, thinkingTime: 5},
+ 	}
+ 
+-	if w.db != nil {
++	if w.db != nil && !cfg.PrepareSkipDDL {
+ 		w.createTableWg.Add(cfg.Threads)
+ 	}
+ 
+@@ -173,8 +198,14 @@ func (w *Workloader) Name() string {
+ 
+ // InitThread implements Workloader interface
+ func (w *Workloader) InitThread(ctx context.Context, threadID int) context.Context {
++	state := workload.NewTpcState(ctx, w.db)
++	if w.cfg.PrepareSeed != 0 {
++		state = workload.NewTpcStateWithSeed(ctx, w.db, w.cfg.PrepareSeed+int64(threadID))
++	} else if w.cfg.RunSeed != 0 {
++		state = workload.NewTpcStateWithSeed(ctx, w.db, w.cfg.RunSeed+int64(threadID))
++	}
+ 	s := &tpccState{
+-		TpcState:        workload.NewTpcState(ctx, w.db),
++		TpcState:        state,
+ 		index:           0,
+ 		decks:           make([]int, 0, 23),
+ 		lastConnRefresh: time.Now(),
+@@ -212,7 +243,7 @@ func (w *Workloader) CleanupThread(ctx context.Context, threadID int) {
+ 
+ // Prepare implements Workloader interface
+ func (w *Workloader) Prepare(ctx context.Context, threadID int) error {
+-	if w.db != nil {
++	if w.db != nil && !w.cfg.PrepareSkipDDL {
+ 		if threadID == 0 {
+ 			if err := w.ddlManager.createTables(ctx, w.cfg.Driver); err != nil {
+ 				return err
+@@ -221,6 +252,9 @@ func (w *Workloader) Prepare(ctx context.Context, threadID int) error {
+ 		w.createTableWg.Done()
+ 		w.createTableWg.Wait()
+ 	}
++	if w.cfg.PrepareDDLOnly {
++		return nil
++	}
+ 
+ 	return prepareWorkload(ctx, w, w.cfg.Threads, w.cfg.Warehouses, threadID)
+ }
+@@ -230,6 +264,17 @@ func getTPCCState(ctx context.Context) *tpccState {
+ 	return s
+ }
+ 
++func (s *tpccState) nextTransactionIndex() int {
++	s.index++
++	if s.index == len(s.decks) {
++		s.index = 0
++		s.R.Shuffle(len(s.decks), func(i, j int) {
++			s.decks[i], s.decks[j] = s.decks[j], s.decks[i]
++		})
++	}
++	return s.decks[s.index]
++}
++
+ // Run implements Workloader interface
+ func (w *Workloader) Run(ctx context.Context, threadID int) (err error) {
+ 	defer func() {
+@@ -320,14 +365,7 @@ func (w *Workloader) Run(ctx context.Context, threadID int) (err error) {
+ 	}
+ 
+ 	// refer 5.2.4.2
+-	if s.index == len(s.decks) {
+-		s.index = 0
+-		s.R.Shuffle(len(s.decks), func(i, j int) {
+-			s.decks[i], s.decks[j] = s.decks[j], s.decks[i]
+-		})
+-	}
+-
+-	txnIndex := s.decks[s.R.Intn(len(s.decks))]
++	txnIndex := s.nextTransactionIndex()
+ 	txn := w.txns[txnIndex]
+ 
+ 	// For each transaction type, the Keying Time is constant
+diff --git a/tpcc/workload_deterministic_test.go b/tpcc/workload_deterministic_test.go
+new file mode 100644
+index 0000000..e3bbcfb
+--- /dev/null
++++ b/tpcc/workload_deterministic_test.go
+@@ -0,0 +1,98 @@
++package tpcc
++
++import (
++	"context"
++	"strings"
++	"testing"
++)
++
++func deterministicTestConfig() Config {
++	return Config{
++		Threads:         1,
++		Parts:           1,
++		PartitionType:   PartitionTypeHash,
++		Warehouses:      1,
++		Weight:          []int{45, 43, 4, 4, 4},
++		OutputType:      "csv",
++		PrepareSeed:     41,
++		PrepareLoadTime: "2024-01-01 00:00:00",
++		PrepareManifest: "manifest.json",
++	}
++}
++
++func TestDeterministicPreparationConfigurationGuards(t *testing.T) {
++	tests := []struct {
++		name      string
++		mutate    func(*Config)
++		wantError string
++	}{
++		{
++			name:      "seed",
++			mutate:    func(config *Config) { config.PrepareSeed = 0 },
++			wantError: "nonzero seed",
++		},
++		{
++			name:      "load time",
++			mutate:    func(config *Config) { config.PrepareLoadTime = "" },
++			wantError: "fixed load time",
++		},
++		{
++			name:      "worker count",
++			mutate:    func(config *Config) { config.Threads = 2 },
++			wantError: "exactly one worker",
++		},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			config := deterministicTestConfig()
++			test.mutate(&config)
++			_, err := NewWorkloader(nil, &config)
++			if err == nil || !strings.Contains(err.Error(), test.wantError) {
++				t.Fatalf("got error %v, want one containing %q", err, test.wantError)
++			}
++		})
++	}
++
++	config := deterministicTestConfig()
++	workload, err := NewWorkloader(nil, &config)
++	if err != nil {
++		t.Fatalf("valid deterministic configuration failed: %v", err)
++	}
++	if workload.(*Workloader).initLoadTime != config.PrepareLoadTime {
++		t.Fatalf(
++			"load time = %q, want %q",
++			workload.(*Workloader).initLoadTime,
++			config.PrepareLoadTime,
++		)
++	}
++}
++
++func TestWeightedDeckSelectsExactFullMixPerHundred(t *testing.T) {
++	config := deterministicTestConfig()
++	config.PrepareSeed = 0
++	config.PrepareLoadTime = ""
++	config.PrepareManifest = ""
++	config.RunSeed = 14
++	workloadInterface, err := NewWorkloader(nil, &config)
++	if err != nil {
++		t.Fatalf("create workloader: %v", err)
++	}
++	workloader := workloadInterface.(*Workloader)
++	ctx := workloader.InitThread(context.Background(), 0)
++	state := getTPCCState(ctx)
++	want := []int{45, 43, 4, 4, 4}
++	for cycle := 0; cycle < 2; cycle++ {
++		got := make([]int, len(want))
++		for selection := 0; selection < 100; selection++ {
++			got[state.nextTransactionIndex()]++
++		}
++		for index := range want {
++			if got[index] != want[index] {
++				t.Fatalf(
++					"cycle %d transaction %d count = %d, want %d (all counts %v)",
++					cycle, index, got[index], want[index], got,
++				)
++			}
++		}
++	}
++}
+diff --git a/cmd/go-tpc/main.go b/cmd/go-tpc/main.go
+--- a/cmd/go-tpc/main.go
++++ b/cmd/go-tpc/main.go
+@@ -56,6 +56,8 @@ var (
+ 
+ 	globalDB  *sql.DB
+ 	globalCtx context.Context
+ )
++
++var continueOnWriteConflict bool
+ 
+ const (
+@@ -221,6 +222,7 @@ func main() {
+ 	rootCmd.PersistentFlags().IntVar(&totalCount, "count", 0, "Total execution count, 0 means infinite")
+ 	rootCmd.PersistentFlags().BoolVar(&dropData, "dropdata", false, "Cleanup data before prepare")
+ 	rootCmd.PersistentFlags().BoolVar(&ignoreError, "ignore-error", false, "Ignore error when running workload")
++	rootCmd.PersistentFlags().BoolVar(&continueOnWriteConflict, "continue-on-write-conflict", false, "Continue only after typed MySQL Error 9007 write conflicts")
+ 	rootCmd.PersistentFlags().BoolVar(&silence, "silence", false, "Don't print error when running workload")
+ 	rootCmd.PersistentFlags().DurationVar(&outputInterval, "interval", 10*time.Second, "Output interval time")
+ 	rootCmd.PersistentFlags().IntVar(&isolationLevel, "isolation", 0, `Isolation Level 0: Default, 1: ReadUncommitted,
+diff --git a/cmd/go-tpc/misc.go b/cmd/go-tpc/misc.go
+--- a/cmd/go-tpc/misc.go
++++ b/cmd/go-tpc/misc.go
+@@ -2,13 +2,29 @@ package main
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
++	"github.com/go-sql-driver/mysql"
+ 	"github.com/pingcap/go-tpc/pkg/workload"
+ )
+ 
++const continuedWriteConflictCode uint16 = 9007
++
++var (
++	continuedWriteConflictCount uint64
++	rejectedRunErrorCount       uint64
++)
++
++func isContinuedWriteConflict(err error) bool {
++	var mysqlError *mysql.MySQLError
++	return errors.As(err, &mysqlError) &&
++		mysqlError.Number == continuedWriteConflictCode
++}
++
+ func checkPrepare(ctx context.Context, w workload.Workloader) {
+ 	// skip preparation check in csv case
+ 	if w.Name() == "tpcc-csv" {
+@@ -61,11 +79,16 @@ func execute(timeoutCtx context.Context, w workload.Workloader, action string,
+ 	for i := 0; i < count || count <= 0; i++ {
+ 		err := w.Run(ctx, index)
+ 		if err != nil {
+-			if !silence {
+-				fmt.Printf("[%s] execute %s failed, err %v\n", time.Now().Format("2006-01-02 15:04:05"), action, err)
+-			}
+-			if !ignoreError {
+-				return err
++			if continueOnWriteConflict && isContinuedWriteConflict(err) {
++				atomic.AddUint64(&continuedWriteConflictCount, 1)
++			} else {
++				atomic.AddUint64(&rejectedRunErrorCount, 1)
++				if !silence {
++					fmt.Printf("[%s] execute %s failed, err %v\n", time.Now().Format("2006-01-02 15:04:05"), action, err)
++				}
++				if !ignoreError {
++					return err
++				}
+ 			}
+ 		}
+ 		select {
+@@ -80,5 +104,9 @@ func execute(timeoutCtx context.Context, w workload.Workloader, action string,
+ }
+ 
+ func executeWorkload(ctx context.Context, w workload.Workloader, threads int, action string) {
++	if action == "run" {
++		atomic.StoreUint64(&continuedWriteConflictCount, 0)
++		atomic.StoreUint64(&rejectedRunErrorCount, 0)
++	}
+ 	var wg sync.WaitGroup
+ 	wg.Add(threads)
+@@ -151,4 +179,15 @@ func executeWorkload(ctx context.Context, w workload.Workloader, threads int,
+ 	outputCancel()
+ 
+ 	<-ch
+ }
++
++func outputRunErrorPolicy() {
++	if !continueOnWriteConflict {
++		return
++	}
++	fmt.Printf(
++		"{\"format_version\":1,\"record\":\"go-tpc-run-error-policy\",\"policy\":\"continue-only-tidb-write-conflict\",\"mysql_error_number\":9007,\"continued_count\":%d,\"rejected_count\":%d}\n",
++		atomic.LoadUint64(&continuedWriteConflictCount),
++		atomic.LoadUint64(&rejectedRunErrorCount),
++	)
++}
+diff --git a/cmd/go-tpc/misc_error_policy_test.go b/cmd/go-tpc/misc_error_policy_test.go
+new file mode 100644
+--- /dev/null
++++ b/cmd/go-tpc/misc_error_policy_test.go
+@@ -0,0 +1,36 @@
++package main
++
++import (
++	"errors"
++	"fmt"
++	"testing"
++
++	"github.com/go-sql-driver/mysql"
++)
++
++func TestIsContinuedWriteConflict(t *testing.T) {
++	writeConflict := &mysql.MySQLError{
++		Number:  continuedWriteConflictCode,
++		Message: "Write conflict",
++	}
++	if !isContinuedWriteConflict(writeConflict) {
++		t.Fatal("typed Error 9007 was not accepted")
++	}
++	if !isContinuedWriteConflict(fmt.Errorf("commit failed: %w", writeConflict)) {
++		t.Fatal("wrapped typed Error 9007 was not accepted")
++	}
++	if isContinuedWriteConflict(&mysql.MySQLError{
++		Number:  1062,
++		Message: "Duplicate entry",
++	}) {
++		t.Fatal("non-9007 MySQL error was accepted")
++	}
++	if isContinuedWriteConflict(errors.New(
++		"Error 9007 (HY000): Write conflict",
++	)) {
++		t.Fatal("untyped error text was accepted")
++	}
++	if isContinuedWriteConflict(nil) {
++		t.Fatal("nil error was accepted")
++	}
++}
+
