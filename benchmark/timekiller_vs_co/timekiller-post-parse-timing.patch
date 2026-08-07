@@ -1,0 +1,55 @@
+diff --git a/README.md b/README.md
+index 3a077c7..b91443d 100644
+--- a/README.md
++++ b/README.md
+@@ -57,0 +58,8 @@ Satisfy SI
++For the offline SI key-value fast reader, `Loading time` ends after JSON input
++decoding and construction of the transaction/operation model. `Checking time`
++starts immediately afterwards and includes the explicit pre-check GC, initial
++state and per-key writer-index construction, commit-timestamp sorting, and the
++SI checker itself. Result and violation printing remain outside `Checking
++time`. This boundary is intended for comparisons that exclude input-format
++loading but include all checker-specific preparation.
++
+@@ -467 +475 @@ To reproduce Figure 15, you need to record the time when the runner starts and e
+-To reproduce Figure 16, you need to monitor the memory usage of Aion when it's running.
+\ No newline at end of file
++To reproduce Figure 16, you need to monitor the memory usage of Aion when it's running.
+diff --git a/src/main/java/TimeKiller.java b/src/main/java/TimeKiller.java
+index 72d1562..38431e0 100644
+--- a/src/main/java/TimeKiller.java
++++ b/src/main/java/TimeKiller.java
+@@ -55 +55,6 @@ public class TimeKiller {
+-        Stats.CHECKING_START = System.currentTimeMillis();
++        // Readers that separate format decoding from checker-specific
++        // preparation start this timer at that boundary. Keep the legacy
++        // boundary for readers that do not expose the split yet.
++        if (Stats.CHECKING_START == 0L) {
++            Stats.CHECKING_START = System.currentTimeMillis();
++        }
+diff --git a/src/main/java/reader/si/SIKVFastReader.java b/src/main/java/reader/si/SIKVFastReader.java
+index 8c98855..b731432 100644
+--- a/src/main/java/reader/si/SIKVFastReader.java
++++ b/src/main/java/reader/si/SIKVFastReader.java
+@@ -84 +83,0 @@ public class SIKVFastReader implements Reader<Long, Long> {
+-        System.gc();
+@@ -86,3 +84,0 @@ public class SIKVFastReader implements Reader<Long, Long> {
+-        createInitialTxn(maxKey);
+-        txns.set(0, initialTxn);
+-
+@@ -101,2 +97,13 @@ public class SIKVFastReader implements Reader<Long, Long> {
+-        return Pair.of(new History<>(txns, keyWritten.size(), null,
+-                keyWritten, null), violations);
++        // Match co-checker's phase boundary: input decoding and construction
++        // of the neutral transaction/operation model are loading work.  All
++        // checker-specific preparation after that point is checking work.
++        // This includes the explicit GC, initial-state/keyWritten index
++        // construction, and History's commit-timestamp sort.
++        Stats.CHECKING_START = System.currentTimeMillis();
++        System.gc();
++        createInitialTxn(maxKey);
++        txns.set(0, initialTxn);
++        History<Long, Long> history = new History<>(txns, keyWritten.size(), null,
++                keyWritten, null);
++
++        return Pair.of(history, violations);
