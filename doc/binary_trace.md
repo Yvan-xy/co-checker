@@ -72,6 +72,26 @@ The YAML `key_hex` and `value_hex` strings are decoded before writing, so the
 binary file stores one byte per two hex characters and does not repeat YAML
 field names.
 
+## In-memory Dense IDs
+
+The on-disk version 1 format remains unchanged and retains the original binary
+key/value bytes. Both YAML and binary parsers additionally assign independent
+zero-based `uint32_t` key and non-null value IDs in deterministic first-seen
+order. Per-event IDs are stored in compact parallel arrays on `Trace`; absent
+values, read misses, and delete writes use `kNullValueId`.
+
+Interning uses a temporary flat open-addressed table containing a mixed hash,
+the dense ID, and a reference to the first event with that byte string. Hashes
+only select candidates: full `HexValue` equality resolves collisions, so
+distinct byte strings can never share an ID. Parser storage is reserved before
+representative references are recorded and the temporary table is destroyed
+before checking starts.
+
+`snapshot-so-ww` uses these IDs for vector-indexed snapshots, read state,
+write deduplication, wrong-key state, and rollback deltas. Other checkers and
+diagnostics continue to use the original byte strings, so their behavior and
+the external trace format are unaffected.
+
 ## Converter
 
 Build:

@@ -3,13 +3,21 @@
 #include <filesystem>
 #include <sstream>
 #include <string>
+#include <vector>
 
+#include "common/trace/dense_id_interner.h"
 #include "common/trace/trace_binary.h"
 #include "common/trace/trace_parser.h"
 #include "common/trace/types.h"
 
 namespace test {
 namespace {
+
+struct ConstantHexValueHash {
+  [[nodiscard]] std::size_t operator()(const common::HexValue &) const {
+    return 0;
+  }
+};
 
 void test_hex_value() {
   std::string error;
@@ -74,6 +82,61 @@ events:
   CHECK(trace.events[1].txn_id == 1);
   CHECK(trace.events[0].key == trace.events[1].key);
   CHECK(trace.events[0].value == trace.events[1].value);
+  CHECK(trace.key_count == 1);
+  CHECK(trace.value_count == 1);
+  CHECK(trace.event_key_ids == std::vector<common::KeyId>({0, 0}));
+  CHECK(trace.event_value_ids == std::vector<common::ValueId>({0, 0}));
+}
+
+void test_dense_ids_preserve_order_nulls_and_distinct_values() {
+  auto trace = parse_or_die(R"yaml(
+---
+session_id: 1
+start_ts: 10
+commit_ts: 20
+events:
+  - seq: 1
+    op: W
+    key_hex: 02
+    value_hex: 0a
+  - seq: 2
+    op: W
+    key_hex: 01
+    value_hex: 0a
+  - seq: 3
+    op: W
+    key_hex: 02
+    value_hex: 0b
+  - seq: 4
+    op: W
+    key_hex: 03
+    delete: true
+  - seq: 5
+    op: R
+    key_hex: 04
+    miss: true
+)yaml");
+
+  CHECK(trace.key_count == 4);
+  CHECK(trace.value_count == 2);
+  CHECK(trace.event_key_ids == std::vector<common::KeyId>({0, 1, 0, 2, 3}));
+  CHECK(trace.event_value_ids ==
+        std::vector<common::ValueId>(
+            {0, 0, 1, common::kNullValueId, common::kNullValueId}));
+}
+
+void test_dense_interner_resolves_hash_collisions() {
+  std::vector<common::HexValue> values;
+  values.reserve(3);
+  values.push_back(*common::HexValue::from_hex("01"));
+  values.push_back(*common::HexValue::from_hex("02"));
+  values.push_back(*common::HexValue::from_hex("01"));
+
+  common::DenseIdInterner<common::KeyId, ConstantHexValueHash> interner;
+  CHECK(interner.intern(values[0]) == 0);
+  CHECK(interner.intern(values[1]) == 1);
+  CHECK(interner.intern(values[2]) == 0);
+  CHECK(interner.size() == 2);
 }
 
 void test_trace_print_helpers() {
@@ -152,6 +215,10 @@ events:
   CHECK(parsed.value().events[0].value == trace.events[0].value);
   CHECK(parsed.value().events[1].is_delete);
   CHECK(parsed.value().events[3].is_miss);
+  CHECK(parsed.value().event_key_ids == trace.event_key_ids);
+  CHECK(parsed.value().event_value_ids == trace.event_value_ids);
+  CHECK(parsed.value().key_count == trace.key_count);
+  CHECK(parsed.value().value_count == trace.value_count);
 }
 
 void test_parser_rejects_bad_hex() {
@@ -217,6 +284,8 @@ void test_generated_trace_parses() {
 void run_trace_tests() {
   test_hex_value();
   test_parser_layout();
+  test_dense_ids_preserve_order_nulls_and_distinct_values();
+  test_dense_interner_resolves_hash_collisions();
   test_trace_print_helpers();
   test_binary_trace_round_trip();
   test_parser_rejects_bad_hex();

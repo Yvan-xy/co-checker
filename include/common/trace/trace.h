@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cassert>
+#include <cstddef>
 #include <optional>
 #include <ostream>
 #include <string>
@@ -46,6 +47,10 @@ struct Transaction {
 struct Trace {
   std::vector<Transaction> transactions;
   std::vector<Event> events;
+  std::vector<KeyId> event_key_ids;
+  std::vector<ValueId> event_value_ids;
+  std::size_t key_count   = 0;
+  std::size_t value_count = 0;
 
   const Transaction &getTxn(const TxnId txn_id) const {
     assert(txn_id < transactions.size());
@@ -55,6 +60,16 @@ struct Trace {
   const Event &getEvent(const EventId event_id) const {
     assert(event_id < events.size());
     return events[event_id];
+  }
+
+  [[nodiscard]] KeyId getEventKeyId(const EventId event_id) const {
+    assert(event_id < event_key_ids.size());
+    return event_key_ids[event_id];
+  }
+
+  [[nodiscard]] ValueId getEventValueId(const EventId event_id) const {
+    assert(event_id < event_value_ids.size());
+    return event_value_ids[event_id];
   }
 };
 

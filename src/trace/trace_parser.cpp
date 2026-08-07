@@ -1,6 +1,7 @@
 #include "common/trace/trace_parser.h"
 
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -9,6 +10,7 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include "common/trace/dense_id_interner.h"
 #include "common/trace/trace_binary.h"
 
 namespace common {
@@ -183,6 +185,27 @@ Result<Trace> TraceParser::parse_stream(std::istream &input) const {
   }
 
   Trace trace;
+  std::size_t event_capacity = 0;
+  for (const auto &document : documents) {
+    if (!document || !document.IsMap()) {
+      continue;
+    }
+    const auto events = document["events"];
+    if (!events || !events.IsSequence()) {
+      continue;
+    }
+    if (events.size() > std::numeric_limits<EventId>::max() - event_capacity) {
+      return single_error("parse.too_many_events",
+                          "trace exceeds the event ID range");
+    }
+    event_capacity += events.size();
+  }
+  trace.events.reserve(event_capacity);
+  trace.event_key_ids.reserve(event_capacity);
+  trace.event_value_ids.reserve(event_capacity);
+
+  DenseIdInterner<KeyId> key_interner;
+  DenseIdInterner<ValueId> value_interner;
   DiagnosticList diagnostics;
   std::unordered_set<Timestamp> seen_commit_ts;
   std::optional<Timestamp> previous_commit_ts;
@@ -353,8 +376,31 @@ Result<Trace> TraceParser::parse_stream(std::istream &input) const {
         break;
       }
 
-      txn.event_ids.push_back(event.id);
       trace.events.push_back(std::move(event));
+      const auto &stored_event = trace.events.back();
+      const auto key_id        = key_interner.intern(stored_event.key);
+      if (!key_id.has_value()) {
+        diagnostics.push_back(parse_error(
+            "parse.too_many_keys", location(document_index, event_index) +
+                                       " exceeds the dense key ID range"));
+        break;
+      }
+      ValueId value_id = kNullValueId;
+      if (stored_event.value.has_value()) {
+        const auto interned_value = value_interner.intern(*stored_event.value);
+        if (!interned_value.has_value()) {
+          diagnostics.push_back(
+              parse_error("parse.too_many_values",
+                          location(document_index, event_index) +
+                              " exceeds the dense value ID range"));
+          break;
+        }
+        value_id = *interned_value;
+      }
+
+      txn.event_ids.push_back(stored_event.id);
+      trace.event_key_ids.push_back(*key_id);
+      trace.event_value_ids.push_back(value_id);
     }
 
     if (!diagnostics.empty()) {
@@ -368,6 +414,9 @@ Result<Trace> TraceParser::parse_stream(std::istream &input) const {
   if (!diagnostics.empty()) {
     return Result<Trace>::err(std::move(diagnostics));
   }
+
+  trace.key_count   = key_interner.size();
+  trace.value_count = value_interner.size();
 
   return Result<Trace>::ok(std::move(trace));
 }

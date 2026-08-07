@@ -361,6 +361,27 @@ events:
   CHECK(result.diagnostics[0].key->to_hex() == "01");
 }
 
+void test_so_ww_checker_requires_dense_ids() {
+  auto trace = parse_or_die(R"yaml(
+---
+session_id: 1
+start_ts: 10
+commit_ts: 20
+events:
+  - seq: 1
+    op: W
+    key_hex: 01
+    value_hex: 0a
+)yaml");
+  trace.event_key_ids.clear();
+
+  auto result = run_so_ww_checker(trace);
+  CHECK(result.status == checker::CheckStatus::Inconclusive);
+  CHECK(result.diagnostics.size() == 1);
+  CHECK(result.diagnostics[0].message ==
+        "trace is missing dense key/value IDs");
+}
+
 void test_serializable_checker_allows_read_own_write() {
   auto trace = parse_or_die(R"yaml(
 ---
@@ -501,6 +522,7 @@ void run_checker_tests() {
   test_so_cl_checker_passes_overwrite_chain_trace();
   test_so_ww_checker_rolls_back_unrelated_writes_before_ww_bound();
   test_so_ww_checker_does_not_rollback_before_ww_bound();
+  test_so_ww_checker_requires_dense_ids();
   test_serializable_checker_allows_read_own_write();
   test_serializable_checker_requires_explicit_miss_for_absent_key();
   test_serializable_checker_allows_read_miss_after_local_delete();

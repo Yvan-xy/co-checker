@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -16,6 +17,10 @@ using EventId   = std::uint32_t;
 using SessionId = std::uint32_t;
 using Timestamp = std::uint64_t;
 using EventSeq  = std::uint32_t;
+using KeyId     = std::uint32_t;
+using ValueId   = std::uint32_t;
+
+inline constexpr ValueId kNullValueId = std::numeric_limits<ValueId>::max();
 
 struct HexValue {
   std::uint32_t byte_len = 0;

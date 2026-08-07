@@ -1,27 +1,25 @@
 #pragma once
 
-#include <optional>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "checker/checker.h"
-#include "common/trace/snapshot.h"
 
 namespace checker {
 
 using namespace common;
 
 struct DeltaEntry {
-  EventId event_id;
-  std::optional<Value> old_value;
+  KeyId key_id;
+  ValueId old_value_id;
 };
 
 using SOWWDelta      = std::vector<DeltaEntry>;
 using SOWWChangeList = std::vector<std::pair<TxnId, SOWWDelta>>;
 
 struct SOWWContext final : public CheckerContext {
-  SnapshotOpt cur_snapshot;
+  std::vector<ValueId> cur_snapshot;
   SOWWChangeList cl;
   std::unordered_map<SessionId, TxnId> latest_txns_by_session;
 

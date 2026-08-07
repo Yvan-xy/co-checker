@@ -1,5 +1,7 @@
 #include "common/trace/trace_binary.h"
 
+#include "common/trace/dense_id_interner.h"
+
 #include "common/trace/timekiller_json.h"
 
 #include <array>
@@ -693,6 +695,11 @@ Result<Trace> read_binary_trace_stream(std::istream &input,
   Trace trace;
   trace.transactions.reserve(static_cast<std::size_t>(txn_count));
   trace.events.reserve(static_cast<std::size_t>(event_count));
+  trace.event_key_ids.reserve(static_cast<std::size_t>(event_count));
+  trace.event_value_ids.reserve(static_cast<std::size_t>(event_count));
+
+  DenseIdInterner<KeyId> key_interner;
+  DenseIdInterner<ValueId> value_interner;
 
   DiagnosticList diagnostics;
   std::unordered_set<Timestamp> seen_commit_ts;
@@ -826,8 +833,24 @@ Result<Trace> read_binary_trace_stream(std::istream &input,
         return Result<Trace>::err(std::move(diagnostics));
       }
 
-      txn.event_ids.push_back(event.id);
       trace.events.push_back(std::move(event));
+      const auto &stored_event = trace.events.back();
+      const auto key_id        = key_interner.intern(stored_event.key);
+      if (!key_id.has_value()) {
+        return single_error("binary trace exceeds the dense key ID range");
+      }
+      ValueId value_id = kNullValueId;
+      if (stored_event.value.has_value()) {
+        const auto interned_value = value_interner.intern(*stored_event.value);
+        if (!interned_value.has_value()) {
+          return single_error("binary trace exceeds the dense value ID range");
+        }
+        value_id = *interned_value;
+      }
+
+      txn.event_ids.push_back(stored_event.id);
+      trace.event_key_ids.push_back(*key_id);
+      trace.event_value_ids.push_back(value_id);
     }
 
     trace.transactions.push_back(std::move(txn));
@@ -837,6 +860,9 @@ Result<Trace> read_binary_trace_stream(std::istream &input,
   if (trace.events.size() != event_count) {
     return single_error("binary trace event count does not match header");
   }
+
+  trace.key_count   = key_interner.size();
+  trace.value_count = value_interner.size();
 
   return Result<Trace>::ok(std::move(trace));
 }
