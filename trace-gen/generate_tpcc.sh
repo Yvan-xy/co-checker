@@ -11,6 +11,7 @@ raw_dir="${output_dir}/raw"
 warehouses=${WAREHOUSES:-1}
 threads=${THREADS:-1}
 run_time=${RUN_TIME:-5s}
+transaction_weights=${TRANSACTION_WEIGHTS:-45,43,4,4,4}
 port=${PORT:-4020}
 status_port=${STATUS_PORT:-10200}
 host=${HOST:-127.0.0.1}
@@ -20,6 +21,10 @@ keep_store=${KEEP_STORE:-0}
 conn_params="tidb_txn_mode=optimistic"
 
 suffix="tpcc-optimistic-${warehouses}w-${threads}th-${run_time}"
+if [[ "${transaction_weights}" != "45,43,4,4,4" ]]; then
+	weight_suffix=${transaction_weights//,/-}
+	suffix+="-weights-${weight_suffix}"
+fi
 suffix=${suffix//[^A-Za-z0-9_.-]/_}
 raw_path="${raw_dir}/${suffix}.raw.yaml"
 processed_seed="${output_dir}/${suffix}.yaml"
@@ -37,6 +42,24 @@ fi
 
 if ! command -v python3 >/dev/null 2>&1; then
 	printf 'python3 is not available on PATH\n' >&2
+	exit 1
+fi
+
+IFS=',' read -r -a weight_values <<<"${transaction_weights}"
+if (( ${#weight_values[@]} != 5 )); then
+	printf 'TRANSACTION_WEIGHTS must contain five comma-separated integers: %s\n' "${transaction_weights}" >&2
+	exit 1
+fi
+weight_sum=0
+for weight in "${weight_values[@]}"; do
+	if [[ ! "${weight}" =~ ^[0-9]+$ ]]; then
+		printf 'TRANSACTION_WEIGHTS contains a non-negative-integer violation: %s\n' "${transaction_weights}" >&2
+		exit 1
+	fi
+	weight_sum=$((weight_sum + weight))
+done
+if (( weight_sum != 100 )); then
+	printf 'TRANSACTION_WEIGHTS must sum to 100, got %s: %s\n' "${weight_sum}" "${transaction_weights}" >&2
 	exit 1
 fi
 
@@ -164,8 +187,8 @@ PY
 printf 'Running go-tpc prepare: warehouses=%s threads=%s db=%s conn_params=%s\n' "${warehouses}" "${threads}" "${db_name}" "${conn_params}"
 "${go_tpc}" -H "${host}" -P "${port}" -D "${db_name}" --conn-params "${conn_params}" tpcc --warehouses "${warehouses}" prepare -T "${threads}"
 
-printf 'Running go-tpc workload: warehouses=%s threads=%s time=%s db=%s conn_params=%s\n' "${warehouses}" "${threads}" "${run_time}" "${db_name}" "${conn_params}"
-"${go_tpc}" -H "${host}" -P "${port}" -D "${db_name}" --conn-params "${conn_params}" tpcc --warehouses "${warehouses}" run -T "${threads}" --time "${run_time}" --silence
+printf 'Running go-tpc workload: warehouses=%s threads=%s time=%s weights=%s db=%s conn_params=%s\n' "${warehouses}" "${threads}" "${run_time}" "${transaction_weights}" "${db_name}" "${conn_params}"
+"${go_tpc}" -H "${host}" -P "${port}" -D "${db_name}" --conn-params "${conn_params}" tpcc --warehouses "${warehouses}" run -T "${threads}" --time "${run_time}" --weight "${transaction_weights}" --silence
 
 printf 'Stopping TiDB\n'
 cleanup

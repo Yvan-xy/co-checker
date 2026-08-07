@@ -93,6 +93,7 @@ Useful knobs:
 
 ```bash
 WAREHOUSES=1 THREADS=1 RUN_TIME=5s ./trace-gen/generate_tpcc.sh
+TRANSACTION_WEIGHTS=1,0,0,0,99 RUN_TIME=60s ./trace-gen/generate_tpcc.sh
 OUTPUT_DIR=/tmp/tpcc-traces PORT=4030 STATUS_PORT=10300 ./trace-gen/generate_tpcc.sh
 BIN_TRACE_DIR=/tmp/bin-traces ./trace-gen/generate_tpcc.sh
 ```
@@ -101,6 +102,11 @@ Use `THREADS` to control TPC-C client concurrency. Multi-threaded runs create
 overlapping transactions; the SO-only checker handles those by accepting older
 viable snapshots when the transaction snapshot is not the latest commit-order
 prefix.
+
+`TRANSACTION_WEIGHTS` configures the five go-tpc weights in NewOrder, Payment,
+OrderStatus, Delivery, and StockLevel order. It must contain five nonnegative
+integers summing to 100. Non-default weights are embedded in generated names so
+they cannot silently overwrite a full-mix trace.
 
 For large raw TPC-C traces, use the C++ preprocessor instead of the Python
 preprocessor:
