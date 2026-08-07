@@ -1,12 +1,17 @@
 #include "common/trace/trace_binary.h"
 
+#include "common/trace/timekiller_json.h"
+
 #include <array>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
 #include <limits>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -182,6 +187,442 @@ std::optional<EventOp> decode_op(const std::uint8_t op) {
 
 std::uint8_t encode_op(const EventOp op) { return op == EventOp::Read ? 0 : 1; }
 
+struct BinaryTraceHeaderRecord {
+  std::uint64_t transaction_count = 0;
+  std::uint64_t event_count       = 0;
+};
+
+struct BinaryTransactionRecord {
+  std::uint64_t index       = 0;
+  SessionId session_id      = 0;
+  Timestamp start_ts        = 0;
+  Timestamp commit_ts       = 0;
+  std::uint32_t event_count = 0;
+};
+
+struct BinaryEventRecord {
+  std::uint64_t index             = 0;
+  std::uint64_t transaction_index = 0;
+  EventSeq seq                    = 0;
+  EventOp op                      = EventOp::Read;
+  Key key;
+  std::optional<Value> value;
+  bool is_delete = false;
+  bool is_miss   = false;
+};
+
+struct BinaryDecodeStats {
+  std::uint64_t transactions = 0;
+  std::uint64_t events       = 0;
+};
+
+template <typename T> Result<T> decode_error(std::string message) {
+  DiagnosticList diagnostics;
+  diagnostics.push_back(binary_error(std::move(message)));
+  return Result<T>::err(std::move(diagnostics));
+}
+
+template <typename Consumer>
+Result<BinaryDecodeStats> decode_binary_trace_stream(std::istream &input,
+                                                     ParseOptions options,
+                                                     Consumer &consumer) {
+  std::array<char, kBinaryTraceMagic.size()> magic{};
+  if (!read_exact(input, magic.data(), magic.size()) ||
+      std::string_view(magic.data(), magic.size()) != kBinaryTraceMagic) {
+    return decode_error<BinaryDecodeStats>("invalid binary trace magic");
+  }
+
+  std::uint32_t version = 0;
+  std::uint32_t flags   = 0;
+  BinaryTraceHeaderRecord header;
+  if (!read_u32(input, version) || !read_u32(input, flags) ||
+      !read_u64(input, header.transaction_count) ||
+      !read_u64(input, header.event_count)) {
+    return decode_error<BinaryDecodeStats>("truncated binary trace header");
+  }
+
+  if (version != kBinaryTraceVersion) {
+    return decode_error<BinaryDecodeStats>("unsupported binary trace version " +
+                                           std::to_string(version));
+  }
+  if (flags != kBinaryTraceFlags) {
+    return decode_error<BinaryDecodeStats>("unsupported binary trace flags " +
+                                           std::to_string(flags));
+  }
+  if (header.transaction_count > std::numeric_limits<TxnId>::max()) {
+    return decode_error<BinaryDecodeStats>(
+        "binary trace has too many transactions");
+  }
+  if (header.event_count > std::numeric_limits<EventId>::max()) {
+    return decode_error<BinaryDecodeStats>("binary trace has too many events");
+  }
+
+  std::string consumer_error;
+  if (!consumer.on_header(header, consumer_error)) {
+    return decode_error<BinaryDecodeStats>(
+        consumer_error.empty() ? "binary trace consumer rejected the header"
+                               : std::move(consumer_error));
+  }
+
+  std::unordered_set<Timestamp> seen_commit_ts;
+  std::optional<Timestamp> previous_commit_ts;
+  std::uint64_t observed_events = 0;
+
+  for (std::uint64_t txn_index = 0; txn_index < header.transaction_count;
+       ++txn_index) {
+    BinaryTransactionRecord txn;
+    txn.index = txn_index;
+    if (!read_u32(input, txn.session_id) || !read_u64(input, txn.start_ts) ||
+        !read_u64(input, txn.commit_ts) || !read_u32(input, txn.event_count)) {
+      return decode_error<BinaryDecodeStats>(
+          "truncated transaction record at index " + std::to_string(txn_index));
+    }
+
+    if (previous_commit_ts.has_value() && options.require_commit_order &&
+        txn.commit_ts < *previous_commit_ts) {
+      return decode_error<BinaryDecodeStats>(
+          "transaction " + std::to_string(txn_index) +
+          " has commit_ts smaller than previous commit_ts");
+    }
+    if (options.reject_duplicate_commit_ts &&
+        !seen_commit_ts.insert(txn.commit_ts).second) {
+      return decode_error<BinaryDecodeStats>(
+          "transaction " + std::to_string(txn_index) +
+          " duplicates an earlier commit_ts");
+    }
+    if (txn.event_count > header.event_count - observed_events) {
+      return decode_error<BinaryDecodeStats>(
+          "binary trace event count exceeds header at transaction " +
+          std::to_string(txn_index));
+    }
+
+    consumer_error.clear();
+    if (!consumer.on_transaction_begin(txn, consumer_error)) {
+      return decode_error<BinaryDecodeStats>(
+          consumer_error.empty()
+              ? "binary trace consumer rejected transaction " +
+                    std::to_string(txn_index)
+              : std::move(consumer_error));
+    }
+
+    std::optional<EventSeq> previous_seq;
+    for (std::uint32_t event_index = 0; event_index < txn.event_count;
+         ++event_index) {
+      BinaryEventRecord event;
+      event.index             = observed_events;
+      event.transaction_index = txn_index;
+
+      std::uint8_t op_byte     = 0;
+      std::uint8_t event_flags = 0;
+      std::uint16_t reserved   = 0;
+      if (!read_u32(input, event.seq) || !read_u8(input, op_byte) ||
+          !read_u8(input, event_flags) || !read_u16(input, reserved)) {
+        return decode_error<BinaryDecodeStats>(
+            "truncated event record at transaction " +
+            std::to_string(txn_index) + ", event " +
+            std::to_string(event_index));
+      }
+
+      if (reserved != 0) {
+        return decode_error<BinaryDecodeStats>(
+            "event reserved field must be zero at transaction " +
+            std::to_string(txn_index) + ", event " +
+            std::to_string(event_index));
+      }
+      if ((event_flags & ~(kEventHasValue | kEventDelete | kEventMiss)) != 0) {
+        return decode_error<BinaryDecodeStats>(
+            "unknown event flags at transaction " + std::to_string(txn_index) +
+            ", event " + std::to_string(event_index));
+      }
+      const auto op = decode_op(op_byte);
+      if (!op.has_value()) {
+        return decode_error<BinaryDecodeStats>(
+            "invalid event op at transaction " + std::to_string(txn_index) +
+            ", event " + std::to_string(event_index));
+      }
+      event.op = *op;
+
+      std::string error;
+      auto key = read_hex_value(input, error);
+      if (!key.has_value()) {
+        return decode_error<BinaryDecodeStats>(std::move(error));
+      }
+      event.key = std::move(*key);
+
+      if ((event_flags & kEventHasValue) != 0) {
+        auto value = read_hex_value(input, error);
+        if (!value.has_value()) {
+          return decode_error<BinaryDecodeStats>(std::move(error));
+        }
+        event.value = std::move(*value);
+      }
+      event.is_delete = (event_flags & kEventDelete) != 0;
+      event.is_miss   = (event_flags & kEventMiss) != 0;
+
+      if (previous_seq.has_value() && event.seq <= *previous_seq) {
+        return decode_error<BinaryDecodeStats>(
+            "event seq must be strictly increasing at transaction " +
+            std::to_string(txn_index) + ", event " +
+            std::to_string(event_index));
+      }
+      previous_seq = event.seq;
+
+      if (event.is_miss && event.value.has_value()) {
+        return decode_error<BinaryDecodeStats>(
+            "read event cannot have both miss and value at transaction " +
+            std::to_string(txn_index) + ", event " +
+            std::to_string(event_index));
+      }
+      if (event.is_delete && event.value.has_value()) {
+        return decode_error<BinaryDecodeStats>(
+            "write event cannot have both delete and value at transaction " +
+            std::to_string(txn_index) + ", event " +
+            std::to_string(event_index));
+      }
+      if (event.op == EventOp::Read && event.is_delete) {
+        return decode_error<BinaryDecodeStats>(
+            "read event cannot have delete at transaction " +
+            std::to_string(txn_index) + ", event " +
+            std::to_string(event_index));
+      }
+      if (event.op == EventOp::Write && event.is_miss) {
+        return decode_error<BinaryDecodeStats>(
+            "write event cannot have miss at transaction " +
+            std::to_string(txn_index) + ", event " +
+            std::to_string(event_index));
+      }
+
+      consumer_error.clear();
+      if (!consumer.on_event(std::move(event), consumer_error)) {
+        return decode_error<BinaryDecodeStats>(
+            consumer_error.empty()
+                ? "binary trace consumer rejected event at transaction " +
+                      std::to_string(txn_index) + ", event " +
+                      std::to_string(event_index)
+                : std::move(consumer_error));
+      }
+      ++observed_events;
+    }
+
+    consumer_error.clear();
+    if (!consumer.on_transaction_end(txn, consumer_error)) {
+      return decode_error<BinaryDecodeStats>(
+          consumer_error.empty()
+              ? "binary trace consumer rejected transaction " +
+                    std::to_string(txn_index)
+              : std::move(consumer_error));
+    }
+    previous_commit_ts = txn.commit_ts;
+  }
+
+  if (observed_events != header.event_count) {
+    return decode_error<BinaryDecodeStats>(
+        "binary trace event count does not match header");
+  }
+
+  if (input.peek() != std::char_traits<char>::eof()) {
+    return decode_error<BinaryDecodeStats>(
+        "binary trace has trailing data after declared records");
+  }
+  if (input.bad()) {
+    return decode_error<BinaryDecodeStats>(
+        "failed while checking the end of the binary trace");
+  }
+
+  consumer_error.clear();
+  if (!consumer.on_trace_end(consumer_error)) {
+    return decode_error<BinaryDecodeStats>(
+        consumer_error.empty() ? "binary trace consumer failed to finish"
+                               : std::move(consumer_error));
+  }
+
+  return Result<BinaryDecodeStats>::ok(
+      {.transactions = header.transaction_count, .events = observed_events});
+}
+
+class TimeKillerJsonConsumer {
+public:
+  explicit TimeKillerJsonConsumer(std::ostream &output) : output_(output) {}
+
+  bool on_header(const BinaryTraceHeaderRecord &header, std::string &error) {
+    expected_transactions_ = header.transaction_count;
+    expected_events_       = header.event_count;
+    return write("[", error);
+  }
+
+  bool on_transaction_begin(const BinaryTransactionRecord &record,
+                            std::string &error) {
+    constexpr auto java_long_max =
+        static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+    if (record.index > java_long_max) {
+      error = "transaction id at index " + std::to_string(record.index) +
+              " does not fit signed Java long";
+      return false;
+    }
+    if (record.session_id > java_long_max) {
+      error = "session id at transaction " + std::to_string(record.index) +
+              " does not fit signed Java long";
+      return false;
+    }
+    if (record.start_ts > java_long_max) {
+      error = "start_ts at transaction " + std::to_string(record.index) +
+              " does not fit signed Java long";
+      return false;
+    }
+    if (record.commit_ts > java_long_max) {
+      error = "commit_ts at transaction " + std::to_string(record.index) +
+              " does not fit signed Java long";
+      return false;
+    }
+    if (record.start_ts > record.commit_ts) {
+      error = "start_ts exceeds commit_ts at transaction " +
+              std::to_string(record.index);
+      return false;
+    }
+
+    current_transaction_events_ = 0;
+    if (transactions_ != 0 && !write(",", error)) {
+      return false;
+    }
+    if (!write("{\"tid\":", error) || !write_number(record.index, error) ||
+        !write(",\"sid\":", error) || !write_number(record.session_id, error) ||
+        !write(",\"sts\":{\"p\":", error) ||
+        !write_number(record.start_ts, error) ||
+        !write(",\"l\":0},\"cts\":{\"p\":", error) ||
+        !write_number(record.commit_ts, error) ||
+        !write(",\"l\":0},\"ops\":[", error)) {
+      return false;
+    }
+    ++transactions_;
+    return true;
+  }
+
+  bool on_event(BinaryEventRecord record, std::string &error) {
+    std::int64_t key_id = 0;
+    if (!intern(key_ids_, std::move(record.key), next_key_id_, key_id, "key",
+                error)) {
+      return false;
+    }
+
+    std::optional<std::int64_t> value_id;
+    if (record.value.has_value()) {
+      std::int64_t id = 0;
+      if (!intern(value_ids_, std::move(*record.value), next_value_id_, id,
+                  "value", error)) {
+        return false;
+      }
+      value_id = id;
+    }
+
+    if (current_transaction_events_ != 0 && !write(",", error)) {
+      return false;
+    }
+    if (!write(record.op == EventOp::Read ? "{\"t\":\"r\",\"k\":"
+                                          : "{\"t\":\"w\",\"k\":",
+               error) ||
+        !write_number(static_cast<std::uint64_t>(key_id), error) ||
+        !write(",\"v\":", error)) {
+      return false;
+    }
+    if (value_id.has_value()) {
+      if (!write_number(static_cast<std::uint64_t>(*value_id), error)) {
+        return false;
+      }
+    } else if (!write("null", error)) {
+      return false;
+    }
+    if (!write("}", error)) {
+      return false;
+    }
+
+    ++current_transaction_events_;
+    ++events_;
+    return true;
+  }
+
+  bool on_transaction_end(const BinaryTransactionRecord &, std::string &error) {
+    return write("]}", error);
+  }
+
+  bool on_trace_end(std::string &error) {
+    if (transactions_ != expected_transactions_ ||
+        events_ != expected_events_) {
+      error = "converted record counts do not match the binary trace header";
+      return false;
+    }
+    return write("]", error);
+  }
+
+  [[nodiscard]] TimeKillerJsonStats stats() const {
+    return {.transactions = transactions_,
+            .events       = events_,
+            .keys         = static_cast<std::uint64_t>(key_ids_.size()),
+            .values       = static_cast<std::uint64_t>(value_ids_.size()),
+            .output_bytes = output_bytes_};
+  }
+
+private:
+  using IdMap = std::unordered_map<HexValue, std::int64_t, HexValueHash>;
+
+  bool write(const std::string_view text, std::string &error) {
+    output_.write(text.data(), static_cast<std::streamsize>(text.size()));
+    if (!output_) {
+      error = "failed to write TimeKiller JSON output";
+      return false;
+    }
+    output_bytes_ += static_cast<std::uint64_t>(text.size());
+    return true;
+  }
+
+  bool write_number(const std::uint64_t value, std::string &error) {
+    std::array<char, 32> buffer{};
+    const auto [end, status] =
+        std::to_chars(buffer.data(), buffer.data() + buffer.size(), value);
+    if (status != std::errc{}) {
+      error = "failed to format integer for TimeKiller JSON output";
+      return false;
+    }
+    return write(std::string_view(buffer.data(), static_cast<std::size_t>(
+                                                     end - buffer.data())),
+                 error);
+  }
+
+  bool intern(IdMap &ids, HexValue value, std::uint64_t &next_id,
+              std::int64_t &id, const std::string_view kind,
+              std::string &error) {
+    const auto found = ids.find(value);
+    if (found != ids.end()) {
+      id = found->second;
+      return true;
+    }
+
+    constexpr auto java_long_max =
+        static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+    if (next_id > java_long_max) {
+      error = "generated " + std::string(kind) +
+              " id does not fit signed Java long";
+      return false;
+    }
+
+    id = static_cast<std::int64_t>(next_id);
+    ids.emplace(std::move(value), id);
+    ++next_id;
+    return true;
+  }
+
+  std::ostream &output_;
+  IdMap key_ids_;
+  IdMap value_ids_;
+  std::uint64_t next_key_id_                = 0;
+  std::uint64_t next_value_id_              = 0;
+  std::uint64_t expected_transactions_      = 0;
+  std::uint64_t expected_events_            = 0;
+  std::uint64_t transactions_               = 0;
+  std::uint64_t events_                     = 0;
+  std::uint64_t current_transaction_events_ = 0;
+  std::uint64_t output_bytes_               = 0;
+};
+
 } // namespace
 
 bool is_binary_trace_stream(std::istream &input) {
@@ -198,6 +639,23 @@ bool is_binary_trace_stream(std::istream &input) {
   input.clear();
   input.seekg(original_pos);
   return matched;
+}
+
+Result<TimeKillerJsonStats> write_timekiller_json(std::istream &input,
+                                                  std::ostream &output,
+                                                  ParseOptions options) {
+  TimeKillerJsonConsumer consumer(output);
+  auto decoded = decode_binary_trace_stream(input, options, consumer);
+  if (!decoded) {
+    return Result<TimeKillerJsonStats>::err(decoded.error());
+  }
+
+  output.flush();
+  if (!output) {
+    return decode_error<TimeKillerJsonStats>(
+        "failed to flush TimeKiller JSON output");
+  }
+  return Result<TimeKillerJsonStats>::ok(consumer.stats());
 }
 
 Result<Trace> read_binary_trace_stream(std::istream &input,

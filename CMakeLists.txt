@@ -165,6 +165,20 @@ target_compile_options(trace-convert
     -Wall -Wextra -Wpedantic
 )
 
+add_executable(cotrace-to-timekiller
+  src/cli/cotrace_to_timekiller.cpp
+)
+
+target_link_libraries(cotrace-to-timekiller
+  PRIVATE
+    checker
+)
+
+target_compile_options(cotrace-to-timekiller
+  PRIVATE
+    -Wall -Wextra -Wpedantic
+)
+
 include(CTest)
 if(BUILD_TESTING)
   add_executable(checker_tests
@@ -173,6 +187,7 @@ if(BUILD_TESTING)
     test/test_index.cpp
     test/test_main.cpp
     test/test_snapshot.cpp
+    test/test_timekiller_json.cpp
     test/test_trace.cpp
   )
 

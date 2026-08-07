@@ -109,6 +109,35 @@ build/co-checker --format bin --checker co-si-so-only traces/2s-4t-10e-mutual.tr
 For YAML, use `--format yaml`. The default is `--format auto`, which keeps the
 old behavior and detects binary traces by magic header.
 
+## TimeKiller JSON Converter
+
+The `cotrace-to-timekiller` executable streams a `COTRACE1` file to the
+key-value JSON array accepted by TimeKiller/Chronos:
+
+```bash
+build/cotrace-to-timekiller \
+  --stats /tmp/tpcc.stats.json \
+  bin_traces/tpcc/tpcc.trace \
+  /tmp/tpcc.json
+```
+
+Transaction record positions become `tid`; session and physical timestamp
+fields are copied to `sid`, `sts.p`, and `cts.p`, with both logical
+timestamp fields set to zero. Event order is preserved and operations are
+written as `r` or `w`.
+
+Arbitrary key and non-null value byte strings are assigned independent,
+zero-based IDs in first-occurrence order. The dictionaries use the full byte
+strings for equality, so hash collisions cannot merge distinct inputs.
+Repeated byte strings reuse their earlier ID. Read misses, delete writes, and
+other absent values are emitted as JSON `null`.
+
+The converter validates the binary structure and requires all timestamps and
+generated IDs to fit a signed Java `long`. JSON is written incrementally to a
+temporary file and renamed only after conversion succeeds. The optional stats
+file records transaction, event, distinct-key, distinct-non-null-value, and
+JSON-byte counts for independent validation.
+
 ## Generated Binary Traces
 
 Trace generation scripts write normalized YAML under `./traces` and mirror the

@@ -24,6 +24,7 @@ void run_trace_tests();
 void run_snapshot_tests();
 void run_checker_tests();
 void run_index_tests();
+void run_timekiller_json_tests();
 
 } // namespace test
 
