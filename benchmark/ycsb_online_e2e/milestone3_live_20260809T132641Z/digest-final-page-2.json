@@ -1,0 +1,12 @@
+{
+  "format_version": 1,
+  "algorithm": "sha256",
+  "canonical_encoding": "schema frames table name and exact SHOW CREATE TABLE text; data frames ordered column names and keyset-ordered rows with uint64-le lengths plus one-byte NULL/present field markers",
+  "database_digest_sha256": "7d33ec8de832ec72891bfbede2925148d6d7156c4de131590f18debb47707609",
+  "schema_digest_sha256": "84682b73f0c7fdcd5c82f790c3d2def68e411a87ec7271301f22cf0133c0bcee",
+  "data_digest_sha256": "5fa8ac2422d5e82c69b3d9bc3357cba8f71dee6f50933ab927493b85363d274a",
+  "total_rows": 1,
+  "page_count": 1,
+  "configured_page_size": 2,
+  "maximum_observed_page_size": 1
+}

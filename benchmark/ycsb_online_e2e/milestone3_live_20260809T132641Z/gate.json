@@ -1,0 +1,344 @@
+{
+  "format_version": 1,
+  "database": "ycsb",
+  "table": "usertable",
+  "field_count": 10,
+  "field_length": 100,
+  "session_variables": {
+    "tidb_allow_batch_cop": "0",
+    "tidb_enable_1pc": "0",
+    "tidb_enable_async_commit": "0",
+    "tidb_index_lookup_pushdown_policy": "force",
+    "tidb_low_resolution_tso": "0",
+    "tidb_read_staleness": "0",
+    "tidb_snapshot": "",
+    "tidb_store_batch_size": "0",
+    "tidb_txn_mode": "optimistic",
+    "transaction_isolation": "REPEATABLE-READ"
+  },
+  "plans": [
+    {
+      "name": "point_select_text",
+      "operators": [
+        "Point_Get"
+      ],
+      "explain_rows": [
+        [
+          "Point_Get",
+          "1.00",
+          "root",
+          "table:usertable, clustered index:PRIMARY(YCSB_KEY)",
+          ""
+        ]
+      ]
+    },
+    {
+      "name": "point_select_prepared",
+      "operators": [
+        "Point_Get"
+      ],
+      "explain_rows": [
+        [
+          "Point_Get",
+          "1.00",
+          "root",
+          "table:usertable, clustered index:PRIMARY(YCSB_KEY)",
+          ""
+        ]
+      ]
+    },
+    {
+      "name": "missing_select_text",
+      "operators": [
+        "Point_Get"
+      ],
+      "explain_rows": [
+        [
+          "Point_Get",
+          "1.00",
+          "root",
+          "table:usertable, clustered index:PRIMARY(YCSB_KEY)",
+          ""
+        ]
+      ]
+    },
+    {
+      "name": "missing_select_prepared",
+      "operators": [
+        "Point_Get"
+      ],
+      "explain_rows": [
+        [
+          "Point_Get",
+          "1.00",
+          "root",
+          "table:usertable, clustered index:PRIMARY(YCSB_KEY)",
+          ""
+        ]
+      ]
+    },
+    {
+      "name": "point_update_text",
+      "operators": [
+        "Update",
+        "└─Point_Get"
+      ],
+      "explain_rows": [
+        [
+          "Update",
+          "N/A",
+          "root",
+          "",
+          "N/A"
+        ],
+        [
+          "└─Point_Get",
+          "1.00",
+          "root",
+          "table:usertable, clustered index:PRIMARY(YCSB_KEY)",
+          ""
+        ]
+      ]
+    },
+    {
+      "name": "point_update_prepared",
+      "operators": [
+        "Update",
+        "└─Point_Get"
+      ],
+      "explain_rows": [
+        [
+          "Update",
+          "N/A",
+          "root",
+          "",
+          "N/A"
+        ],
+        [
+          "└─Point_Get",
+          "1.00",
+          "root",
+          "table:usertable, clustered index:PRIMARY(YCSB_KEY)",
+          ""
+        ]
+      ]
+    },
+    {
+      "name": "insert_ignore_text",
+      "operators": [
+        "Insert"
+      ],
+      "explain_rows": [
+        [
+          "Insert",
+          "N/A",
+          "root",
+          "",
+          "N/A"
+        ]
+      ]
+    },
+    {
+      "name": "insert_ignore_prepared",
+      "operators": [
+        "Insert"
+      ],
+      "explain_rows": [
+        [
+          "Insert",
+          "N/A",
+          "root",
+          "",
+          "N/A"
+        ]
+      ]
+    },
+    {
+      "name": "range_select_text",
+      "operators": [
+        "Limit",
+        "└─TableReader",
+        "  └─Limit",
+        "    └─TableRangeScan"
+      ],
+      "explain_rows": [
+        [
+          "Limit",
+          "3.00",
+          "root",
+          "",
+          "offset:0, count:3"
+        ],
+        [
+          "└─TableReader",
+          "3.00",
+          "root",
+          "",
+          "data:Limit"
+        ],
+        [
+          "  └─Limit",
+          "3.00",
+          "cop[tikv]",
+          "",
+          "offset:0, count:3"
+        ],
+        [
+          "    └─TableRangeScan",
+          "3.00",
+          "cop[tikv]",
+          "table:usertable",
+          "range:[\"user1\",+inf], keep order:false, stats:pseudo"
+        ]
+      ]
+    },
+    {
+      "name": "range_select_prepared",
+      "operators": [
+        "Limit",
+        "└─TableReader",
+        "  └─Limit",
+        "    └─TableRangeScan"
+      ],
+      "explain_rows": [
+        [
+          "Limit",
+          "3.00",
+          "root",
+          "",
+          "offset:0, count:3"
+        ],
+        [
+          "└─TableReader",
+          "3.00",
+          "root",
+          "",
+          "data:Limit"
+        ],
+        [
+          "  └─Limit",
+          "3.00",
+          "cop[tikv]",
+          "",
+          "offset:0, count:3"
+        ],
+        [
+          "    └─TableRangeScan",
+          "3.00",
+          "cop[tikv]",
+          "table:usertable",
+          "range:[\"user1\",+inf], keep order:false, stats:pseudo"
+        ]
+      ]
+    },
+    {
+      "name": "point_delete_text",
+      "operators": [
+        "Delete",
+        "└─Point_Get"
+      ],
+      "explain_rows": [
+        [
+          "Delete",
+          "N/A",
+          "root",
+          "",
+          "N/A"
+        ],
+        [
+          "└─Point_Get",
+          "1.00",
+          "root",
+          "table:usertable, clustered index:PRIMARY(YCSB_KEY)",
+          ""
+        ]
+      ]
+    },
+    {
+      "name": "point_delete_prepared",
+      "operators": [
+        "Delete",
+        "└─Point_Get"
+      ],
+      "explain_rows": [
+        [
+          "Delete",
+          "N/A",
+          "root",
+          "",
+          "N/A"
+        ],
+        [
+          "└─Point_Get",
+          "1.00",
+          "root",
+          "table:usertable, clustered index:PRIMARY(YCSB_KEY)",
+          ""
+        ]
+      ]
+    }
+  ],
+  "probes": [
+    {
+      "name": "point_select",
+      "protocol": "text",
+      "rows_observed": 1
+    },
+    {
+      "name": "point_select",
+      "protocol": "prepared",
+      "rows_observed": 1
+    },
+    {
+      "name": "missing_select",
+      "protocol": "text",
+      "rows_observed": 0
+    },
+    {
+      "name": "missing_select",
+      "protocol": "prepared",
+      "rows_observed": 0
+    },
+    {
+      "name": "range_select",
+      "protocol": "text",
+      "rows_observed": 1
+    },
+    {
+      "name": "range_select",
+      "protocol": "prepared",
+      "rows_observed": 1
+    },
+    {
+      "name": "point_update",
+      "protocol": "text",
+      "rows_observed": 1
+    },
+    {
+      "name": "point_update",
+      "protocol": "prepared",
+      "rows_observed": 1
+    },
+    {
+      "name": "insert_ignore",
+      "protocol": "text",
+      "rows_observed": 1
+    },
+    {
+      "name": "insert_ignore",
+      "protocol": "prepared",
+      "rows_observed": 1
+    },
+    {
+      "name": "point_delete",
+      "protocol": "text",
+      "rows_observed": 1
+    },
+    {
+      "name": "point_delete",
+      "protocol": "prepared",
+      "rows_observed": 1
+    }
+  ],
+  "outcome": "pass"
+}

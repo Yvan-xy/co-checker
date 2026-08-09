@@ -1,0 +1,24 @@
+{
+  "format_version": "go-ycsb-online-result-v1",
+  "client_identity": "go-ycsb-v1.0.3-online-checker-v1",
+  "base_commit": "f030f9942393a8febbf4365c2d582711723159f5",
+  "patch_identity": "co-checker-go-ycsb-online-v1",
+  "command": "run",
+  "master_seed": 12345,
+  "seed_derivation": "splitmix64-v1",
+  "properties_sha256": "49cc1edfa1016bc70da4442beb360ab32e479bac0ba9f488f473631fb9a38c0a",
+  "requested": 3,
+  "attempted": 0,
+  "successful": 0,
+  "failed": 3,
+  "started_unix_ns": 1786281233009061792,
+  "ended_unix_ns": 1786281233009142282,
+  "monotonic_start_ns": 0,
+  "monotonic_end_ns": 80480,
+  "elapsed_ns": 80480,
+  "error_classes": {
+    "initialization": 1
+  },
+  "error_message": "database definitely-unregistered-db is not registered",
+  "measurements": {}
+}

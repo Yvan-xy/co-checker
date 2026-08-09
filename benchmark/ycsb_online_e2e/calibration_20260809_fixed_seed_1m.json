@@ -1,0 +1,52 @@
+{
+  "capacity_decision": {
+    "capture_capacity_bytes": 2147483648,
+    "queue_capacity_bytes": 1073741824,
+    "retained_state_capacity_bytes": 12884901888
+  },
+  "cpu_sets": {
+    "client": "8-15",
+    "tidb": "0-7"
+  },
+  "field_count": 10,
+  "field_length": 100,
+  "format_version": 1,
+  "mode_rotation": "trial-index-left-rotation-v1",
+  "profile_id": "co-checker-ycsb-core-v1",
+  "record_count": 1000000,
+  "seed_policy": "fixed-v1",
+  "seeds": {
+    "load": 7732542672685676034,
+    "measured": 1251957853004150076,
+    "warmup": 6300581044758642952
+  },
+  "supersedes": "calibration_20260809T144157Z.json",
+  "threads": 16,
+  "tidb_retry_limit": 100,
+  "workloads": {
+    "A": {
+      "measured_operations": 7231770,
+      "warmup_operations": 723177
+    },
+    "B": {
+      "measured_operations": 5482626,
+      "warmup_operations": 548263
+    },
+    "C": {
+      "measured_operations": 11443398,
+      "warmup_operations": 1144340
+    },
+    "D": {
+      "measured_operations": 11094018,
+      "warmup_operations": 1109402
+    },
+    "E": {
+      "measured_operations": 3188964,
+      "warmup_operations": 318896
+    },
+    "F": {
+      "measured_operations": 6078222,
+      "warmup_operations": 607822
+    }
+  }
+}

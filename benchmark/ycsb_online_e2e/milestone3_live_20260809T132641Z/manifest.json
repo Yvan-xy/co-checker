@@ -1,0 +1,35 @@
+{
+  "format_version": 1,
+  "created_at_utc": "2026-08-09T13:26:41Z",
+  "purpose": "Milestone 3 live SQL-helper schema, empty-table, capability-gate, and page-size-invariant digest validation",
+  "tidb_repository_head": "a570cb08e95e5fd544b669eed508c54255b2d7ac",
+  "tidb_server_provenance": "pre-existing TiDB development binary; used only for SQL-helper qualification, not benchmark measurement",
+  "tidb_server_sha256": "41b97fd94802cda8a40082782421662c3dd1f2249daac15743492ab699229c06",
+  "tidb_sql_source_sha256": "6a7f7a29bfbfee63610a8c7e555dd16e684f7e61ddc55f30c1efce71e564eb23",
+  "tidb_sql_test_sha256": "4e05f5f662b302b348912ba808f10b5dd44c1fe91ea6e22bd6b8c2854897b23d",
+  "tidb_sql_binary_sha256": "b45d7f0014728f61cc1b3be20dd34ff6c2cfdab6e150f75c2a0a31a3d9f3832f",
+  "dsn_parameters": "transaction_isolation=%27REPEATABLE-READ%27&tidb_txn_mode=%27OPTIMISTIC%27&tidb_enable_async_commit=0&tidb_enable_1pc=0&tidb_low_resolution_tso=0&tidb_store_batch_size=0&tidb_allow_batch_cop=0&tidb_index_lookup_pushdown_policy=%27FORCE%27",
+  "schema": {
+    "database": "ycsb",
+    "field_count": 10,
+    "field_length": 100,
+    "coprocessor_cache_capacity_mb": 0
+  },
+  "profile_sha256": {
+    "workloada.properties": "cb93645ebed3d3cece1133a5874e0741602b2325e190b0eb3af9d0b7bd483a60",
+    "workloadb.properties": "3e63b17a5941cc60e835d5cd0ed43d604d280ecd5fb52abfd264c7e0583c2bdb",
+    "workloadc.properties": "991e1bb805e85e65d9840a6310e93bd33323640a9d7d4ea1db76f3d1b92990e4",
+    "workloadd.properties": "fa1d0bb1956fe30e60c14d10d23375e021cb4a1e0afdd0342f4b35cb22755cfe",
+    "workloade.properties": "4d5927eb0e4c45cdafbbbe50e628a0dcc6b948efdc3f79071f30a069ea4174ca",
+    "workloadf.properties": "0d89a4c2e8bc741c0bc36815a34380198d365973851d124c05a3b08f205ec663"
+  },
+  "validation": {
+    "unit_test": "go test -count=1 tidb_sql.go tidb_sql_test.go: pass",
+    "schema": "pass",
+    "empty_table": "pass",
+    "gate": "pass: 12 text/prepared plans and 12 actual text/prepared probes",
+    "digest": "pass: identical schema/data/combined SHA-256 at page sizes 1 and 2",
+    "row_count": 1,
+    "database_digest_sha256": "7d33ec8de832ec72891bfbede2925148d6d7156c4de131590f18debb47707609"
+  }
+}

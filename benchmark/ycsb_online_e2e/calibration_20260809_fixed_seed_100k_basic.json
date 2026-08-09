@@ -1,0 +1,52 @@
+{
+  "capacity_decision": {
+    "capture_capacity_bytes": 2147483648,
+    "queue_capacity_bytes": 1073741824,
+    "retained_state_capacity_bytes": 12884901888
+  },
+  "cpu_sets": {
+    "client": "8-15",
+    "tidb": "0-7"
+  },
+  "field_count": 10,
+  "field_length": 100,
+  "format_version": 1,
+  "mode_rotation": "trial-index-left-rotation-v1",
+  "profile_id": "co-checker-ycsb-core-v1",
+  "purpose": "basic baseline-versus-full overhead estimate with approximately 60 seconds of pristine measured work per workload",
+  "record_count": 100000,
+  "seed_policy": "fixed-v1",
+  "seeds": {
+    "load": 7732542672685676034,
+    "measured": 1251957853004150076,
+    "warmup": 6300581044758642952
+  },
+  "threads": 16,
+  "tidb_retry_limit": 100,
+  "workloads": {
+    "A": {
+      "measured_operations": 723177,
+      "warmup_operations": 72318
+    },
+    "B": {
+      "measured_operations": 548263,
+      "warmup_operations": 54826
+    },
+    "C": {
+      "measured_operations": 1144340,
+      "warmup_operations": 114434
+    },
+    "D": {
+      "measured_operations": 1109402,
+      "warmup_operations": 110940
+    },
+    "E": {
+      "measured_operations": 318896,
+      "warmup_operations": 31890
+    },
+    "F": {
+      "measured_operations": 607822,
+      "warmup_operations": 60782
+    }
+  }
+}

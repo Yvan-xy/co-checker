@@ -1,0 +1,119 @@
+{
+  "capacity_decision": {
+    "capture_capacity_bytes": 2147483648,
+    "headroom_fraction": 0.3,
+    "host_available_memory_bytes": 56461070336,
+    "queue_capacity_bytes": 1073741824,
+    "retained_state_capacity_bytes": 12884901888,
+    "rationale": "The A-F serialized-full smoke and 16-thread retry pilot are proportional capacity pilots. Their largest capture buffer was 4055208 bytes and largest queue occupancy was 100320 bytes. Conservative retained-state projection uses 1145 bytes per initial row or successful write plus 30% headroom. The largest 500000-row projection is Workload A at 6664720049 bytes. The selected 12 GiB retained-state cap is 1.93x that projection; total configured checker capacity plus the runner's 8 GiB host headroom is 23 GiB, below 52.6 GiB available memory at calibration time.",
+    "runner_required_headroom_bytes": 8589934592
+  },
+  "cpu_sets": {
+    "client": "8-15",
+    "tidb": "0-7"
+  },
+  "field_count": 10,
+  "field_length": 100,
+  "format_version": 1,
+  "mode_rotation": "trial-index-left-rotation-v1",
+  "profile_id": "co-checker-ycsb-core-v1",
+  "record_count": 500000,
+  "retry_qualification_pilot": {
+    "artifact_manifest_sha256": "545b229cdce187633da2013df49d47f07c621877b182edc4240cdfb2b233de5e",
+    "experiment_sha256": "595526e74554b4cc2eb24d2cbebf7ebc79f9d32c69e7c431d90d5f8b2298d3b5",
+    "full_mode_outcome": "pass",
+    "invalid_attempts": 0,
+    "measured_attempts_aborted": {
+      "serialized-capture-only": 43082,
+      "serialized-full": 43278,
+      "serialized-order-only": 42438
+    },
+    "measured_operations": 2000000,
+    "record_count": 100000,
+    "result_root": "/home/dyf/code/db-consistency/ycsb-online-results/milestone7_retry_pilot_20260809T160000Z",
+    "sha256": {
+      "build-artifacts.json": "545b229cdce187633da2013df49d47f07c621877b182edc4240cdfb2b233de5e",
+      "experiment.json": "3673c2cab376ece8ae80dc41ef4a8b6695ad8db42913fdaac1000244fc87d983",
+      "ycsb-performance.csv": "41032830ee30807df7819bceac63e4dbea504dd918ddcfec07cda196bef4a845",
+      "ycsb-report.md": "eebb42cddae72d673ccebe4356ad5f4db6a7509b5029865b07f7bc8745737880",
+      "ycsb-summary.json": "5736545b394d6ec4bc56faa98f8aede7b7647c00994777f5aae81c70b5f901c9",
+      "ycsb-trials.csv": "a9903bab3ef4d554fd508371858a90b23a1eebeeab20689682a8799ec09dccf9"
+    },
+    "threads": 16,
+    "tidb_retry_limit": 100,
+    "warmup_operations": 200000
+  },
+  "seed_bases": {
+    "load": 2026080901,
+    "measured": 2026080903,
+    "warmup": 2026080902
+  },
+  "seed_derivation": "splitmix64-v1",
+  "storage_decision": {
+    "attempt_count": 120,
+    "estimated_final_result_root_bytes": 429000000000,
+    "estimated_remaining_bytes": 58145635840,
+    "host_available_storage_bytes": 487145635840,
+    "initial_row_bytes_per_store": 1600,
+    "per_attempt_log_allowance_bytes": 250000000,
+    "per_store_fixed_overhead_bytes": 315000000,
+    "rationale": "Required failed, smoke, and retry-pilot evidence is preserved. Observed fresh-store sizes imply that one million rows plus 120 retained attempt stores and logs would exceed current free space. The 500000-row matrix, including references, automatic smoke, artifacts, 120 per-attempt log allowances, and 1476 bytes per successful write, projects to 429 GB and leaves about 58 GB decimal reserve.",
+    "successful_write_bytes_per_store": 1476
+  },
+  "threads": 16,
+  "tidb_retry_limit": 100,
+  "workloads": {
+    "A": {
+      "calibration_baseline_ops_per_second": 12052.948516049777,
+      "measured_operations": 7231770,
+      "projected_retained_state_bytes_with_headroom": 6664720049,
+      "warmup_operations": 723177
+    },
+    "B": {
+      "calibration_baseline_ops_per_second": 9137.708437857105,
+      "measured_operations": 5482626,
+      "projected_retained_state_bytes_with_headroom": 1193099733,
+      "warmup_operations": 548263
+    },
+    "C": {
+      "calibration_baseline_ops_per_second": 19072.327738635737,
+      "measured_operations": 11443398,
+      "projected_retained_state_bytes_with_headroom": 744250000,
+      "warmup_operations": 1144340
+    },
+    "D": {
+      "calibration_baseline_ops_per_second": 18490.032603086198,
+      "measured_operations": 11094018,
+      "projected_retained_state_bytes_with_headroom": 1652489534,
+      "warmup_operations": 1109402
+    },
+    "E": {
+      "calibration_baseline_ops_per_second": 5314.94156623026,
+      "measured_operations": 3188964,
+      "projected_retained_state_bytes_with_headroom": 1005322481,
+      "warmup_operations": 318896
+    },
+    "F": {
+      "calibration_baseline_ops_per_second": 10130.366757812548,
+      "measured_operations": 6078222,
+      "projected_retained_state_bytes_with_headroom": 5720338247,
+      "warmup_operations": 607822
+    }
+  },
+  "workload_derivation": {
+    "description": "Retain the positive fixed operation counts derived by rounding the A-F pristine smoke rates times 60 seconds for warm-up and 600 seconds for measurement. The storage-capacity fallback changes only initial rows from 1000000 to 500000; projected 16-thread pristine intervals remain at least 180 seconds. Retained-state projection counts one unit per initial row plus the configured write fraction of all warm-up and measured operations, multiplies by 1145 bytes per unit, then adds 30% headroom.",
+    "measured_target_seconds": 600,
+    "minimum_publishable_pristine_seconds": 180,
+    "operation_rounding": "nearest integer",
+    "retained_state_bytes_per_unit": 1145,
+    "warmup_target_seconds": 60,
+    "write_fractions": {
+      "A": 0.5,
+      "B": 0.05,
+      "C": 0.0,
+      "D": 0.05,
+      "E": 0.05,
+      "F": 0.5
+    }
+  }
+}

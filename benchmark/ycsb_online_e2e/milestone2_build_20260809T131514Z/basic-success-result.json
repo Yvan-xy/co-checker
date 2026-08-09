@@ -1,0 +1,36 @@
+{
+  "format_version": "go-ycsb-online-result-v1",
+  "client_identity": "go-ycsb-v1.0.3-online-checker-v1",
+  "base_commit": "f030f9942393a8febbf4365c2d582711723159f5",
+  "patch_identity": "co-checker-go-ycsb-online-v1",
+  "command": "run",
+  "master_seed": 12345,
+  "seed_derivation": "splitmix64-v1",
+  "properties_sha256": "27a89a3ede6ecc9ae7182d26139fa21b7e047e842b6dfadf71cefdf8a2f4aad0",
+  "requested": 5,
+  "attempted": 5,
+  "successful": 5,
+  "failed": 0,
+  "started_unix_ns": 1786281226292606545,
+  "ended_unix_ns": 1786281226293052995,
+  "monotonic_start_ns": 0,
+  "monotonic_end_ns": 446450,
+  "elapsed_ns": 446450,
+  "error_classes": {},
+  "measurements": {
+    "READ": {
+      "count": 5,
+      "p50_us": 0,
+      "p95_us": 0,
+      "p99_us": 0,
+      "p99_9_us": 0
+    },
+    "TOTAL": {
+      "count": 5,
+      "p50_us": 0,
+      "p95_us": 0,
+      "p99_us": 0,
+      "p99_9_us": 0
+    }
+  }
+}

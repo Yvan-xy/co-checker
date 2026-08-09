@@ -1,0 +1,58 @@
+{
+  "format_version": "co-checker-ycsb-build-artifacts-v1",
+  "created_utc": "2026-08-09T13:15:14Z",
+  "base": {
+    "tag": "v1.0.3",
+    "commit": "f030f9942393a8febbf4365c2d582711723159f5",
+    "source_path": "/tmp/co-checker-ycsb.ByiN9v/go-ycsb",
+    "tracked_tree_clean": true
+  },
+  "patch": {
+    "path": "/home/dyf/code/db-consistency/co-checker/online/tools/go_ycsb_v1.0.3_online_checker.patch",
+    "sha256": "5c42eec49f1561e1a9e6db0430bcfaa50cac92eea692a8e5511d573e491f6c83"
+  },
+  "binary": {
+    "path": "/home/dyf/code/db-consistency/co-checker/benchmark/ycsb_online_e2e/milestone2_build_20260809T131514Z/go-ycsb-online",
+    "sha256": "cb9b81e33a2e713f75b9c00339f9f7e8a6bba290bede672a04d36a030ce7f30f",
+    "build_command": "go build -trimpath -o go-ycsb-online ./cmd/go-ycsb",
+    "reproducible_second_build_sha256": "cb9b81e33a2e713f75b9c00339f9f7e8a6bba290bede672a04d36a030ce7f30f"
+  },
+  "go_version_m": {
+    "path": "/home/dyf/code/db-consistency/co-checker/benchmark/ycsb_online_e2e/milestone2_build_20260809T131514Z/go-version-m.txt",
+    "sha256": "7a170342cc71678efa072d19eabb089cd6c9c8afd2de5c9059dc043c767770c0"
+  },
+  "build_environment": {
+    "kernel": "Linux 6.8.0-137-generic x86_64 GNU/Linux",
+    "goos": "linux",
+    "goarch": "amd64",
+    "goversion": "go1.22.2",
+    "cgo_enabled": "1",
+    "goamd64": "v1"
+  },
+  "validation": [
+    {
+      "command": "go test ./pkg/client ./pkg/generator ./pkg/workload ./db/mysql ./cmd/go-ycsb",
+      "outcome": "pass"
+    },
+    {
+      "command": "go test -race ./pkg/client ./pkg/workload ./db/mysql",
+      "outcome": "pass"
+    },
+    {
+      "command": "go vet ./pkg/client ./pkg/generator ./pkg/workload ./db/mysql ./cmd/go-ycsb",
+      "outcome": "pass"
+    },
+    {
+      "command": "go-ycsb-online run basic ... strict=true randomseed=12345 operationcount=5",
+      "outcome": "pass; requested=attempted=successful=5, failed=0",
+      "result_path": "/home/dyf/code/db-consistency/co-checker/benchmark/ycsb_online_e2e/milestone2_build_20260809T131514Z/basic-success-result.json",
+      "result_sha256": "7512dbaefc7088a5a98656a5baa509c3a9f8667bb246fa3f132676c0f7375280"
+    },
+    {
+      "command": "go-ycsb-online run definitely-unregistered-db ... strict=true operationcount=3",
+      "outcome": "expected exit 1; requested=failed=3, attempted=successful=0",
+      "result_path": "/home/dyf/code/db-consistency/co-checker/benchmark/ycsb_online_e2e/milestone2_build_20260809T131514Z/expected-failure-result.json",
+      "result_sha256": "7b621cdd57c95aeb16462410b1a9c905087a744ad742c5333542048b4a5a7a3c"
+    }
+  ]
+}

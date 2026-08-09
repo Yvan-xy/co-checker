@@ -1,0 +1,8 @@
+{
+  "format_version": 1,
+  "database": "ycsb",
+  "table": "usertable",
+  "field_count": 10,
+  "field_length": 100,
+  "outcome": "pass"
+}

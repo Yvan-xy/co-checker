@@ -1,0 +1,112 @@
+{
+  "capacity_decision": {
+    "capture_capacity_bytes": 2147483648,
+    "headroom_fraction": 0.3,
+    "host_available_memory_bytes": 57470345216,
+    "host_available_storage_bytes": 537348190208,
+    "host_logical_cpus": 16,
+    "queue_capacity_bytes": 1073741824,
+    "retained_state_capacity_bytes": 12884901888,
+    "rationale": "The A-F serialized-full smoke is the proportional capacity pilot. Its largest capture buffer was 4055208 bytes, largest queue occupancy was 86184 bytes, and conservative retained-state projection uses 1145 bytes per initial row or successful write plus 30% headroom. The largest projection is Workload A at 7408970049 bytes. The selected 12 GiB retained-state cap is 1.74x that projection; total configured checker capacity plus the runner's 8 GiB host headroom is 23 GiB, below 53.5 GiB available memory at calibration time.",
+    "runner_required_headroom_bytes": 8589934592
+  },
+  "cpu_sets": {
+    "client": "8-15",
+    "tidb": "0-7"
+  },
+  "field_count": 10,
+  "field_length": 100,
+  "format_version": 1,
+  "mode_rotation": "trial-index-left-rotation-v1",
+  "pilot": {
+    "artifact_manifest_sha256": "66c8ddefffb6e8fc1789832c81157ed12d51341f0d678b5a426f2e8ed445c7ae",
+    "capture_peak_bytes_maximum": 4055208,
+    "experiment_sha256": "d8f9fdd3b75eebc7ba5e91fc3858cf6c47508a13475d9e4d913d4f820d5fa2a8",
+    "full_mode_verdicts": {
+      "A": "pass",
+      "B": "pass",
+      "C": "pass",
+      "D": "pass",
+      "E": "pass",
+      "F": "pass"
+    },
+    "invalid_attempts": 0,
+    "measured_operations": 10000,
+    "queue_peak_bytes_maximum": 86184,
+    "record_count": 10000,
+    "result_root": "/home/dyf/code/db-consistency/ycsb-online-results/milestone7_smoke_20260809T144500Z",
+    "sha256": {
+      "build-artifacts.json": "66c8ddefffb6e8fc1789832c81157ed12d51341f0d678b5a426f2e8ed445c7ae",
+      "experiment.json": "9b482c451e240978faaad6aa3a5af5ceccda34e623f16d983c961e865d0e5a1d",
+      "ycsb-performance.csv": "74a0d061e1a50a8879c21a24b96972adf5b1ec801b950d563283a3b3d3d9b7fb",
+      "ycsb-report.md": "1913ae5835196999520481357e4529a4bf44c21b1c4ade7114fe5a38b07d5fbe",
+      "ycsb-summary.json": "25d3fd2196841d83a4aeadb3f0de42f868bb90e0569abbfdaf67315b62a5536d",
+      "ycsb-trials.csv": "95f6abed9511697711fd77efefd544899c8cbfc196ad17b29e26f2d9a3d1644f"
+    },
+    "threads": 4,
+    "warmup_operations": 2000
+  },
+  "profile_id": "co-checker-ycsb-core-v1",
+  "record_count": 1000000,
+  "seed_bases": {
+    "load": 2026080901,
+    "measured": 2026080903,
+    "warmup": 2026080902
+  },
+  "seed_derivation": "splitmix64-v1",
+  "threads": 16,
+  "tidb_retry_limit": 100,
+  "workloads": {
+    "A": {
+      "calibration_baseline_ops_per_second": 12052.948516049777,
+      "measured_operations": 7231770,
+      "projected_retained_state_bytes_with_headroom": 7408970049,
+      "warmup_operations": 723177
+    },
+    "B": {
+      "calibration_baseline_ops_per_second": 9137.708437857105,
+      "measured_operations": 5482626,
+      "projected_retained_state_bytes_with_headroom": 1937349733,
+      "warmup_operations": 548263
+    },
+    "C": {
+      "calibration_baseline_ops_per_second": 19072.327738635737,
+      "measured_operations": 11443398,
+      "projected_retained_state_bytes_with_headroom": 1488500000,
+      "warmup_operations": 1144340
+    },
+    "D": {
+      "calibration_baseline_ops_per_second": 18490.032603086198,
+      "measured_operations": 11094018,
+      "projected_retained_state_bytes_with_headroom": 2396739534,
+      "warmup_operations": 1109402
+    },
+    "E": {
+      "calibration_baseline_ops_per_second": 5314.94156623026,
+      "measured_operations": 3188964,
+      "projected_retained_state_bytes_with_headroom": 1749572481,
+      "warmup_operations": 318896
+    },
+    "F": {
+      "calibration_baseline_ops_per_second": 10130.366757812548,
+      "measured_operations": 6078222,
+      "projected_retained_state_bytes_with_headroom": 6464588247,
+      "warmup_operations": 607822
+    }
+  },
+  "workload_derivation": {
+    "description": "Round the smoke baseline-original fixed throughput times 60 seconds for warm-up and 600 seconds for measurement. Retained-state projection counts one unit per initial row plus the configured write fraction of all warm-up and measured operations, multiplies by the pilot's conservative 1145 bytes per unit, then adds 30% headroom.",
+    "measured_target_seconds": 600,
+    "operation_rounding": "nearest integer",
+    "retained_state_bytes_per_unit": 1145,
+    "warmup_target_seconds": 60,
+    "write_fractions": {
+      "A": 0.5,
+      "B": 0.05,
+      "C": 0.0,
+      "D": 0.05,
+      "E": 0.05,
+      "F": 0.5
+    }
+  }
+}
