@@ -1,0 +1,209 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1120" viewBox="0 0 1600 1120" role="img" aria-labelledby="title desc">
+  <title id="title">Sound online SOWW checking with a synchronized TSO frontier</title>
+  <desc id="desc">Three-lane workflow showing TiDB transaction capture, periodic frontier advancement, commit-order release, concurrent SOWW checking, safety invariants, and graceful shutdown.</desc>
+  <defs>
+    <filter id="shadow" x="-15%" y="-20%" width="130%" height="150%">
+      <feDropShadow dx="0" dy="3" stdDeviation="5" flood-color="#183153" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#2463a9"/>
+    </marker>
+    <marker id="arrow-gold" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#bd7611"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#26845b"/>
+    </marker>
+    <marker id="arrow-red" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#b84343"/>
+    </marker>
+    <style>
+      .title { font-family: Arial, sans-serif; font-size: 32px; font-weight: 700; fill: #17263c; }
+      .subtitle { font-family: Arial, sans-serif; font-size: 17px; font-weight: 400; fill: #52647d; }
+      .lane-title { font-family: Arial, sans-serif; font-size: 19px; font-weight: 700; fill: #20334d; }
+      .lane-note { font-family: Arial, sans-serif; font-size: 14px; font-weight: 400; fill: #667890; }
+      .box-title { font-family: Arial, sans-serif; font-size: 16px; font-weight: 700; fill: #17263c; text-anchor: middle; }
+      .box-text { font-family: Arial, sans-serif; font-size: 14px; font-weight: 400; fill: #314762; text-anchor: middle; }
+      .small { font-family: Arial, sans-serif; font-size: 13px; font-weight: 600; fill: #52647d; }
+      .tiny { font-family: Arial, sans-serif; font-size: 12px; font-weight: 400; fill: #63758d; }
+      .condition { font-family: "DejaVu Sans Mono"; font-size: 15px; font-weight: 600; fill: #185c41; text-anchor: middle; }
+      .arrow-label { font-family: Arial, sans-serif; font-size: 12px; font-weight: 600; fill: #52647d; }
+      .safety-title { font-family: Arial, sans-serif; font-size: 14px; font-weight: 700; fill: #7d2d2d; }
+      .safety-text { font-family: Arial, sans-serif; font-size: 13px; font-weight: 400; fill: #4d5f75; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1120" fill="#f5f8fc"/>
+  <text id="diagram-title" class="title" x="56" y="52">Sound online SOWW checking with a synchronized TSO frontier</text>
+  <text class="subtitle" x="56" y="83">TSO supplies authoritative transaction order; registrations and delivery cutoffs prove when a prefix is complete.</text>
+
+  <!-- Lane backgrounds -->
+  <rect x="40" y="112" width="1520" height="225" rx="18" fill="#eaf3fe" stroke="#c7dcf5"/>
+  <rect x="40" y="360" width="1520" height="220" rx="18" fill="#fff6df" stroke="#f0d89e"/>
+  <rect x="40" y="603" width="1520" height="250" rx="18" fill="#eaf8f1" stroke="#bfe4d1"/>
+
+  <text class="lane-title" x="65" y="148">A. TiDB transaction path</text>
+  <text class="lane-note" x="65" y="171">Synchronous, lossless evidence production</text>
+
+  <!-- Transaction path boxes -->
+  <g filter="url(#shadow)">
+    <rect x="205" y="190" width="190" height="98" rx="12" fill="#ffffff" stroke="#7caee3" stroke-width="2"/>
+    <rect x="425" y="190" width="170" height="98" rx="12" fill="#ffffff" stroke="#7caee3" stroke-width="2"/>
+    <rect x="625" y="190" width="205" height="98" rx="12" fill="#ffffff" stroke="#7caee3" stroke-width="2"/>
+    <rect x="860" y="190" width="180" height="98" rx="12" fill="#ffffff" stroke="#7caee3" stroke-width="2"/>
+    <rect x="1070" y="190" width="205" height="98" rx="12" fill="#ffffff" stroke="#7caee3" stroke-width="2"/>
+    <rect x="1305" y="190" width="205" height="98" rx="12" fill="#ffffff" stroke="#7caee3" stroke-width="2"/>
+  </g>
+
+  <text class="box-title" x="300" y="218">1  Reserve lease</text>
+  <text class="box-text" x="300" y="242"><tspan x="300">pending, unregistered</tspan><tspan x="300" dy="19">transaction start</tspan></text>
+
+  <text class="box-title" x="510" y="218">2  Request TSO</text>
+  <text class="box-text" x="510" y="246"><tspan x="510">receive global</tspan><tspan x="510" dy="19">start_ts = S</tspan></text>
+
+  <text class="box-title" x="727" y="215">3  Register active S</text>
+  <text class="box-text" x="727" y="240"><tspan x="727">native acknowledgment,</tspan><tspan x="727" dy="19">then release lease</tspan></text>
+
+  <text class="box-title" x="950" y="218">4  Capture evidence</text>
+  <text class="box-text" x="950" y="246"><tspan x="950">exact reads, writes,</tspan><tspan x="950" dy="19">retries and aborts</tspan></text>
+
+  <text class="box-title" x="1172" y="215">5  Complete attempt</text>
+  <text class="box-text" x="1172" y="239"><tspan x="1172">write token = commit_ts</tspan><tspan x="1172" dy="18">read-only token = S</tspan><tspan x="1172" dy="18">abort = no batch</tspan></text>
+
+  <text class="box-title" x="1407" y="215">6  Publish batch</text>
+  <text class="box-text" x="1407" y="240"><tspan x="1407">pack + ProducerSeq;</tspan><tspan x="1407" dy="19">lossless bounded queue</tspan></text>
+
+  <!-- Transaction arrows -->
+  <path d="M395 239 H425" stroke="#2463a9" stroke-width="3" fill="none" marker-end="url(#arrow-blue)"/>
+  <path d="M595 239 H625" stroke="#2463a9" stroke-width="3" fill="none" marker-end="url(#arrow-blue)"/>
+  <path d="M830 239 H860" stroke="#2463a9" stroke-width="3" fill="none" marker-end="url(#arrow-blue)"/>
+  <path d="M1040 239 H1070" stroke="#2463a9" stroke-width="3" fill="none" marker-end="url(#arrow-blue)"/>
+  <path d="M1275 239 H1305" stroke="#2463a9" stroke-width="3" fill="none" marker-end="url(#arrow-blue)"/>
+
+  <!-- Frontier lane -->
+  <text class="lane-title" x="65" y="397">B. Periodic frontier coordinator</text>
+  <text class="lane-note" x="65" y="420">Runs concurrently; never guesses from arrival order or maximum observed timestamp</text>
+
+  <g filter="url(#shadow)">
+    <rect x="205" y="447" width="130" height="72" rx="12" fill="#ffffff" stroke="#d6a344" stroke-width="2"/>
+    <rect x="370" y="447" width="180" height="72" rx="12" fill="#ffffff" stroke="#d6a344" stroke-width="2"/>
+    <polygon points="665,432 755,483 665,534 575,483" fill="#ffffff" stroke="#d6a344" stroke-width="2"/>
+    <rect x="790" y="447" width="175" height="72" rx="12" fill="#ffffff" stroke="#d6a344" stroke-width="2"/>
+    <rect x="1000" y="435" width="230" height="96" rx="12" fill="#ffffff" stroke="#d6a344" stroke-width="2"/>
+    <rect x="1270" y="447" width="240" height="72" rx="12" fill="#fffdf7" stroke="#d6a344" stroke-width="2"/>
+    <rect x="590" y="375" width="150" height="42" rx="10" fill="#fffaf0" stroke="#d6a344" stroke-dasharray="5 4"/>
+  </g>
+
+  <text class="box-title" x="270" y="476">Timer tick</text>
+  <text class="box-text" x="270" y="497">for example, 10 ms</text>
+
+  <text class="box-title" x="460" y="474">Exclusive barrier</text>
+  <text class="box-text" x="460" y="497">blocks new lease creation</text>
+
+  <text class="box-title" x="665" y="473"><tspan x="665">pending lease</tspan><tspan x="665" dy="19">count = 0?</tspan></text>
+
+  <text class="box-title" x="877" y="474">Fresh global TSO</text>
+  <text class="box-text" x="877" y="497">allocate fence F</text>
+
+  <text class="box-title" x="1115" y="461">Publish acknowledged frontiers</text>
+  <text class="box-text" x="1115" y="484"><tspan x="1115">database frontier = F</tspan><tspan x="1115" dy="19">producer frontier = F</tspan><tspan x="1115" dy="19">+ delivered sequence cutoff</tspan></text>
+
+  <text class="box-title" x="1390" y="474">Effective frontier W</text>
+  <text class="box-text" x="1390" y="497">min(DB, every producer)</text>
+
+  <text class="small" x="665" y="402" text-anchor="middle">No: skip this tick safely</text>
+
+  <path d="M335 483 H370" stroke="#bd7611" stroke-width="3" fill="none" marker-end="url(#arrow-gold)"/>
+  <path d="M550 483 H575" stroke="#bd7611" stroke-width="3" fill="none" marker-end="url(#arrow-gold)"/>
+  <path d="M755 483 H790" stroke="#bd7611" stroke-width="3" fill="none" marker-end="url(#arrow-gold)"/>
+  <text class="arrow-label" x="767" y="469">Yes</text>
+  <path d="M665 432 V417" stroke="#bd7611" stroke-width="2.5" fill="none" marker-end="url(#arrow-gold)"/>
+  <text class="arrow-label" x="676" y="428">No</text>
+  <path d="M965 483 H1000" stroke="#bd7611" stroke-width="3" fill="none" marker-end="url(#arrow-gold)"/>
+  <path d="M1230 483 H1270" stroke="#bd7611" stroke-width="3" fill="none" marker-end="url(#arrow-gold)"/>
+
+  <!-- Shared start-coordinator relationship -->
+  <path d="M300 288 V347 H460 V447" stroke="#9b6b20" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+  <path d="M727 288 V330 H500 V447" stroke="#9b6b20" stroke-width="2" fill="none" stroke-dasharray="7 6"/>
+  <text class="tiny" x="518" y="342">same start-coordinator lock</text>
+
+  <!-- Checker lane -->
+  <text class="lane-title" x="65" y="640">C. Commit-order gate and online SOWW consumer</text>
+  <text class="lane-note" x="65" y="663">Continuously drains every proven-complete prefix while TiDB keeps serving transactions</text>
+
+  <g filter="url(#shadow)">
+    <rect x="205" y="704" width="230" height="102" rx="12" fill="#ffffff" stroke="#59aa83" stroke-width="2"/>
+    <rect x="485" y="687" width="330" height="136" rx="12" fill="#ffffff" stroke="#59aa83" stroke-width="2"/>
+    <rect x="865" y="704" width="180" height="102" rx="12" fill="#ffffff" stroke="#59aa83" stroke-width="2"/>
+    <rect x="1095" y="691" width="225" height="128" rx="12" fill="#ffffff" stroke="#8a70c7" stroke-width="2"/>
+    <rect x="1370" y="704" width="140" height="102" rx="12" fill="#ffffff" stroke="#8a70c7" stroke-width="2"/>
+  </g>
+
+  <text class="box-title" x="320" y="734">Reorder min-heap</text>
+  <text class="box-text" x="320" y="759"><tspan x="320">keyed by authoritative</tspan><tspan x="320" dy="19">commit-order token</tspan></text>
+  <text class="tiny" x="320" y="793" text-anchor="middle">arrival order has no meaning</text>
+
+  <text class="box-title" x="650" y="713">Release only when all conditions hold</text>
+  <text class="condition" x="650" y="744">token ≤ W</text>
+  <text class="condition" x="650" y="770">token &lt; min(active start_ts)</text>
+  <text class="condition" x="650" y="796">ProducerSeq ≤ delivered cutoff</text>
+
+  <text class="box-title" x="955" y="735">Assign CommitSeq</text>
+  <text class="box-text" x="955" y="760"><tspan x="955">dense 1, 2, 3, …</tspan><tspan x="955" dy="19">only after closure</tspan></text>
+
+  <text class="box-title" x="1207" y="722">SOWW engine</text>
+  <text class="box-text" x="1207" y="748"><tspan x="1207">repeated-read checks</tspan><tspan x="1207" dy="19">apply writes + history</tspan><tspan x="1207" dy="19">retained exact state</tspan></text>
+  <text class="small" x="1207" y="804" text-anchor="middle">runs during the workload</text>
+
+  <text class="box-title" x="1440" y="739">Verdict</text>
+  <text class="box-text" x="1440" y="766"><tspan x="1440">Pass / violation /</tspan><tspan x="1440" dy="19">unavailable</tspan></text>
+
+  <path d="M435 755 H485" stroke="#26845b" stroke-width="3" fill="none" marker-end="url(#arrow-green)"/>
+  <path d="M815 755 H865" stroke="#26845b" stroke-width="3" fill="none" marker-end="url(#arrow-green)"/>
+  <path d="M1045 755 H1095" stroke="#26845b" stroke-width="3" fill="none" marker-end="url(#arrow-green)"/>
+  <path d="M1320 755 H1370" stroke="#26845b" stroke-width="3" fill="none" marker-end="url(#arrow-green)"/>
+
+  <!-- Data and control paths into the gate -->
+  <path d="M1407 288 V621 H320 V704" stroke="#2463a9" stroke-width="3" fill="none" marker-end="url(#arrow-blue)"/>
+  <text class="arrow-label" x="1220" y="616">committed batch + ProducerSeq</text>
+  <path d="M1390 519 V603 H760 V687" stroke="#bd7611" stroke-width="3" fill="none" marker-end="url(#arrow-gold)"/>
+  <text class="arrow-label" x="1070" y="597">frontier W + delivery cutoff</text>
+  <path d="M727 288 V603 H570 V687" stroke="#b84343" stroke-width="2.5" fill="none" stroke-dasharray="7 5" marker-end="url(#arrow-red)"/>
+  <text class="arrow-label" x="738" y="570">active start guard remains until batch insertion or abort</text>
+
+  <!-- Safety invariants -->
+  <rect x="40" y="875" width="1520" height="123" rx="18" fill="#fff1f1" stroke="#e6b7b7"/>
+  <text class="lane-title" x="65" y="907" fill="#7d2d2d">Safety invariants at a successful fence F</text>
+
+  <g>
+    <circle cx="92" cy="948" r="17" fill="#c74e4e"/><text x="92" y="954" text-anchor="middle" font-family="Arial" font-size="14" font-weight="700" fill="#fff">1</text>
+    <text class="safety-title" x="120" y="940">New starts are after F</text>
+    <text class="safety-text" x="120" y="961"><tspan x="120">Lease creation was blocked while F</tspan><tspan x="120" dy="17">was allocated and published.</tspan></text>
+
+    <circle cx="470" cy="948" r="17" fill="#c74e4e"/><text x="470" y="954" text-anchor="middle" font-family="Arial" font-size="14" font-weight="700" fill="#fff">2</text>
+    <text class="safety-title" x="498" y="940">Older starts are registered</text>
+    <text class="safety-text" x="498" y="961"><tspan x="498">They conservatively block release until</tspan><tspan x="498" dy="17">commit publication or abort.</tspan></text>
+
+    <circle cx="870" cy="948" r="17" fill="#c74e4e"/><text x="870" y="954" text-anchor="middle" font-family="Arial" font-size="14" font-weight="700" fill="#fff">3</text>
+    <text class="safety-title" x="898" y="940">Delivery is acknowledged</text>
+    <text class="safety-text" x="898" y="961"><tspan x="898">Producer cutoff cannot overtake a batch</tspan><tspan x="898" dy="17">still packing, queueing, or publishing.</tspan></text>
+
+    <circle cx="1260" cy="948" r="17" fill="#c74e4e"/><text x="1260" y="954" text-anchor="middle" font-family="Arial" font-size="14" font-weight="700" fill="#fff">4</text>
+    <text class="safety-title" x="1288" y="940">Missing evidence never passes</text>
+    <text class="safety-text" x="1288" y="961"><tspan x="1288">A timeout, loss, or unsupported path</tspan><tspan x="1288" dy="17">makes the verdict unavailable.</tspan></text>
+  </g>
+
+  <!-- Shutdown strip -->
+  <rect x="40" y="1020" width="1520" height="70" rx="16" fill="#edf0f6" stroke="#cbd3df"/>
+  <text class="lane-title" x="65" y="1051">Graceful shutdown</text>
+  <text class="box-text" x="407" y="1051">Stop admission</text>
+  <text class="box-text" x="655" y="1051">Resolve active starts</text>
+  <text class="box-text" x="930" y="1051">Publish final frontiers</text>
+  <text class="box-text" x="1205" y="1051">Drain a small residual tail</text>
+  <text class="box-text" x="1463" y="1051">Seal verdict</text>
+  <path d="M480 1047 H565" stroke="#687990" stroke-width="2.5" fill="none" marker-end="url(#arrow-blue)"/>
+  <path d="M745 1047 H830" stroke="#687990" stroke-width="2.5" fill="none" marker-end="url(#arrow-blue)"/>
+  <path d="M1025 1047 H1110" stroke="#687990" stroke-width="2.5" fill="none" marker-end="url(#arrow-blue)"/>
+  <path d="M1310 1047 H1385" stroke="#687990" stroke-width="2.5" fill="none" marker-end="url(#arrow-blue)"/>
+  <text class="tiny" x="800" y="1077" text-anchor="middle">A tail that grows with workload duration means checking was deferred, not online.</text>
+</svg>
