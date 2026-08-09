@@ -1,4 +1,4 @@
-./traces/
+/traces/*.png
 bin_traces/
 *.yaml
 build/
@@ -8,3 +8,14 @@ __pycache__/
 *.log
 *.tmp
 *.csv
+!/benchmark/ycsb_online_e2e/*.csv
+
+# Local benchmark runtime state and reproducible binaries. Keep compact
+# manifests, digests, and reports under benchmark/ycsb_online_e2e tracked.
+/benchmark/ycsb_online_e2e/*/store/
+/benchmark/ycsb_online_e2e/*/go-ycsb-online
+/benchmark/ycsb_online_e2e/*/tidb-sql
+/benchmark/ycsb_online_e2e/*/tidb.toml
+
+# Local reference copy; cite the published paper from documentation instead.
+/doc/3797871.pdf
