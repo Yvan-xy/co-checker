@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="844" height="658" viewBox="0 0 844 658" role="img" aria-labelledby="title description">
+  <title id="title">Trace distinguished by co-si-basic and snapshot-so-ww</title>
+  <desc id="description">
+    Session one first writes x equals 0a, then later writes y equals 0b.
+    Session two starts while the second transaction is active, reads x equals
+    0a from the first transaction, writes y equals 0c, and commits after the
+    second transaction. The read-from edge is green and the write-write edge
+    is blue.
+  </desc>
+
+  <rect width="844" height="658" fill="#fff"/>
+
+  <!-- Session timelines. -->
+  <line x1="205" y1="72" x2="205" y2="610" stroke="#111" stroke-width="2"/>
+  <line x1="625" y1="72" x2="625" y2="610" stroke="#111" stroke-width="2"/>
+
+  <!-- T1 in session 1: start=10, commit=20. -->
+  <line x1="170" y1="112" x2="238" y2="112" stroke="#111" stroke-width="2"/>
+  <polygon points="238,112 226,105 226,119" fill="#111"/>
+  <text x="160" y="174" text-anchor="end" font-family="Arial, Helvetica, sans-serif"
+        font-size="23" fill="#111">w(x, 0x0a)</text>
+  <line x1="238" y1="226" x2="170" y2="226" stroke="#111" stroke-width="2"/>
+  <polygon points="170,226 182,219 182,233" fill="#111"/>
+
+  <!-- T2 in session 1: start=30, commit=50. -->
+  <line x1="170" y1="292" x2="238" y2="292" stroke="#111" stroke-width="2"/>
+  <polygon points="238,292 226,285 226,299" fill="#111"/>
+  <text x="160" y="352" text-anchor="end" font-family="Arial, Helvetica, sans-serif"
+        font-size="23" fill="#111">w(y, 0x0b)</text>
+  <line x1="238" y1="492" x2="170" y2="492" stroke="#111" stroke-width="2"/>
+  <polygon points="170,492 182,485 182,499" fill="#111"/>
+
+  <!-- T3 in session 2: start=40, commit=60. -->
+  <line x1="590" y1="390" x2="658" y2="390" stroke="#111" stroke-width="2"/>
+  <polygon points="658,390 646,383 646,397" fill="#111"/>
+  <text x="570" y="438" text-anchor="end" font-family="Arial, Helvetica, sans-serif"
+        font-size="23" fill="#111">r(x, 0x0a)</text>
+  <text x="570" y="478" text-anchor="end" font-family="Arial, Helvetica, sans-serif"
+        font-size="23" fill="#111">w(y, 0x0c)</text>
+  <line x1="658" y1="566" x2="590" y2="566" stroke="#111" stroke-width="2"/>
+  <polygon points="590,566 602,559 602,573" fill="#111"/>
+
+  <!-- Read-from T1 -> T3. -->
+  <path d="M 222 166 C 315 205, 393 322, 472 424"
+        fill="none" stroke="#2f7d21" stroke-width="2.5"/>
+  <polygon points="472,424 460,418 469,411" fill="#2f7d21"/>
+  <text x="360" y="278" font-family="Arial, Helvetica, sans-serif"
+        font-size="22" fill="#2f7d21">RF</text>
+
+  <!-- Write-write T2 -> T3. -->
+  <path d="M 222 344 C 320 350, 390 403, 472 464"
+        fill="none" stroke="#2767a8" stroke-width="2.5"/>
+  <polygon points="472,464 459,461 465,453" fill="#2767a8"/>
+  <text x="370" y="393" font-family="Arial, Helvetica, sans-serif"
+        font-size="22" fill="#2767a8">WW</text>
+</svg>
