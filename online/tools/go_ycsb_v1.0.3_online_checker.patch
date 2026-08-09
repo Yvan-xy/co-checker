@@ -1,0 +1,2469 @@
+diff --git a/cmd/go-ycsb/client.go b/cmd/go-ycsb/client.go
+index 3e4e0e02bc08f9561a346b99b407590075a5b34b..51f3962e370b3e767b4c7b065a2155a2ffc9d439 100644
+--- a/cmd/go-ycsb/client.go
++++ b/cmd/go-ycsb/client.go
+@@ -14,6 +14,7 @@
+ package main
+ 
+ import (
++	"errors"
+ 	"fmt"
+ 	"strconv"
+ 	"time"
+@@ -24,51 +25,95 @@ import (
+ 	"github.com/spf13/cobra"
+ )
+ 
+-func runClientCommandFunc(cmd *cobra.Command, args []string, doTransactions bool, command string) {
+-	dbName := args[0]
++func addResultError(result *client.Result, class string, err error) {
++	if err == nil {
++		return
++	}
++	if result.ErrorClasses == nil {
++		result.ErrorClasses = make(map[string]int64)
++	}
++	result.ErrorClasses[class]++
++	if result.ErrorMessage == "" {
++		result.ErrorMessage = err.Error()
++	}
++}
+ 
+-	initialGlobal(dbName, func() {
++func runClientCommandFunc(cmd *cobra.Command, args []string, doTransactions bool, command string) error {
++	start := time.Now()
++	startUnix := start.UnixNano()
++	dbName := args[0]
++	initializeErr := initialGlobal(dbName, func() error {
+ 		doTransFlag := "true"
+ 		if !doTransactions {
+ 			doTransFlag = "false"
+ 		}
+-		globalProps.Set(prop.DoTransactions, doTransFlag)
+-		globalProps.Set(prop.Command, command)
+-
++		if err := setProperty(prop.DoTransactions, doTransFlag); err != nil {
++			return err
++		}
++		if err := setProperty(prop.Command, command); err != nil {
++			return err
++		}
+ 		if cmd.Flags().Changed("threads") {
+-			// We set the threadArg via command line.
+-			globalProps.Set(prop.ThreadCount, strconv.Itoa(threadsArg))
++			if err := setProperty(prop.ThreadCount, strconv.Itoa(threadsArg)); err != nil {
++				return err
++			}
+ 		}
+-
+ 		if cmd.Flags().Changed("target") {
+-			globalProps.Set(prop.Target, strconv.Itoa(targetArg))
++			if err := setProperty(prop.Target, strconv.Itoa(targetArg)); err != nil {
++				return err
++			}
+ 		}
+-
+ 		if cmd.Flags().Changed("interval") {
+-			globalProps.Set(prop.LogInterval, strconv.Itoa(reportInterval))
++			return setProperty(prop.LogInterval, strconv.Itoa(reportInterval))
+ 		}
++		return nil
+ 	})
+ 
+-	fmt.Println("***************** properties *****************")
+-	for key, value := range globalProps.Map() {
+-		fmt.Printf("\"%s\"=\"%s\"\n", key, value)
++	result := client.Result{ErrorClasses: make(map[string]int64)}
++	var runErr error
++	if initializeErr != nil {
++		result.Requested = client.RequestedOperations(globalProps)
++		result.Failed = result.Requested
++		addResultError(&result, "initialization", initializeErr)
++		runErr = initializeErr
++	} else {
++		fmt.Println("***************** properties *****************")
++		for key, value := range globalProps.Map() {
++			fmt.Printf("\"%s\"=\"%s\"\n", key, value)
++		}
++		fmt.Println("**********************************************")
++		result, runErr = client.NewClient(globalProps, globalWorkload, globalDB).Run(globalContext)
++	}
++
++	outputErr := measurement.Output()
++	addResultError(&result, "measurement_output", outputErr)
++	closeClasses, closeErr := closeGlobals()
++	for class, count := range closeClasses {
++		result.ErrorClasses[class] += count
++	}
++	if result.ErrorMessage == "" && closeErr != nil {
++		result.ErrorMessage = closeErr.Error()
++	}
++
++	end := time.Now()
++	elapsed := end.Sub(start)
++	structured := makeStructuredResult(command, globalProps, result, startUnix, end.UnixNano(), elapsed.Nanoseconds())
++	resultErr := writeStructuredResult(globalProps.GetString(prop.ResultPath, ""), structured)
++	if resultErr != nil {
++		addResultError(&result, "result_output", resultErr)
+ 	}
+-	fmt.Println("**********************************************")
+ 
+-	c := client.NewClient(globalProps, globalWorkload, globalDB)
+-	start := time.Now()
+-	c.Run(globalContext)
+ 	fmt.Println("**********************************************")
+-	fmt.Printf("Run finished, takes %s\n", time.Now().Sub(start))
+-	measurement.Output()
++	fmt.Printf("Run finished, takes %s\n", elapsed)
++	return errors.Join(runErr, outputErr, closeErr, resultErr)
+ }
+ 
+-func runLoadCommandFunc(cmd *cobra.Command, args []string) {
+-	runClientCommandFunc(cmd, args, false, "load")
++func runLoadCommandFunc(cmd *cobra.Command, args []string) error {
++	return runClientCommandFunc(cmd, args, false, "load")
+ }
+ 
+-func runTransCommandFunc(cmd *cobra.Command, args []string) {
+-	runClientCommandFunc(cmd, args, true, "run")
++func runTransCommandFunc(cmd *cobra.Command, args []string) error {
++	return runClientCommandFunc(cmd, args, true, "run")
+ }
+ 
+ var (
+@@ -78,7 +123,7 @@ var (
+ )
+ 
+ func initClientCommand(m *cobra.Command) {
+-	m.Flags().StringSliceVarP(&propertyFiles, "property_file", "P", nil, "Spefify a property file")
++	m.Flags().StringSliceVarP(&propertyFiles, "property_file", "P", nil, "Specify a property file")
+ 	m.Flags().StringArrayVarP(&propertyValues, "prop", "p", nil, "Specify a property value with name=value")
+ 	m.Flags().StringVar(&tableName, "table", "", "Use the table name instead of the default \""+prop.TableNameDefault+"\"")
+ 	m.Flags().IntVar(&threadsArg, "threads", 1, "Execute using n threads - can also be specified as the \"threadcount\" property")
+@@ -91,9 +136,8 @@ func newLoadCommand() *cobra.Command {
+ 		Use:   "load db",
+ 		Short: "YCSB load benchmark",
+ 		Args:  cobra.MinimumNArgs(1),
+-		Run:   runLoadCommandFunc,
++		RunE:  runLoadCommandFunc,
+ 	}
+-
+ 	initClientCommand(m)
+ 	return m
+ }
+@@ -103,9 +147,8 @@ func newRunCommand() *cobra.Command {
+ 		Use:   "run db",
+ 		Short: "YCSB run benchmark",
+ 		Args:  cobra.MinimumNArgs(1),
+-		Run:   runTransCommandFunc,
++		RunE:  runTransCommandFunc,
+ 	}
+-
+ 	initClientCommand(m)
+ 	return m
+ }
+diff --git a/cmd/go-ycsb/main.go b/cmd/go-ycsb/main.go
+index 32ec4230597be68d0d3d5750e102009c83be4156..0721d9d371f01c13e01c2f02794f9a330e8f58b4 100644
+--- a/cmd/go-ycsb/main.go
++++ b/cmd/go-ycsb/main.go
+@@ -15,8 +15,8 @@ package main
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+-	"log"
+ 	"net/http"
+ 	_ "net/http/pprof"
+ 	"os"
+@@ -26,58 +26,34 @@ import (
+ 	"time"
+ 
+ 	"github.com/magiconair/properties"
+-
+-	// Register workload
+-
+ 	"github.com/spf13/cobra"
+ 
+ 	"github.com/pingcap/go-ycsb/pkg/client"
+ 	"github.com/pingcap/go-ycsb/pkg/measurement"
+ 	"github.com/pingcap/go-ycsb/pkg/prop"
+-	"github.com/pingcap/go-ycsb/pkg/util"
+ 	_ "github.com/pingcap/go-ycsb/pkg/workload"
+ 	"github.com/pingcap/go-ycsb/pkg/ycsb"
+ 
+-	// Register basic database
+-	_ "github.com/pingcap/go-ycsb/db/basic"
+-	// Register MySQL database
+-	_ "github.com/pingcap/go-ycsb/db/mysql"
+-	// Register TiKV database
+-	_ "github.com/pingcap/go-ycsb/db/tikv"
+-	// Register PostgreSQL database
+-	_ "github.com/pingcap/go-ycsb/db/pg"
+-	// Register Aerospike database
+ 	_ "github.com/pingcap/go-ycsb/db/aerospike"
+-	// Register Badger database
+ 	_ "github.com/pingcap/go-ycsb/db/badger"
+-	// Register FoundationDB database
+-	_ "github.com/pingcap/go-ycsb/db/foundationdb"
+-	// Register RocksDB database
+-	_ "github.com/pingcap/go-ycsb/db/rocksdb"
+-	// Register Spanner database
+-	_ "github.com/pingcap/go-ycsb/db/spanner"
+-	// Register pegasus database
+-	_ "github.com/pingcap/go-ycsb/db/pegasus"
+-	// Register sqlite database
+-	_ "github.com/pingcap/go-ycsb/db/sqlite"
+-	// Register cassandra database
+-	_ "github.com/pingcap/go-ycsb/db/cassandra"
+-	// Register mongodb database
+-	_ "github.com/pingcap/go-ycsb/db/mongodb"
+-	// Register redis database
+-	_ "github.com/pingcap/go-ycsb/db/redis"
+-	// Register boltdb database
++	_ "github.com/pingcap/go-ycsb/db/basic"
+ 	_ "github.com/pingcap/go-ycsb/db/boltdb"
+-	// Register minio
+-	_ "github.com/pingcap/go-ycsb/db/minio"
+-	// Register elastic
++	_ "github.com/pingcap/go-ycsb/db/cassandra"
++	_ "github.com/pingcap/go-ycsb/db/dynamodb"
+ 	_ "github.com/pingcap/go-ycsb/db/elasticsearch"
+-	// Register etcd
+ 	_ "github.com/pingcap/go-ycsb/db/etcd"
+-	// Register dynamodb
+-	_ "github.com/pingcap/go-ycsb/db/dynamodb"
+-	// Register s3 database
++	_ "github.com/pingcap/go-ycsb/db/foundationdb"
++	_ "github.com/pingcap/go-ycsb/db/minio"
++	_ "github.com/pingcap/go-ycsb/db/mongodb"
++	_ "github.com/pingcap/go-ycsb/db/mysql"
++	_ "github.com/pingcap/go-ycsb/db/pegasus"
++	_ "github.com/pingcap/go-ycsb/db/pg"
++	_ "github.com/pingcap/go-ycsb/db/redis"
++	_ "github.com/pingcap/go-ycsb/db/rocksdb"
+ 	_ "github.com/pingcap/go-ycsb/db/s3"
++	_ "github.com/pingcap/go-ycsb/db/spanner"
++	_ "github.com/pingcap/go-ycsb/db/sqlite"
++	_ "github.com/pingcap/go-ycsb/db/tikv"
+ )
+ 
+ var (
+@@ -94,111 +70,132 @@ var (
+ 	globalProps    *properties.Properties
+ )
+ 
+-func initialGlobal(dbName string, onProperties func()) {
++func setProperty(key string, value string) error {
++	_, _, err := globalProps.Set(key, value)
++	return err
++}
++
++func initialGlobal(name string, onProperties func() error) (err error) {
++	defer func() {
++		if recovered := recover(); recovered != nil {
++			err = fmt.Errorf("initialize client panic: %v", recovered)
++		}
++	}()
+ 	globalProps = properties.NewProperties()
+ 	if len(propertyFiles) > 0 {
+-		globalProps = properties.MustLoadFiles(propertyFiles, properties.UTF8, false)
++		globalProps, err = properties.LoadFiles(propertyFiles, properties.UTF8, false)
++		if err != nil {
++			return err
++		}
+ 	}
+-
+-	for _, prop := range propertyValues {
+-		seps := strings.SplitN(prop, "=", 2)
+-		if len(seps) != 2 {
+-			log.Fatalf("bad property: `%s`, expected format `name=value`", prop)
++	for _, property := range propertyValues {
++		parts := strings.SplitN(property, "=", 2)
++		if len(parts) != 2 {
++			return fmt.Errorf("bad property %q, expected name=value", property)
++		}
++		if err = setProperty(parts[0], parts[1]); err != nil {
++			return err
+ 		}
+-		globalProps.Set(seps[0], seps[1])
+ 	}
+-
+ 	if onProperties != nil {
+-		onProperties()
++		if err = onProperties(); err != nil {
++			return err
++		}
+ 	}
+ 
+ 	addr := globalProps.GetString(prop.DebugPprof, prop.DebugPprofDefault)
+-	go func() {
+-		http.ListenAndServe(addr, nil)
+-	}()
+-
++	go func() { _ = http.ListenAndServe(addr, nil) }()
+ 	measurement.InitMeasure(globalProps)
+ 
+-	if len(tableName) == 0 {
++	if tableName == "" {
+ 		tableName = globalProps.GetString(prop.TableName, prop.TableNameDefault)
+ 	}
+-	var err error
+-
+-	if _, _, err = globalProps.Set(prop.TableName, tableName); err != nil {
+-		panic(err)
++	if err = setProperty(prop.TableName, tableName); err != nil {
++		return err
+ 	}
+-
+ 	workloadName := globalProps.GetString(prop.Workload, "core")
+ 	workloadCreator := ycsb.GetWorkloadCreator(workloadName)
+-
++	if workloadCreator == nil {
++		return fmt.Errorf("workload %s is not registered", workloadName)
++	}
+ 	if globalWorkload, err = workloadCreator.Create(globalProps); err != nil {
+-		util.Fatalf("create workload %s failed %v", workloadName, err)
++		return fmt.Errorf("create workload %s: %w", workloadName, err)
+ 	}
+-
+-	dbCreator := ycsb.GetDBCreator(dbName)
++	dbCreator := ycsb.GetDBCreator(name)
+ 	if dbCreator == nil {
+-		util.Fatalf("%s is not registered", dbName)
++		return fmt.Errorf("database %s is not registered", name)
+ 	}
+ 	if globalDB, err = dbCreator.Create(globalProps); err != nil {
+-		util.Fatalf("create db %s failed %v", dbName, err)
++		return fmt.Errorf("create database %s: %w", name, err)
+ 	}
+-	globalDB = client.DbWrapper{globalDB}
++	globalDB = client.DbWrapper{DB: globalDB}
++	return nil
+ }
+ 
+-func main() {
+-	globalContext, globalCancel = context.WithCancel(context.Background())
++func closeGlobals() (map[string]int64, error) {
++	classes := make(map[string]int64)
++	var errs []error
++	if globalDB != nil {
++		if err := globalDB.Close(); err != nil {
++			classes["database_close"]++
++			errs = append(errs, fmt.Errorf("close database: %w", err))
++		}
++		globalDB = nil
++	}
++	if globalWorkload != nil {
++		if err := globalWorkload.Close(); err != nil {
++			classes["workload_close"]++
++			errs = append(errs, fmt.Errorf("close workload: %w", err))
++		}
++		globalWorkload = nil
++	}
++	return classes, errors.Join(errs...)
++}
+ 
+-	sc := make(chan os.Signal, 1)
+-	signal.Notify(sc,
+-		syscall.SIGHUP,
+-		syscall.SIGINT,
+-		syscall.SIGTERM,
+-		syscall.SIGQUIT)
++func newRootCommand() *cobra.Command {
++	root := &cobra.Command{Use: "go-ycsb", Short: "Go YCSB", SilenceUsage: true}
++	root.AddCommand(newShellCommand(), newLoadCommand(), newRunCommand())
++	return root
++}
+ 
+-	closeDone := make(chan struct{}, 1)
++func runMain(args []string) error {
++	globalContext, globalCancel = context.WithCancel(context.Background())
++	defer globalCancel()
++	signals := make(chan os.Signal, 2)
++	signal.Notify(signals, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
++	defer signal.Stop(signals)
++	closeDone := make(chan struct{})
+ 	go func() {
+-		sig := <-sc
+-		fmt.Printf("\nGot signal [%v] to exit.\n", sig)
+-		globalCancel()
+-
+ 		select {
+-		case <-sc:
+-			// send signal again, return directly
+-			fmt.Printf("\nGot signal [%v] again to exit.\n", sig)
+-			os.Exit(1)
+-		case <-time.After(10 * time.Second):
+-			fmt.Print("\nWait 10s for closed, force exit\n")
+-			os.Exit(1)
++		case sig := <-signals:
++			fmt.Printf("\nGot signal [%v] to exit.\n", sig)
++			globalCancel()
++			select {
++			case second := <-signals:
++				fmt.Printf("\nGot signal [%v] again to exit.\n", second)
++				os.Exit(1)
++			case <-time.After(10 * time.Second):
++				fmt.Print("\nWait 10s for close, force exit\n")
++				os.Exit(1)
++			case <-closeDone:
++			}
+ 		case <-closeDone:
+-			return
+ 		}
+ 	}()
+ 
+-	rootCmd := &cobra.Command{
+-		Use:   "go-ycsb",
+-		Short: "Go YCSB",
+-	}
+-
+-	rootCmd.AddCommand(
+-		newShellCommand(),
+-		newLoadCommand(),
+-		newRunCommand(),
+-	)
+-
+ 	cobra.EnablePrefixMatching = true
+-
+-	if err := rootCmd.Execute(); err != nil {
+-		fmt.Println(rootCmd.UsageString())
+-	}
+-
++	root := newRootCommand()
++	root.SetArgs(args)
++	commandErr := root.Execute()
+ 	globalCancel()
+-	if globalDB != nil {
+-		globalDB.Close()
+-	}
++	_, closeErr := closeGlobals()
++	close(closeDone)
++	return errors.Join(commandErr, closeErr)
++}
+ 
+-	if globalWorkload != nil {
+-		globalWorkload.Close()
++func main() {
++	if err := runMain(os.Args[1:]); err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		os.Exit(1)
+ 	}
+-
+-	closeDone <- struct{}{}
+ }
+diff --git a/cmd/go-ycsb/result.go b/cmd/go-ycsb/result.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..1b6f01b69fbf70a0825285f96c162bddc0483940
+--- /dev/null
++++ b/cmd/go-ycsb/result.go
+@@ -0,0 +1,137 @@
++package main
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"os"
++	"path/filepath"
++	"sort"
++	"strconv"
++
++	"github.com/magiconair/properties"
++	"github.com/pingcap/go-ycsb/pkg/client"
++	"github.com/pingcap/go-ycsb/pkg/measurement"
++	"github.com/pingcap/go-ycsb/pkg/prop"
++	"github.com/pingcap/go-ycsb/pkg/util"
++)
++
++const (
++	resultFormatVersion = "go-ycsb-online-result-v1"
++	clientIdentity      = "go-ycsb-v1.0.3-online-checker-v1"
++	baseCommit          = "f030f9942393a8febbf4365c2d582711723159f5"
++	patchIdentity       = "co-checker-go-ycsb-online-v1"
++)
++
++type structuredResult struct {
++	FormatVersion      string                                  `json:"format_version"`
++	ClientIdentity     string                                  `json:"client_identity"`
++	BaseCommit         string                                  `json:"base_commit"`
++	PatchIdentity      string                                  `json:"patch_identity"`
++	Command            string                                  `json:"command"`
++	MasterSeed         int64                                   `json:"master_seed"`
++	SeedDerivation     string                                  `json:"seed_derivation"`
++	PropertiesSHA256   string                                  `json:"properties_sha256"`
++	Requested          int64                                   `json:"requested"`
++	Attempted          int64                                   `json:"attempted"`
++	Successful         int64                                   `json:"successful"`
++	Failed             int64                                   `json:"failed"`
++	StartedUnixNano    int64                                   `json:"started_unix_ns"`
++	EndedUnixNano      int64                                   `json:"ended_unix_ns"`
++	MonotonicStartNano int64                                   `json:"monotonic_start_ns"`
++	MonotonicEndNano   int64                                   `json:"monotonic_end_ns"`
++	ElapsedNano        int64                                   `json:"elapsed_ns"`
++	ErrorClasses       map[string]int64                        `json:"error_classes"`
++	ErrorMessage       string                                  `json:"error_message,omitempty"`
++	Measurements       map[string]measurement.OperationSummary `json:"measurements"`
++}
++
++func digestProperties(p *properties.Properties) string {
++	if p == nil {
++		return ""
++	}
++	values := p.Map()
++	keys := make([]string, 0, len(values))
++	for key := range values {
++		keys = append(keys, key)
++	}
++	sort.Strings(keys)
++	hash := sha256.New()
++	for _, key := range keys {
++		hash.Write([]byte(strconv.Itoa(len(key))))
++		hash.Write([]byte{':'})
++		hash.Write([]byte(key))
++		hash.Write([]byte{'='})
++		hash.Write([]byte(strconv.Itoa(len(values[key]))))
++		hash.Write([]byte{':'})
++		hash.Write([]byte(values[key]))
++		hash.Write([]byte{'\n'})
++	}
++	return hex.EncodeToString(hash.Sum(nil))
++}
++
++func makeStructuredResult(command string, p *properties.Properties, result client.Result, startUnix int64, endUnix int64, elapsed int64) structuredResult {
++	return structuredResult{
++		FormatVersion:      resultFormatVersion,
++		ClientIdentity:     clientIdentity,
++		BaseCommit:         baseCommit,
++		PatchIdentity:      patchIdentity,
++		Command:            command,
++		MasterSeed:         p.GetInt64(prop.RandomSeed, 0),
++		SeedDerivation:     util.SeedDerivationVersion,
++		PropertiesSHA256:   digestProperties(p),
++		Requested:          result.Requested,
++		Attempted:          result.Attempted,
++		Successful:         result.Successful,
++		Failed:             result.Failed,
++		StartedUnixNano:    startUnix,
++		EndedUnixNano:      endUnix,
++		MonotonicStartNano: 0,
++		MonotonicEndNano:   elapsed,
++		ElapsedNano:        elapsed,
++		ErrorClasses:       result.ErrorClasses,
++		ErrorMessage:       result.ErrorMessage,
++		Measurements:       measurement.Snapshot(),
++	}
++}
++
++func writeStructuredResult(path string, result structuredResult) error {
++	if path == "" {
++		return nil
++	}
++	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
++		return fmt.Errorf("create result directory: %w", err)
++	}
++	temporary := path + ".tmp-" + strconv.Itoa(os.Getpid())
++	file, err := os.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
++	if err != nil {
++		return fmt.Errorf("create temporary result: %w", err)
++	}
++	removeTemporary := true
++	defer func() {
++		if removeTemporary {
++			_ = os.Remove(temporary)
++		}
++	}()
++	encoder := json.NewEncoder(file)
++	encoder.SetIndent("", "  ")
++	if err = encoder.Encode(result); err == nil {
++		err = file.Sync()
++	}
++	closeErr := file.Close()
++	if err != nil {
++		return fmt.Errorf("write temporary result: %w", err)
++	}
++	if closeErr != nil {
++		return fmt.Errorf("close temporary result: %w", closeErr)
++	}
++	if err = os.Link(temporary, path); err != nil {
++		return fmt.Errorf("publish result without overwrite: %w", err)
++	}
++	if err = os.Remove(temporary); err != nil {
++		return fmt.Errorf("remove temporary result: %w", err)
++	}
++	removeTemporary = false
++	return nil
++}
+diff --git a/cmd/go-ycsb/result_test.go b/cmd/go-ycsb/result_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..a3710c8a6dbc8ebe4a788b413ef2043766ae087f
+--- /dev/null
++++ b/cmd/go-ycsb/result_test.go
+@@ -0,0 +1,95 @@
++package main
++
++import (
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/magiconair/properties"
++	"github.com/pingcap/go-ycsb/pkg/client"
++	"github.com/pingcap/go-ycsb/pkg/measurement"
++	"github.com/pingcap/go-ycsb/pkg/prop"
++)
++
++func TestStructuredResultIsAtomicAndRefusesOverwrite(t *testing.T) {
++	p := properties.NewProperties()
++	_, _, _ = p.Set(prop.RandomSeed, "17")
++	measurement.InitMeasure(p)
++	result := client.Result{
++		Requested: 3, Attempted: 3, Successful: 2, Failed: 1,
++		ErrorClasses: map[string]int64{"operation": 1},
++	}
++	structured := makeStructuredResult("run", p, result, 100, 130, 30)
++	path := filepath.Join(t.TempDir(), "result.json")
++	if err := writeStructuredResult(path, structured); err != nil {
++		t.Fatal(err)
++	}
++	original, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var decoded structuredResult
++	if err := json.Unmarshal(original, &decoded); err != nil {
++		t.Fatal(err)
++	}
++	if decoded.FormatVersion != resultFormatVersion || decoded.BaseCommit != baseCommit ||
++		decoded.Requested != 3 || decoded.Successful+decoded.Failed != decoded.Requested ||
++		decoded.MasterSeed != 17 || decoded.ElapsedNano != 30 {
++		t.Fatalf("unexpected structured result: %+v", decoded)
++	}
++	if err := writeStructuredResult(path, structured); err == nil {
++		t.Fatal("existing result was overwritten")
++	}
++	after, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if string(after) != string(original) {
++		t.Fatal("existing result changed after overwrite refusal")
++	}
++}
++
++func TestPropertiesDigestIsCanonical(t *testing.T) {
++	first := properties.NewProperties()
++	_, _, _ = first.Set("b", "two")
++	_, _, _ = first.Set("a", "one")
++	second := properties.NewProperties()
++	_, _, _ = second.Set("a", "one")
++	_, _, _ = second.Set("b", "two")
++	if digestProperties(first) != digestProperties(second) {
++		t.Fatal("property insertion order changed the digest")
++	}
++	_, _, _ = second.Set("b", "changed")
++	if digestProperties(first) == digestProperties(second) {
++		t.Fatal("property value change did not change the digest")
++	}
++}
++
++func TestRunMainReturnsErrorAndWritesInitializationResult(t *testing.T) {
++	propertyFiles = nil
++	propertyValues = nil
++	tableName = ""
++	path := filepath.Join(t.TempDir(), "failure.json")
++	err := runMain([]string{
++		"run", "definitely-unregistered-db",
++		"-p", "strict=true",
++		"-p", "randomseed=29",
++		"-p", "operationcount=1",
++		"-p", "result.path=" + path,
++	})
++	if err == nil {
++		t.Fatal("command failure returned zero status")
++	}
++	content, readErr := os.ReadFile(path)
++	if readErr != nil {
++		t.Fatal(readErr)
++	}
++	var result structuredResult
++	if err := json.Unmarshal(content, &result); err != nil {
++		t.Fatal(err)
++	}
++	if result.ErrorClasses["initialization"] != 1 || result.Requested != 1 || result.Failed != 1 {
++		t.Fatalf("initialization failure was not conserved: %+v", result)
++	}
++}
+diff --git a/db/mysql/db.go b/db/mysql/db.go
+index 4c4887662198db8b92cfa070db9d25bb2c6add9b..c2945bafe2e431b97e4c9561b28849656b100a6f 100644
+--- a/db/mysql/db.go
++++ b/db/mysql/db.go
+@@ -21,6 +21,9 @@ import (
+ 	"database/sql/driver"
+ 	"encoding/hex"
+ 	"fmt"
++	"net"
++	"net/url"
++	"strconv"
+ 	"strings"
+ 	"sync/atomic"
+ 
+@@ -33,12 +36,15 @@ import (
+ 
+ // mysql properties
+ const (
+-	mysqlHost       = "mysql.host"
+-	mysqlPort       = "mysql.port"
+-	mysqlUser       = "mysql.user"
+-	mysqlPassword   = "mysql.password"
+-	mysqlDBName     = "mysql.db"
+-	mysqlForceIndex = "mysql.force_index"
++	mysqlHost        = "mysql.host"
++	mysqlPort        = "mysql.port"
++	mysqlUser        = "mysql.user"
++	mysqlPassword    = "mysql.password"
++	mysqlDBName      = "mysql.db"
++	mysqlForceIndex  = "mysql.force_index"
++	mysqlCreateTable = "mysql.create_table"
++	mysqlParams      = "mysql.params"
++	mysqlStrictRows  = "mysql.strict_rows"
+ 	// TODO: support batch and auto commit
+ 
+ 	tidbClusterIndex = "tidb.cluster_index"
+@@ -56,12 +62,40 @@ func (drv *muxDriver) Open(name string) (driver.Conn, error) {
+ 	return drv.internal.Open(drv.instances[int(k)%len(drv.instances)])
+ }
+ 
+-func openTiDBInstances(addrs []string, user string, pass string, db string) (*sql.DB, error) {
++func parseParams(raw string) (map[string]string, error) {
++	values, err := url.ParseQuery(raw)
++	if err != nil {
++		return nil, fmt.Errorf("parse %s: %w", mysqlParams, err)
++	}
++	params := make(map[string]string, len(values))
++	for key, entries := range values {
++		if key == "" || len(entries) != 1 {
++			return nil, fmt.Errorf("%s requires one value for parameter %q", mysqlParams, key)
++		}
++		params[key] = entries[0]
++	}
++	return params, nil
++}
++
++func formatDSN(addr string, user string, pass string, db string, params map[string]string) string {
++	config := mysql.NewConfig()
++	config.User = user
++	config.Passwd = pass
++	config.Net = "tcp"
++	config.Addr = addr
++	config.DBName = db
++	config.Params = params
++	return config.FormatDSN()
++}
++
++func openTiDBInstances(addrs []string, user string, pass string, db string, params map[string]string) (*sql.DB, error) {
+ 	instances := make([]string, len(addrs))
+ 	hash := sha1.New()
+ 	for i, addr := range addrs {
+-		hash.Write([]byte("+" + addr))
+-		instances[i] = fmt.Sprintf("%s:%s@tcp(%s)/%s", user, pass, addr, db)
++		instances[i] = formatDSN(addr, user, pass, db, params)
++		hash.Write([]byte(strconv.Itoa(len(instances[i]))))
++		hash.Write([]byte{':'})
++		hash.Write([]byte(instances[i]))
+ 	}
+ 	digest := hash.Sum(nil)
+ 	driver := "tidb:" + hex.EncodeToString(digest[:])
+@@ -82,6 +116,7 @@ type mysqlDB struct {
+ 	p                 *properties.Properties
+ 	db                *sql.DB
+ 	verbose           bool
++	strictRows        bool
+ 	forceIndexKeyword string
+ 
+ 	bufPool *util.BufPool
+@@ -108,10 +143,13 @@ func (c mysqlCreator) Create(p *properties.Properties) (ycsb.DB, error) {
+ 	password := p.GetString(mysqlPassword, "")
+ 	dbName := p.GetString(mysqlDBName, "test")
+ 	tidbList := p.GetString(tidbInstances, "")
++	params, err := parseParams(p.GetString(mysqlParams, ""))
++	if err != nil {
++		return nil, err
++	}
+ 
+ 	var (
+ 		db    *sql.DB
+-		err   error
+ 		tidbs []string
+ 	)
+ 	for _, tidb := range strings.Split(tidbList, ",") {
+@@ -121,9 +159,9 @@ func (c mysqlCreator) Create(p *properties.Properties) (ycsb.DB, error) {
+ 		}
+ 	}
+ 	if len(tidbs) > 0 {
+-		db, err = openTiDBInstances(tidbs, user, password, dbName)
++		db, err = openTiDBInstances(tidbs, user, password, dbName, params)
+ 	} else {
+-		dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s", user, password, host, port, dbName)
++		dsn := formatDSN(net.JoinHostPort(host, strconv.Itoa(port)), user, password, dbName, params)
+ 		db, err = sql.Open("mysql", dsn)
+ 	}
+ 	if err != nil {
+@@ -135,6 +173,7 @@ func (c mysqlCreator) Create(p *properties.Properties) (ycsb.DB, error) {
+ 	db.SetMaxOpenConns(threadCount * 2)
+ 
+ 	d.verbose = p.GetBool(prop.Verbose, prop.VerboseDefault)
++	d.strictRows = p.GetBool(mysqlStrictRows, false)
+ 	if p.GetBool(mysqlForceIndex, true) {
+ 		d.forceIndexKeyword = "FORCE INDEX(`PRIMARY`)"
+ 	}
+@@ -142,8 +181,10 @@ func (c mysqlCreator) Create(p *properties.Properties) (ycsb.DB, error) {
+ 
+ 	d.bufPool = util.NewBufPool()
+ 
+-	if err := d.createTable(c.name); err != nil {
+-		return nil, err
++	if p.GetBool(mysqlCreateTable, true) {
++		if err := d.createTable(c.name); err != nil {
++			return nil, err
++		}
+ 	}
+ 
+ 	return d, nil
+@@ -205,9 +246,13 @@ func (db *mysqlDB) CleanupThread(ctx context.Context) {
+ 	state := ctx.Value(stateKey).(*mysqlState)
+ 
+ 	for _, stmt := range state.stmtCache {
+-		stmt.Close()
++		if err := stmt.Close(); err != nil && db.strictRows {
++			panic(fmt.Sprintf("close prepared statement: %v", err))
++		}
++	}
++	if err := state.conn.Close(); err != nil && db.strictRows {
++		panic(fmt.Sprintf("close database connection: %v", err))
+ 	}
+-	state.conn.Close()
+ }
+ 
+ func (db *mysqlDB) getAndCacheStmt(ctx context.Context, query string) (*sql.Stmt, error) {
+@@ -287,6 +332,13 @@ func (db *mysqlDB) queryRows(ctx context.Context, query string, count int, args
+ 	return vs, rows.Err()
+ }
+ 
++func validateStrictRowCount(strict bool, exact bool, operation string, actual int, expected int) error {
++	if strict && exact && actual != expected {
++		return fmt.Errorf("strict %s returned %d rows, expected %d", operation, actual, expected)
++	}
++	return nil
++}
++
+ func (db *mysqlDB) Read(ctx context.Context, table string, key string, fields []string) (map[string][]byte, error) {
+ 	var query string
+ 	if len(fields) == 0 {
+@@ -300,6 +352,8 @@ func (db *mysqlDB) Read(ctx context.Context, table string, key string, fields []
+ 
+ 	if err != nil {
+ 		return nil, err
++	} else if err := validateStrictRowCount(db.strictRows, true, fmt.Sprintf("point read for key %q", key), len(rows), 1); err != nil {
++		return nil, err
+ 	} else if len(rows) == 0 {
+ 		return nil, nil
+ 	}
+@@ -331,6 +385,8 @@ func (db *mysqlDB) BatchRead(ctx context.Context, table string, keys []string, f
+ 
+ 	if err != nil {
+ 		return nil, err
++	} else if err := validateStrictRowCount(db.strictRows, true, "batch read", len(rows), len(keys)); err != nil {
++		return nil, err
+ 	} else if len(rows) == 0 {
+ 		return nil, nil
+ 	}
+@@ -348,11 +404,16 @@ func (db *mysqlDB) Scan(ctx context.Context, table string, startKey string, coun
+ 
+ 	rows, err := db.queryRows(ctx, query, count, startKey, count)
+ 	db.clearCacheIfFailed(ctx, query, err)
+-
+-	return rows, err
++	if err != nil {
++		return nil, err
++	}
++	if err := validateStrictRowCount(db.strictRows, false, "scan", len(rows), count); err != nil {
++		return nil, err
++	}
++	return rows, nil
+ }
+ 
+-func (db *mysqlDB) execQuery(ctx context.Context, query string, args ...interface{}) error {
++func (db *mysqlDB) execQuery(ctx context.Context, query string, expectedRows int64, args ...interface{}) error {
+ 	if db.verbose {
+ 		fmt.Printf("%s %v\n", query, args)
+ 	}
+@@ -362,9 +423,23 @@ func (db *mysqlDB) execQuery(ctx context.Context, query string, args ...interfac
+ 		return err
+ 	}
+ 
+-	_, err = stmt.ExecContext(ctx, args...)
++	result, err := stmt.ExecContext(ctx, args...)
+ 	db.clearCacheIfFailed(ctx, query, err)
+-	return err
++	if err != nil || !db.strictRows {
++		return err
++	}
++	return validateAffectedRows(result, expectedRows)
++}
++
++func validateAffectedRows(result sql.Result, expectedRows int64) error {
++	affected, err := result.RowsAffected()
++	if err != nil {
++		return fmt.Errorf("read affected rows: %w", err)
++	}
++	if affected != expectedRows {
++		return fmt.Errorf("strict mutation affected %d rows, expected %d", affected, expectedRows)
++	}
++	return nil
+ }
+ 
+ func (db *mysqlDB) Update(ctx context.Context, table string, key string, values map[string][]byte) error {
+@@ -394,7 +469,7 @@ func (db *mysqlDB) Update(ctx context.Context, table string, key string, values
+ 
+ 	args = append(args, key)
+ 
+-	return db.execQuery(ctx, buf.String(), args...)
++	return db.execQuery(ctx, buf.String(), 1, args...)
+ }
+ 
+ func (db *mysqlDB) BatchUpdate(ctx context.Context, table string, keys []string, values []map[string][]byte) error {
+@@ -435,7 +510,7 @@ func (db *mysqlDB) Insert(ctx context.Context, table string, key string, values
+ 
+ 	buf.WriteByte(')')
+ 
+-	return db.execQuery(ctx, buf.String(), args...)
++	return db.execQuery(ctx, buf.String(), 1, args...)
+ }
+ 
+ func (db *mysqlDB) BatchInsert(ctx context.Context, table string, keys []string, values []map[string][]byte) error {
+@@ -474,13 +549,13 @@ func (db *mysqlDB) BatchInsert(ctx context.Context, table string, keys []string,
+ 		}
+ 	}
+ 
+-	return db.execQuery(ctx, string(buf[:]), args...)
++	return db.execQuery(ctx, string(buf[:]), int64(len(keys)), args...)
+ }
+ 
+ func (db *mysqlDB) Delete(ctx context.Context, table string, key string) error {
+ 	query := fmt.Sprintf(`DELETE FROM %s WHERE YCSB_KEY = ?`, table)
+ 
+-	return db.execQuery(ctx, query, key)
++	return db.execQuery(ctx, query, 1, key)
+ }
+ 
+ func (db *mysqlDB) BatchDelete(ctx context.Context, table string, keys []string) error {
+@@ -497,7 +572,7 @@ func (db *mysqlDB) BatchDelete(ctx context.Context, table string, keys []string)
+ 	}
+ 	buf = append(buf, ')')
+ 
+-	return db.execQuery(ctx, string(buf[:]), args...)
++	return db.execQuery(ctx, string(buf[:]), int64(len(keys)), args...)
+ }
+ 
+ func (db *mysqlDB) Analyze(ctx context.Context, table string) error {
+diff --git a/db/mysql/db_test.go b/db/mysql/db_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..e51fdb4359f9218d3787d2b9eaf45011f4f398d1
+--- /dev/null
++++ b/db/mysql/db_test.go
+@@ -0,0 +1,89 @@
++package mysql
++
++import (
++	"database/sql/driver"
++	"testing"
++
++	drivermysql "github.com/go-sql-driver/mysql"
++	"github.com/magiconair/properties"
++)
++
++func TestDSNParametersSingleAndMultipleInstances(t *testing.T) {
++	raw := "transaction_isolation=%27REPEATABLE-READ%27&tidb_txn_mode=%27OPTIMISTIC%27&tidb_enable_1pc=0"
++	params, err := parseParams(raw)
++	if err != nil {
++		t.Fatal(err)
++	}
++	check := func(dsn string) {
++		config, err := drivermysql.ParseDSN(dsn)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if config.Params["transaction_isolation"] != "'REPEATABLE-READ'" ||
++			config.Params["tidb_txn_mode"] != "'OPTIMISTIC'" || config.Params["tidb_enable_1pc"] != "0" {
++			t.Fatalf("parameters missing from DSN %q: %v", dsn, config.Params)
++		}
++	}
++	check(formatDSN("127.0.0.1:4000", "root", "", "ycsb", params))
++	db, err := openTiDBInstances([]string{"127.0.0.1:4000", "127.0.0.1:4001"}, "root", "", "ycsb", params)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer db.Close()
++	mux, ok := db.Driver().(*muxDriver)
++	if !ok || len(mux.instances) != 2 {
++		t.Fatalf("unexpected mux driver: %#v", db.Driver())
++	}
++	for _, dsn := range mux.instances {
++		check(dsn)
++	}
++	changed := map[string]string{
++		"transaction_isolation": "'REPEATABLE-READ'",
++		"tidb_txn_mode":         "'OPTIMISTIC'",
++		"tidb_enable_1pc":       "1",
++	}
++	changedDB, err := openTiDBInstances([]string{"127.0.0.1:4000", "127.0.0.1:4001"}, "root", "", "ycsb", changed)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer changedDB.Close()
++	changedMux := changedDB.Driver().(*muxDriver)
++	changedConfig, err := drivermysql.ParseDSN(changedMux.instances[0])
++	if err != nil {
++		t.Fatal(err)
++	}
++	if changedConfig.Params["tidb_enable_1pc"] != "1" {
++		t.Fatalf("mux registration hash ignored parameters: %v", changedConfig.Params)
++	}
++}
++
++func TestCreateTableCanBeDisabled(t *testing.T) {
++	p := properties.NewProperties()
++	_, _, _ = p.Set(mysqlCreateTable, "false")
++	_, _, _ = p.Set(mysqlParams, "tidb_txn_mode=%27OPTIMISTIC%27")
++	db, err := (mysqlCreator{name: "tidb"}).Create(p)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := db.Close(); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestStrictRowValidation(t *testing.T) {
++	if err := validateStrictRowCount(true, true, "point read", 0, 1); err == nil {
++		t.Fatal("missing point row was accepted")
++	}
++	if err := validateStrictRowCount(true, true, "point read", 1, 1); err != nil {
++		t.Fatal(err)
++	}
++	if err := validateStrictRowCount(true, false, "scan", 3, 10); err != nil {
++		t.Fatal("strict scans may return fewer rows than requested")
++	}
++	if err := validateAffectedRows(driver.RowsAffected(0), 1); err == nil {
++		t.Fatal("zero affected rows was accepted")
++	}
++	if err := validateAffectedRows(driver.RowsAffected(1), 1); err != nil {
++		t.Fatal(err)
++	}
++}
+diff --git a/pkg/client/client.go b/pkg/client/client.go
+index 7537ce0f5a2bf1f757c92291f8c33c5314280fa4..85ad93fe195250fd2d3cd8a654881e22a2fa8722 100644
+--- a/pkg/client/client.go
++++ b/pkg/client/client.go
+@@ -15,18 +15,62 @@ package client
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"math/rand"
+-	"os"
+ 	"sync"
+ 	"time"
+ 
+ 	"github.com/magiconair/properties"
+ 	"github.com/pingcap/go-ycsb/pkg/measurement"
+ 	"github.com/pingcap/go-ycsb/pkg/prop"
++	"github.com/pingcap/go-ycsb/pkg/util"
+ 	"github.com/pingcap/go-ycsb/pkg/ycsb"
+ )
+ 
++// Result conserves the requested top-level operations for one client run.
++type Result struct {
++	Requested    int64            `json:"requested"`
++	Attempted    int64            `json:"attempted"`
++	Successful   int64            `json:"successful"`
++	Failed       int64            `json:"failed"`
++	ErrorClasses map[string]int64 `json:"error_classes"`
++	ErrorMessage string           `json:"error_message,omitempty"`
++}
++
++func newResult() Result {
++	return Result{ErrorClasses: make(map[string]int64)}
++}
++
++func (r *Result) add(other Result) {
++	r.Requested += other.Requested
++	r.Attempted += other.Attempted
++	r.Successful += other.Successful
++	r.Failed += other.Failed
++	for class, count := range other.ErrorClasses {
++		r.ErrorClasses[class] += count
++	}
++}
++
++func classifyContext(err error) string {
++	if errors.Is(err, context.DeadlineExceeded) {
++		return "context_deadline_exceeded"
++	}
++	return "context_canceled"
++}
++
++type firstError struct {
++	once sync.Once
++	err  error
++}
++
++func (f *firstError) set(err error) {
++	if err == nil {
++		return
++	}
++	f.once.Do(func() { f.err = err })
++}
++
+ type worker struct {
+ 	p               *properties.Properties
+ 	workDB          ycsb.DB
+@@ -39,122 +83,230 @@ type worker struct {
+ 	threadID        int
+ 	targetOpsTickNs int64
+ 	opsDone         int64
++	rng             *rand.Rand
+ }
+ 
+-func newWorker(p *properties.Properties, threadID int, threadCount int, workload ycsb.Workload, db ycsb.DB) *worker {
+-	w := new(worker)
+-	w.p = p
+-	w.doTransactions = p.GetBool(prop.DoTransactions, true)
+-	w.batchSize = p.GetInt(prop.BatchSize, prop.DefaultBatchSize)
+-	if w.batchSize > 1 {
+-		w.doBatch = true
+-	}
+-	w.threadID = threadID
+-	w.workload = workload
+-	w.workDB = db
+-
+-	var totalOpCount int64
+-	if w.doTransactions {
+-		totalOpCount = p.GetInt64(prop.OperationCount, 0)
+-	} else {
+-		if _, ok := p.Get(prop.InsertCount); ok {
+-			totalOpCount = p.GetInt64(prop.InsertCount, 0)
+-		} else {
+-			totalOpCount = p.GetInt64(prop.RecordCount, 0)
+-		}
++func totalOperationCount(p *properties.Properties) int64 {
++	if p.GetBool(prop.DoTransactions, true) {
++		return p.GetInt64(prop.OperationCount, 0)
+ 	}
++	if _, ok := p.Get(prop.InsertCount); ok {
++		return p.GetInt64(prop.InsertCount, 0)
++	}
++	return p.GetInt64(prop.RecordCount, 0)
++}
+ 
+-	if totalOpCount < int64(threadCount) {
+-		fmt.Printf("totalOpCount(%s/%s/%s): %d should be bigger than threadCount: %d",
+-			prop.OperationCount,
+-			prop.InsertCount,
+-			prop.RecordCount,
+-			totalOpCount,
+-			threadCount)
++// RequestedOperations returns the configured finite top-level operation count.
++func RequestedOperations(p *properties.Properties) int64 {
++	return totalOperationCount(p)
++}
+ 
+-		os.Exit(-1)
++func newWorker(p *properties.Properties, threadID int, threadCount int, workload ycsb.Workload, db ycsb.DB) (*worker, error) {
++	totalOpCount := totalOperationCount(p)
++	if totalOpCount > 0 && totalOpCount < int64(threadCount) {
++		return nil, fmt.Errorf("total operation count %d must be at least thread count %d", totalOpCount, threadCount)
+ 	}
+ 
+-	w.opCount = totalOpCount / int64(threadCount)
+-	if threadID < int(totalOpCount%int64(threadCount)) {
+-		w.opCount++
++	w := &worker{
++		p:              p,
++		doTransactions: p.GetBool(prop.DoTransactions, true),
++		batchSize:      p.GetInt(prop.BatchSize, prop.DefaultBatchSize),
++		threadID:       threadID,
++		workload:       workload,
++		workDB:         db,
+ 	}
+-
+-	targetPerThreadPerms := float64(-1)
+-	if v := p.GetInt64(prop.Target, 0); v > 0 {
+-		targetPerThread := float64(v) / float64(threadCount)
+-		targetPerThreadPerms = targetPerThread / 1000.0
++	if w.batchSize <= 0 {
++		return nil, fmt.Errorf("%s must be positive", prop.BatchSize)
++	}
++	w.doBatch = w.batchSize > 1
++	if totalOpCount > 0 {
++		w.opCount = totalOpCount / int64(threadCount)
++		if threadID < int(totalOpCount%int64(threadCount)) {
++			w.opCount++
++		}
+ 	}
+ 
+-	if targetPerThreadPerms > 0 {
+-		w.targetOpsPerMs = targetPerThreadPerms
++	if target := p.GetInt64(prop.Target, 0); target > 0 {
++		w.targetOpsPerMs = float64(target) / float64(threadCount) / 1000.0
+ 		w.targetOpsTickNs = int64(1000000.0 / w.targetOpsPerMs)
+ 	}
+ 
+-	return w
++	masterSeed := p.GetInt64(prop.RandomSeed, 0)
++	seed := time.Now().UnixNano() + int64(threadID)
++	if masterSeed != 0 {
++		seed = util.DeriveSeed(masterSeed, threadID, util.ThrottleSeedStream)
++	}
++	w.rng = rand.New(rand.NewSource(seed))
++	return w, nil
+ }
+ 
+ func (w *worker) throttle(ctx context.Context, startTime time.Time) {
+ 	if w.targetOpsPerMs <= 0 {
+ 		return
+ 	}
+-
+-	d := time.Duration(w.opsDone * w.targetOpsTickNs)
+-	d = startTime.Add(d).Sub(time.Now())
+-	if d < 0 {
++	d := startTime.Add(time.Duration(w.opsDone * w.targetOpsTickNs)).Sub(time.Now())
++	if d <= 0 {
+ 		return
+ 	}
++	timer := time.NewTimer(d)
++	defer timer.Stop()
+ 	select {
+ 	case <-ctx.Done():
+-	case <-time.After(d):
++	case <-timer.C:
+ 	}
+ }
+ 
+-func (w *worker) run(ctx context.Context) {
+-	// spread the thread operation out so they don't all hit the DB at the same time
++func panicAsError(phase string, fn func()) (err error) {
++	defer func() {
++		if recovered := recover(); recovered != nil {
++			err = fmt.Errorf("%s panic: %v", phase, recovered)
++		}
++	}()
++	fn()
++	return nil
++}
++
++func operationError(fn func() error) (err error) {
++	defer func() {
++		if recovered := recover(); recovered != nil {
++			err = fmt.Errorf("operation panic: %v", recovered)
++		}
++	}()
++	return fn()
++}
++
++func initContext(phase string, fn func() context.Context) (ctx context.Context, err error) {
++	defer func() {
++		if recovered := recover(); recovered != nil {
++			err = fmt.Errorf("%s panic: %v", phase, recovered)
++		}
++	}()
++	ctx = fn()
++	if ctx == nil {
++		return nil, fmt.Errorf("%s returned a nil context", phase)
++	}
++	return ctx, nil
++}
++
++func (w *worker) run(ctx context.Context, strict bool, cancel context.CancelFunc, first *firstError) Result {
++	result := newResult()
++	result.Requested = w.opCount
++	actualFailures := int64(0)
++	recordFatal := func(class string, err error) {
++		result.ErrorClasses[class]++
++		first.set(fmt.Errorf("worker %d %s: %w", w.threadID, class, err))
++		cancel()
++	}
++
+ 	if w.targetOpsPerMs > 0.0 && w.targetOpsPerMs <= 1.0 {
+-		time.Sleep(time.Duration(rand.Int63n(w.targetOpsTickNs)))
++		d := time.Duration(w.rng.Int63n(w.targetOpsTickNs))
++		timer := time.NewTimer(d)
++		select {
++		case <-ctx.Done():
++			timer.Stop()
++		case <-timer.C:
++		}
+ 	}
+ 
+-	startTime := time.Now()
++	threadCtx := ctx
++	if masterSeed := w.p.GetInt64(prop.RandomSeed, 0); masterSeed != 0 {
++		threadCtx = ycsb.WithThreadSeed(threadCtx, util.DeriveSeed(masterSeed, w.threadID, util.WorkloadSeedStream))
++	}
++	workloadCtx, err := initContext("workload initialization", func() context.Context {
++		return w.workload.InitThread(threadCtx, w.threadID, w.p.GetInt(prop.ThreadCount, 1))
++	})
++	if err != nil {
++		recordFatal("workload_initialization", err)
++		result.Failed = result.Requested
++		return result
++	}
++	dbCtx, err := initContext("database initialization", func() context.Context {
++		return w.workDB.InitThread(workloadCtx, w.threadID, w.p.GetInt(prop.ThreadCount, 1))
++	})
++	if err != nil {
++		_ = panicAsError("workload cleanup", func() { w.workload.CleanupThread(workloadCtx) })
++		recordFatal("database_initialization", err)
++		result.Failed = result.Requested
++		return result
++	}
+ 
++	startTime := time.Now()
+ 	for w.opCount == 0 || w.opsDone < w.opCount {
+-		var err error
+-		opsCount := 1
+-		if w.doTransactions {
+-			if w.doBatch {
+-				err = w.workload.DoBatchTransaction(ctx, w.batchSize, w.workDB)
+-				opsCount = w.batchSize
+-			} else {
+-				err = w.workload.DoTransaction(ctx, w.workDB)
++		select {
++		case <-ctx.Done():
++			goto cleanup
++		default:
++		}
++
++		opsCount := int64(1)
++		if w.doBatch {
++			opsCount = int64(w.batchSize)
++		}
++		opErr := operationError(func() error {
++			if w.doTransactions {
++				if w.doBatch {
++					return w.workload.DoBatchTransaction(dbCtx, w.batchSize, w.workDB)
++				}
++				return w.workload.DoTransaction(dbCtx, w.workDB)
+ 			}
+-		} else {
+ 			if w.doBatch {
+-				err = w.workload.DoBatchInsert(ctx, w.batchSize, w.workDB)
+-				opsCount = w.batchSize
+-			} else {
+-				err = w.workload.DoInsert(ctx, w.workDB)
++				return w.workload.DoBatchInsert(dbCtx, w.batchSize, w.workDB)
+ 			}
+-		}
++			return w.workload.DoInsert(dbCtx, w.workDB)
++		})
+ 
+-		if err != nil && !w.p.GetBool(prop.Silence, prop.SilenceDefault) {
+-			fmt.Printf("operation err: %v\n", err)
++		if !measurement.IsWarmUpFinished() {
++			if opErr != nil && strict {
++				recordFatal("warmup_operation", opErr)
++				goto cleanup
++			}
++			continue
+ 		}
+-
+-		if measurement.IsWarmUpFinished() {
+-			w.opsDone += int64(opsCount)
+-			w.throttle(ctx, startTime)
++		if w.opCount > 0 && opsCount > w.opCount-w.opsDone {
++			opsCount = w.opCount - w.opsDone
++		}
++		result.Attempted += opsCount
++		w.opsDone += opsCount
++		if opErr == nil {
++			result.Successful += opsCount
++		} else {
++			actualFailures += opsCount
++			result.ErrorClasses["operation"] += opsCount
++			if !w.p.GetBool(prop.Silence, prop.SilenceDefault) {
++				fmt.Printf("operation err: %v\n", opErr)
++			}
++			if strict {
++				first.set(fmt.Errorf("worker %d operation: %w", w.threadID, opErr))
++				cancel()
++				goto cleanup
++			}
+ 		}
++		w.throttle(ctx, startTime)
++	}
+ 
+-		select {
+-		case <-ctx.Done():
+-			return
+-		default:
++cleanup:
++	if cleanupErr := panicAsError("database cleanup", func() { w.workDB.CleanupThread(dbCtx) }); cleanupErr != nil {
++		recordFatal("database_cleanup", cleanupErr)
++	}
++	if cleanupErr := panicAsError("workload cleanup", func() { w.workload.CleanupThread(workloadCtx) }); cleanupErr != nil {
++		recordFatal("workload_cleanup", cleanupErr)
++	}
++
++	if w.opCount == 0 {
++		result.Requested = result.Attempted
++	}
++	result.Failed = result.Requested - result.Successful
++	if unattempted := result.Failed - actualFailures; unattempted > 0 {
++		class := "canceled_before_attempt"
++		if ctxErr := ctx.Err(); ctxErr != nil {
++			class = classifyContext(ctxErr)
+ 		}
++		result.ErrorClasses[class] += unattempted
+ 	}
++	return result
+ }
+ 
+-// Client is a struct which is used the run workload to a specific DB.
++// Client runs one workload against one DB.
+ type Client struct {
+ 	p        *properties.Properties
+ 	workload ycsb.Workload
+@@ -162,42 +314,62 @@ type Client struct {
+ }
+ 
+ // NewClient returns a client with the given workload and DB.
+-// The workload and db can't be nil.
+ func NewClient(p *properties.Properties, workload ycsb.Workload, db ycsb.DB) *Client {
+ 	return &Client{p: p, workload: workload, db: db}
+ }
+ 
+-// Run runs the workload to the target DB, and blocks until all workers end.
+-func (c *Client) Run(ctx context.Context) {
+-	var wg sync.WaitGroup
++// Run runs the workload, returns conserved top-level counts, and preserves the
++// first strict or lifecycle error.
++func (c *Client) Run(ctx context.Context) (Result, error) {
++	result := newResult()
+ 	threadCount := c.p.GetInt(prop.ThreadCount, 1)
++	if threadCount <= 0 {
++		return result, fmt.Errorf("%s must be positive", prop.ThreadCount)
++	}
++	strict := c.p.GetBool(prop.Strict, prop.StrictDefault)
++	if strict && c.p.GetInt64(prop.RandomSeed, 0) == 0 {
++		result.Requested = totalOperationCount(c.p)
++		result.Failed = result.Requested
++		result.ErrorClasses["configuration"]++
++		err := errors.New("strict mode requires a nonzero randomseed")
++		result.ErrorMessage = err.Error()
++		return result, err
++	}
++	if strict && totalOperationCount(c.p) <= 0 {
++		result.ErrorClasses["configuration"]++
++		err := errors.New("strict mode requires a positive finite operation count")
++		result.ErrorMessage = err.Error()
++		return result, err
++	}
++	if c.p.GetInt64(prop.LogInterval, 10) <= 0 {
++		result.ErrorClasses["configuration"]++
++		err := fmt.Errorf("%s must be positive", prop.LogInterval)
++		result.ErrorMessage = err.Error()
++		return result, err
++	}
+ 
+-	wg.Add(threadCount)
++	runCtx, cancel := context.WithCancel(ctx)
++	defer cancel()
+ 	measureCtx, measureCancel := context.WithCancel(ctx)
+-	measureCh := make(chan struct{}, 1)
++	measureDone := make(chan struct{})
+ 	go func() {
+-		defer func() {
+-			measureCh <- struct{}{}
+-		}()
+-		// load stage no need to warm up
++		defer close(measureDone)
+ 		if c.p.GetBool(prop.DoTransactions, true) {
+-			dur := c.p.GetInt64(prop.WarmUpTime, 0)
++			warmup := time.Duration(c.p.GetInt64(prop.WarmUpTime, 0)) * time.Second
++			timer := time.NewTimer(warmup)
+ 			select {
+ 			case <-ctx.Done():
++				timer.Stop()
+ 				return
+-			case <-time.After(time.Duration(dur) * time.Second):
++			case <-timer.C:
+ 			}
+ 		}
+-		// finish warming up
+ 		measurement.EnableWarmUp(false)
+-
+-		dur := c.p.GetInt64(prop.LogInterval, 10)
+-		t := time.NewTicker(time.Duration(dur) * time.Second)
+-		defer t.Stop()
+-
++		ticker := time.NewTicker(time.Duration(c.p.GetInt64(prop.LogInterval, 10)) * time.Second)
++		defer ticker.Stop()
+ 		for {
+ 			select {
+-			case <-t.C:
++			case <-ticker.C:
+ 				measurement.Summary()
+ 			case <-measureCtx.Done():
+ 				return
+@@ -205,26 +377,59 @@ func (c *Client) Run(ctx context.Context) {
+ 		}
+ 	}()
+ 
+-	for i := 0; i < threadCount; i++ {
+-		go func(threadId int) {
+-			defer wg.Done()
+-
+-			w := newWorker(c.p, threadId, threadCount, c.workload, c.db)
+-			ctx := c.workload.InitThread(ctx, threadId, threadCount)
+-			ctx = c.db.InitThread(ctx, threadId, threadCount)
+-			w.run(ctx)
+-			c.db.CleanupThread(ctx)
+-			c.workload.CleanupThread(ctx)
+-		}(i)
++	workers := make([]*worker, threadCount)
++	for i := range workers {
++		currentWorker, err := newWorker(c.p, i, threadCount, c.workload, c.db)
++		if err != nil {
++			measureCancel()
++			<-measureDone
++			result.Requested = totalOperationCount(c.p)
++			result.Failed = result.Requested
++			result.ErrorClasses["configuration"]++
++			result.ErrorMessage = err.Error()
++			return result, err
++		}
++		workers[i] = currentWorker
+ 	}
+ 
++	var wg sync.WaitGroup
++	results := make(chan Result, threadCount)
++	first := new(firstError)
++	for _, currentWorker := range workers {
++		wg.Add(1)
++		go func(w *worker) {
++			defer wg.Done()
++			results <- w.run(runCtx, strict, cancel, first)
++		}(currentWorker)
++	}
+ 	wg.Wait()
+-	if !c.p.GetBool(prop.DoTransactions, true) {
+-		// when loading is finished, try to analyze table if possible.
++	close(results)
++	for workerResult := range results {
++		result.add(workerResult)
++	}
++
++	if first.err == nil && ctx.Err() != nil {
++		first.set(ctx.Err())
++	}
++	if first.err == nil && !c.p.GetBool(prop.DoTransactions, true) &&
++		c.p.GetBool(prop.LoadAnalyze, prop.LoadAnalyzeDefault) {
+ 		if analyzeDB, ok := c.db.(ycsb.AnalyzeDB); ok {
+-			analyzeDB.Analyze(ctx, c.p.GetString(prop.TableName, prop.TableNameDefault))
++			if err := operationError(func() error {
++				return analyzeDB.Analyze(ctx, c.p.GetString(prop.TableName, prop.TableNameDefault))
++			}); err != nil {
++				result.ErrorClasses["analyze"]++
++				first.set(fmt.Errorf("analyze: %w", err))
++			}
+ 		}
+ 	}
+ 	measureCancel()
+-	<-measureCh
++	<-measureDone
++	if result.Requested != result.Successful+result.Failed {
++		return result, fmt.Errorf("operation conservation failure: requested=%d successful=%d failed=%d",
++			result.Requested, result.Successful, result.Failed)
++	}
++	if first.err != nil {
++		result.ErrorMessage = first.err.Error()
++	}
++	return result, first.err
+ }
+diff --git a/pkg/client/client_test.go b/pkg/client/client_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..9ca34f8fdd71b3b446e9afd00cc9cd2d4ce32158
+--- /dev/null
++++ b/pkg/client/client_test.go
+@@ -0,0 +1,210 @@
++package client
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"sync"
++	"sync/atomic"
++	"testing"
++
++	"github.com/magiconair/properties"
++	"github.com/pingcap/go-ycsb/pkg/measurement"
++	"github.com/pingcap/go-ycsb/pkg/prop"
++	"github.com/pingcap/go-ycsb/pkg/ycsb"
++)
++
++type fakeDB struct {
++	analyzeErr   error
++	analyzeCalls atomic.Int64
++	initPanic    bool
++	cleanupPanic bool
++}
++
++func (*fakeDB) Close() error { return nil }
++func (db *fakeDB) InitThread(ctx context.Context, _ int, _ int) context.Context {
++	if db.initPanic {
++		panic("init failed")
++	}
++	return ctx
++}
++func (db *fakeDB) CleanupThread(context.Context) {
++	if db.cleanupPanic {
++		panic("cleanup failed")
++	}
++}
++func (*fakeDB) Read(context.Context, string, string, []string) (map[string][]byte, error) {
++	return map[string][]byte{"field0": []byte("value")}, nil
++}
++func (*fakeDB) Scan(context.Context, string, string, int, []string) ([]map[string][]byte, error) {
++	return nil, nil
++}
++func (*fakeDB) Update(context.Context, string, string, map[string][]byte) error { return nil }
++func (*fakeDB) Insert(context.Context, string, string, map[string][]byte) error { return nil }
++func (*fakeDB) Delete(context.Context, string, string) error                    { return nil }
++func (db *fakeDB) Analyze(context.Context, string) error {
++	db.analyzeCalls.Add(1)
++	return db.analyzeErr
++}
++
++type fakeWorkload struct {
++	calls        atomic.Int64
++	failAt       int64
++	initPanic    bool
++	cleanupPanic bool
++	seedMu       sync.Mutex
++	seeds        map[int]int64
++}
++
++func (*fakeWorkload) Close() error { return nil }
++func (w *fakeWorkload) InitThread(ctx context.Context, threadID int, _ int) context.Context {
++	if w.initPanic {
++		panic("init failed")
++	}
++	seed, ok := ycsb.ThreadSeed(ctx)
++	if ok {
++		w.seedMu.Lock()
++		if w.seeds == nil {
++			w.seeds = make(map[int]int64)
++		}
++		w.seeds[threadID] = seed
++		w.seedMu.Unlock()
++	}
++	return ctx
++}
++func (w *fakeWorkload) CleanupThread(context.Context) {
++	if w.cleanupPanic {
++		panic("cleanup failed")
++	}
++}
++func (*fakeWorkload) Load(context.Context, ycsb.DB, int64) error { return nil }
++func (w *fakeWorkload) operation() error {
++	call := w.calls.Add(1)
++	if w.failAt > 0 && call == w.failAt {
++		return errors.New("injected operation failure")
++	}
++	return nil
++}
++func (w *fakeWorkload) DoInsert(context.Context, ycsb.DB) error      { return w.operation() }
++func (w *fakeWorkload) DoTransaction(context.Context, ycsb.DB) error { return w.operation() }
++func (w *fakeWorkload) DoBatchInsert(context.Context, int, ycsb.DB) error {
++	return w.operation()
++}
++func (w *fakeWorkload) DoBatchTransaction(context.Context, int, ycsb.DB) error {
++	return w.operation()
++}
++
++func clientProperties(t *testing.T, transactions bool, operations int64, threads int, strict bool) *properties.Properties {
++	t.Helper()
++	p := properties.NewProperties()
++	values := map[string]string{
++		prop.DoTransactions: "false",
++		prop.RecordCount:    stringInt(operations),
++		prop.ThreadCount:    stringInt(int64(threads)),
++		prop.LogInterval:    "3600",
++		prop.WarmUpTime:     "0",
++		prop.Strict:         boolString(strict),
++		prop.RandomSeed:     "991827",
++	}
++	if transactions {
++		values[prop.DoTransactions] = "true"
++		values[prop.OperationCount] = stringInt(operations)
++	}
++	for key, value := range values {
++		_, _, err := p.Set(key, value)
++		if err != nil {
++			t.Fatal(err)
++		}
++	}
++	measurement.InitMeasure(p)
++	return p
++}
++
++func stringInt(value int64) string {
++	return fmt.Sprintf("%d", value)
++}
++
++func boolString(value bool) string {
++	if value {
++		return "true"
++	}
++	return "false"
++}
++
++func TestStrictFirstErrorCancelsAndConserves(t *testing.T) {
++	p := clientProperties(t, true, 100, 4, true)
++	result, err := NewClient(p, &fakeWorkload{failAt: 1}, &fakeDB{}).Run(context.Background())
++	if err == nil {
++		t.Fatal("strict operation failure returned nil")
++	}
++	if result.Requested != 100 || result.Requested != result.Successful+result.Failed {
++		t.Fatalf("unconserved result: %+v", result)
++	}
++	if result.Attempted >= result.Requested {
++		t.Fatalf("strict cancellation did not stop peers: %+v", result)
++	}
++	if result.ErrorClasses["operation"] == 0 {
++		t.Fatalf("missing operation error class: %+v", result)
++	}
++}
++
++func TestNonStrictFailureContinuesAndConserves(t *testing.T) {
++	p := clientProperties(t, true, 7, 2, false)
++	result, err := NewClient(p, &fakeWorkload{failAt: 1}, &fakeDB{}).Run(context.Background())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if result.Requested != 7 || result.Attempted != 7 || result.Successful != 6 || result.Failed != 1 {
++		t.Fatalf("unexpected result: %+v", result)
++	}
++}
++
++func TestAnalyzeSuppressionAndPropagation(t *testing.T) {
++	p := clientProperties(t, false, 2, 1, false)
++	_, _, _ = p.Set(prop.LoadAnalyze, "false")
++	db := &fakeDB{analyzeErr: errors.New("analyze failed")}
++	if _, err := NewClient(p, &fakeWorkload{}, db).Run(context.Background()); err != nil {
++		t.Fatal(err)
++	}
++	if db.analyzeCalls.Load() != 0 {
++		t.Fatal("Analyze ran while load.analyze=false")
++	}
++
++	p = clientProperties(t, false, 2, 1, false)
++	db = &fakeDB{analyzeErr: errors.New("analyze failed")}
++	result, err := NewClient(p, &fakeWorkload{}, db).Run(context.Background())
++	if err == nil || result.ErrorClasses["analyze"] != 1 || db.analyzeCalls.Load() != 1 {
++		t.Fatalf("Analyze error was not propagated: result=%+v err=%v", result, err)
++	}
++}
++
++func TestInitializationAndCleanupPanicsBecomeErrors(t *testing.T) {
++	p := clientProperties(t, true, 3, 1, true)
++	result, err := NewClient(p, &fakeWorkload{initPanic: true}, &fakeDB{}).Run(context.Background())
++	if err == nil || result.Failed != result.Requested || result.ErrorClasses["workload_initialization"] != 1 {
++		t.Fatalf("initialization panic was not preserved: result=%+v err=%v", result, err)
++	}
++
++	p = clientProperties(t, true, 3, 1, true)
++	result, err = NewClient(p, &fakeWorkload{cleanupPanic: true}, &fakeDB{}).Run(context.Background())
++	if err == nil || result.ErrorClasses["workload_cleanup"] != 1 {
++		t.Fatalf("cleanup panic was not preserved: result=%+v err=%v", result, err)
++	}
++}
++
++func TestThreadSeedsAreStableAndIndependent(t *testing.T) {
++	run := func() map[int]int64 {
++		p := clientProperties(t, true, 4, 2, true)
++		workload := &fakeWorkload{}
++		result, err := NewClient(p, workload, &fakeDB{}).Run(context.Background())
++		if err != nil || result.Successful != 4 {
++			t.Fatalf("run failed: result=%+v err=%v", result, err)
++		}
++		return workload.seeds
++	}
++	first := run()
++	second := run()
++	if first[0] == first[1] || first[0] != second[0] || first[1] != second[1] {
++		t.Fatalf("seeds are not stable and independent: first=%v second=%v", first, second)
++	}
++}
+diff --git a/pkg/generator/deterministic_test.go b/pkg/generator/deterministic_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..d10026ac500d27a0f38604bc22db0b90a32fda3c
+--- /dev/null
++++ b/pkg/generator/deterministic_test.go
+@@ -0,0 +1,46 @@
++package generator
++
++import (
++	"math/rand"
++	"reflect"
++	"testing"
++)
++
++func sequence(generator interface{ Next(*rand.Rand) int64 }, seed int64, count int) []int64 {
++	rng := rand.New(rand.NewSource(seed))
++	values := make([]int64, count)
++	for i := range values {
++		values[i] = generator.Next(rng)
++	}
++	return values
++}
++
++func TestDeterministicUniformZipfianLatestAndScanSequences(t *testing.T) {
++	const seed = int64(81923)
++	tests := []struct {
++		name string
++		new  func() interface{ Next(*rand.Rand) int64 }
++	}{
++		{name: "uniform", new: func() interface{ Next(*rand.Rand) int64 } { return NewUniform(0, 999) }},
++		{name: "zipfian", new: func() interface{ Next(*rand.Rand) int64 } {
++			return NewScrambledZipfian(0, 999, ZipfianConstant)
++		}},
++		{name: "latest", new: func() interface{ Next(*rand.Rand) int64 } {
++			return NewSkewedLatest(NewAcknowledgedCounter(1000))
++		}},
++		{name: "scan_length", new: func() interface{ Next(*rand.Rand) int64 } { return NewUniform(1, 100) }},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			first := sequence(test.new(), seed, 64)
++			second := sequence(test.new(), seed, 64)
++			third := sequence(test.new(), seed+1, 64)
++			if !reflect.DeepEqual(first, second) {
++				t.Fatalf("same seed produced different sequences: %v != %v", first, second)
++			}
++			if reflect.DeepEqual(first, third) {
++				t.Fatalf("different seeds produced the same sequence: %v", first)
++			}
++		})
++	}
++}
+diff --git a/pkg/generator/skewedlatest.go b/pkg/generator/skewedlatest.go
+index d4d2258ac62cc9f1a6d2a10a405764b5fd3d169d..d034f7831ddcd1ea73cebba3b2dfcabfe5eb8ec9 100644
+--- a/pkg/generator/skewedlatest.go
++++ b/pkg/generator/skewedlatest.go
+@@ -32,7 +32,6 @@ package generator
+ 
+ import (
+ 	"math/rand"
+-	"time"
+ 
+ 	"github.com/pingcap/go-ycsb/pkg/ycsb"
+ )
+@@ -54,8 +53,6 @@ func NewSkewedLatest(basis ycsb.Generator) *SkewedLatest {
+ 		zipfian: zipfian,
+ 	}
+ 
+-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+-	s.Next(r)
+ 	return s
+ }
+ 
+diff --git a/pkg/generator/zipfian.go b/pkg/generator/zipfian.go
+index 4bac6075042412f102ec42245e50dd8fb2235466..d68c59120e491748b2c3bf443f9d78e34c02f23b 100644
+--- a/pkg/generator/zipfian.go
++++ b/pkg/generator/zipfian.go
+@@ -34,7 +34,6 @@ import (
+ 	"fmt"
+ 	"math"
+ 	"math/rand"
+-	"time"
+ 
+ 	"github.com/pingcap/go-ycsb/pkg/util"
+ )
+@@ -112,8 +111,6 @@ func NewZipfian(min int64, max int64, zipfianConstant float64, zetan float64) *Z
+ 	z.countForZeta = items
+ 	z.eta = (1 - math.Pow(2.0/float64(items), 1-theta)) / (1 - z.zeta2Theta/z.zetan)
+ 
+-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+-	z.Next(r)
+ 	return z
+ }
+ 
+diff --git a/pkg/measurement/measurement.go b/pkg/measurement/measurement.go
+index 26b4c612165571df9b838871674957774c16100e..5c2d1cd67c781b0f3729a172f15f8e516cdb5e8e 100644
+--- a/pkg/measurement/measurement.go
++++ b/pkg/measurement/measurement.go
+@@ -15,7 +15,9 @@ package measurement
+ 
+ import (
+ 	"bufio"
++	"fmt"
+ 	"os"
++	"sort"
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
+@@ -41,7 +43,7 @@ func (m *measurement) measure(op string, start time.Time, lan time.Duration) {
+ 	m.Unlock()
+ }
+ 
+-func (m *measurement) output() {
++func (m *measurement) output() error {
+ 	m.RLock()
+ 	defer m.RUnlock()
+ 
+@@ -52,21 +54,22 @@ func (m *measurement) output() {
+ 	} else {
+ 		f, err := os.Create(outFile)
+ 		if err != nil {
+-			panic("failed to create output file: " + err.Error())
++			return fmt.Errorf("create measurement output: %w", err)
+ 		}
+ 		defer f.Close()
+ 		w = bufio.NewWriter(f)
+ 	}
+ 
+-	err := globalMeasure.measurer.Output(w)
++	err := m.measurer.Output(w)
+ 	if err != nil {
+-		panic("failed to write output: " + err.Error())
++		return fmt.Errorf("write measurement output: %w", err)
+ 	}
+ 
+ 	err = w.Flush()
+ 	if err != nil {
+-		panic("failed to flush output: " + err.Error())
++		return fmt.Errorf("flush measurement output: %w", err)
+ 	}
++	return nil
+ }
+ 
+ func (m *measurement) summary() {
+@@ -91,10 +94,73 @@ func InitMeasure(p *properties.Properties) {
+ 	EnableWarmUp(p.GetInt64(prop.WarmUpTime, 0) > 0)
+ }
+ 
+-// Output prints the complete measurements.
+-func Output() {
++// Output prints the complete measurements and reports output failures.
++func Output() (err error) {
++	if globalMeasure == nil {
++		return nil
++	}
++	defer func() {
++		if recovered := recover(); recovered != nil {
++			err = fmt.Errorf("measurement output panic: %v", recovered)
++		}
++	}()
+ 	globalMeasure.measurer.GenerateExtendedOutputs()
+-	globalMeasure.output()
++	return globalMeasure.output()
++}
++
++// OperationSummary is the machine-readable latency summary for one label.
++type OperationSummary struct {
++	Count      int64 `json:"count"`
++	P50Micros  int64 `json:"p50_us"`
++	P95Micros  int64 `json:"p95_us"`
++	P99Micros  int64 `json:"p99_us"`
++	P999Micros int64 `json:"p99_9_us"`
++}
++
++func percentile(sorted []int64, percentile float64) int64 {
++	if len(sorted) == 0 {
++		return 0
++	}
++	index := int(float64(len(sorted)-1) * percentile / 100.0)
++	return sorted[index]
++}
++
++// Snapshot returns stable operation counts and required percentiles.
++func Snapshot() map[string]OperationSummary {
++	result := make(map[string]OperationSummary)
++	if globalMeasure == nil {
++		return result
++	}
++	globalMeasure.RLock()
++	defer globalMeasure.RUnlock()
++	switch measurer := globalMeasure.measurer.(type) {
++	case *histograms:
++		for operation, h := range measurer.histograms {
++			result[operation] = OperationSummary{
++				Count:      h.hist.TotalCount(),
++				P50Micros:  h.hist.ValueAtPercentile(50),
++				P95Micros:  h.hist.ValueAtPercentile(95),
++				P99Micros:  h.hist.ValueAtPercentile(99),
++				P999Micros: h.hist.ValueAtPercentile(99.9),
++			}
++		}
++	case *csvs:
++		for operation, entries := range measurer.opCsv {
++			latencies := make([]int64, len(entries))
++			for i := range entries {
++				latencies[i] = entries[i].latencyUs
++			}
++			sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
++			result[operation] = OperationSummary{
++				Count:      int64(len(latencies)),
++				P50Micros:  percentile(latencies, 50),
++				P95Micros:  percentile(latencies, 95),
++				P99Micros:  percentile(latencies, 99),
++				P999Micros: percentile(latencies, 99.9),
++			}
++		}
++	}
++	return result
+ }
+ 
+ // Summary prints the measurement summary.
+diff --git a/pkg/prop/prop.go b/pkg/prop/prop.go
+index 6c6daa7b9361e93eb58d2007057f452665db79a5..b78e601e1947aeae73e5107ab44ca29851837be6 100644
+--- a/pkg/prop/prop.go
++++ b/pkg/prop/prop.go
+@@ -117,6 +117,13 @@ const (
+ 
+ 	Command = "command"
+ 
++	LoadAnalyze        = "load.analyze"
++	LoadAnalyzeDefault = true
++	RandomSeed         = "randomseed"
++	Strict             = "strict"
++	StrictDefault      = false
++	ResultPath         = "result.path"
++
+ 	OutputStyle = "outputstyle"
+ 
+ 	// MeasurementHistogramPercentileExport properties -- related to histogram latencies exporting
+diff --git a/pkg/util/seed.go b/pkg/util/seed.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..796c829e840f22db93394e15ccf47007a0e743d6
+--- /dev/null
++++ b/pkg/util/seed.go
+@@ -0,0 +1,24 @@
++package util
++
++const (
++	// SeedDerivationVersion identifies the stable per-thread seed derivation.
++	SeedDerivationVersion = "splitmix64-v1"
++	// WorkloadSeedStream separates workload randomness from pacing jitter.
++	WorkloadSeedStream uint64 = 0x776f726b6c6f6164
++	// ThrottleSeedStream separates pacing jitter from workload randomness.
++	ThrottleSeedStream uint64 = 0x7468726f74746c65
++)
++
++// DeriveSeed deterministically derives an independent nonzero seed.
++func DeriveSeed(master int64, threadID int, stream uint64) int64 {
++	x := uint64(master) ^ stream ^ (uint64(threadID+1) * 0x9e3779b97f4a7c15)
++	x += 0x9e3779b97f4a7c15
++	x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9
++	x = (x ^ (x >> 27)) * 0x94d049bb133111eb
++	x ^= x >> 31
++	seed := int64(x & ((uint64(1) << 63) - 1))
++	if seed == 0 {
++		return 1
++	}
++	return seed
++}
+diff --git a/pkg/workload/core.go b/pkg/workload/core.go
+index 0df29fc1614e75ae700451743c7af756f4df6cee..79fe02c6f9e7d7b9397c498e1ff6e04096e9df49 100644
+--- a/pkg/workload/core.go
++++ b/pkg/workload/core.go
+@@ -16,6 +16,7 @@ package workload
+ import (
+ 	"bytes"
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"math"
+ 	"math/rand"
+@@ -80,7 +81,7 @@ type core struct {
+ 	valuePool sync.Pool
+ }
+ 
+-func getFieldLengthGenerator(p *properties.Properties) ycsb.Generator {
++func getFieldLengthGenerator(p *properties.Properties) (ycsb.Generator, error) {
+ 	var fieldLengthGenerator ycsb.Generator
+ 	fieldLengthDistribution := p.GetString(prop.FieldLengthDistribution, prop.FieldLengthDistributionDefault)
+ 	fieldLength := p.GetInt64(prop.FieldLength, prop.FieldLengthDefault)
+@@ -96,10 +97,10 @@ func getFieldLengthGenerator(p *properties.Properties) ycsb.Generator {
+ 	case "histogram":
+ 		fieldLengthGenerator = generator.NewHistogramFromFile(fieldLengthHistogram)
+ 	default:
+-		util.Fatalf("unknown field length distribution %s", fieldLengthDistribution)
++		return nil, fmt.Errorf("unknown field length distribution %s", fieldLengthDistribution)
+ 	}
+ 
+-	return fieldLengthGenerator
++	return fieldLengthGenerator, nil
+ }
+ 
+ func createOperationGenerator(p *properties.Properties) *generator.Discrete {
+@@ -140,7 +141,11 @@ func (c *core) Load(ctx context.Context, db ycsb.DB, totalCount int64) error {
+ 
+ // InitThread implements the Workload InitThread interface.
+ func (c *core) InitThread(ctx context.Context, _ int, _ int) context.Context {
+-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
++	seed, ok := ycsb.ThreadSeed(ctx)
++	if !ok {
++		seed = time.Now().UnixNano()
++	}
++	r := rand.New(rand.NewSource(seed))
+ 	fieldNames := make([]string, len(c.fieldNames))
+ 	copy(fieldNames, c.fieldNames)
+ 	state := &coreState{
+@@ -244,18 +249,18 @@ func (c *core) buildDeterministicValue(state *coreState, key string, fieldKey st
+ 	return b.Bytes()
+ }
+ 
+-func (c *core) verifyRow(state *coreState, key string, values map[string][]byte) {
++func (c *core) verifyRow(state *coreState, key string, values map[string][]byte) error {
+ 	if len(values) == 0 {
+-		// null data here, need panic?
+-		return
++		return fmt.Errorf("missing deterministic row for key %q", key)
+ 	}
+ 
+ 	for fieldKey, value := range values {
+ 		expected := c.buildDeterministicValue(state, key, fieldKey)
+ 		if !bytes.Equal(expected, value) {
+-			util.Fatalf("unexpected deterministic value, expect %q, but got %q", expected, value)
++			return fmt.Errorf("unexpected deterministic value, expect %q, but got %q", expected, value)
+ 		}
+ 	}
++	return nil
+ }
+ 
+ // DoInsert implements the Workload DoInsert interface.
+@@ -278,9 +283,7 @@ func (c *core) DoInsert(ctx context.Context, db ycsb.DB) error {
+ 
+ 		select {
+ 		case <-ctx.Done():
+-			if ctx.Err() == context.Canceled {
+-				return nil
+-			}
++			return ctx.Err()
+ 		default:
+ 		}
+ 
+@@ -333,9 +336,7 @@ func (c *core) DoBatchInsert(ctx context.Context, batchSize int, db ycsb.DB) err
+ 
+ 		select {
+ 		case <-ctx.Done():
+-			if ctx.Err() == context.Canceled {
+-				return nil
+-			}
++			return ctx.Err()
+ 		default:
+ 		}
+ 
+@@ -393,7 +394,7 @@ func (c *core) DoBatchTransaction(ctx context.Context, batchSize int, db ycsb.DB
+ 	case update:
+ 		return c.doBatchTransactionUpdate(ctx, batchSize, batchDB, state)
+ 	case scan:
+-		panic("The batch mode don't support the scan operation")
++		return errors.New("batch mode does not support scan operations")
+ 	default:
+ 		return nil
+ 	}
+@@ -432,16 +433,18 @@ func (c *core) doTransactionRead(ctx context.Context, db ycsb.DB, state *coreSta
+ 	}
+ 
+ 	if c.dataIntegrity {
+-		c.verifyRow(state, keyName, values)
++		return c.verifyRow(state, keyName, values)
+ 	}
+ 
+ 	return nil
+ }
+ 
+-func (c *core) doTransactionReadModifyWrite(ctx context.Context, db ycsb.DB, state *coreState) error {
++func (c *core) doTransactionReadModifyWrite(ctx context.Context, db ycsb.DB, state *coreState) (err error) {
+ 	start := time.Now()
+ 	defer func() {
+-		measurement.Measure("READ_MODIFY_WRITE", start, time.Now().Sub(start))
++		if err == nil {
++			measurement.Measure("READ_MODIFY_WRITE", start, time.Since(start))
++		}
+ 	}()
+ 
+ 	r := state.r
+@@ -474,7 +477,7 @@ func (c *core) doTransactionReadModifyWrite(ctx context.Context, db ycsb.DB, sta
+ 	}
+ 
+ 	if c.dataIntegrity {
+-		c.verifyRow(state, keyName, readValues)
++		return c.verifyRow(state, keyName, readValues)
+ 	}
+ 
+ 	return nil
+@@ -614,7 +617,11 @@ func (coreCreator) Create(p *properties.Properties) (ycsb.Workload, error) {
+ 	for i := int64(0); i < c.fieldCount; i++ {
+ 		c.fieldNames[i] = fmt.Sprintf("field%d", i)
+ 	}
+-	c.fieldLengthGenerator = getFieldLengthGenerator(p)
++	var err error
++	c.fieldLengthGenerator, err = getFieldLengthGenerator(p)
++	if err != nil {
++		return nil, err
++	}
+ 	c.recordCount = p.GetInt64(prop.RecordCount, prop.RecordCountDefault)
+ 	if c.recordCount == 0 {
+ 		c.recordCount = int64(math.MaxInt32)
+@@ -628,7 +635,7 @@ func (coreCreator) Create(p *properties.Properties) (ycsb.Workload, error) {
+ 	insertStart := p.GetInt64(prop.InsertStart, prop.InsertStartDefault)
+ 	insertCount := p.GetInt64(prop.InsertCount, c.recordCount-insertStart)
+ 	if c.recordCount < insertStart+insertCount {
+-		util.Fatalf("record count %d must be bigger than insert start %d + count %d",
++		return nil, fmt.Errorf("record count %d must be bigger than insert start %d + count %d",
+ 			c.recordCount, insertStart, insertCount)
+ 	}
+ 	c.zeroPadding = p.GetInt64(prop.ZeroPadding, prop.ZeroPaddingDefault)
+@@ -637,7 +644,7 @@ func (coreCreator) Create(p *properties.Properties) (ycsb.Workload, error) {
+ 	c.dataIntegrity = p.GetBool(prop.DataIntegrity, prop.DataIntegrityDefault)
+ 	fieldLengthDistribution := p.GetString(prop.FieldLengthDistribution, prop.FieldLengthDistributionDefault)
+ 	if c.dataIntegrity && fieldLengthDistribution != "constant" {
+-		util.Fatal("must have constant field size to check data integrity")
++		return nil, errors.New("must have constant field size to check data integrity")
+ 	}
+ 
+ 	if p.GetString(prop.InsertOrder, prop.InsertOrderDefault) == "hashed" {
+@@ -674,9 +681,9 @@ func (coreCreator) Create(p *properties.Properties) (ycsb.Workload, error) {
+ 		frac := p.GetFloat64(prop.ExponentialFrac, prop.ExponentialFracDefault)
+ 		c.keyChooser = generator.NewExponential(percentile, float64(c.recordCount)*frac)
+ 	default:
+-		util.Fatalf("unknown request distribution %s", requestDistrib)
++		return nil, fmt.Errorf("unknown request distribution %s", requestDistrib)
+ 	}
+-	fmt.Println(fmt.Sprintf("Using request distribution '%s' a keyrange of [%d %d]", requestDistrib, keyrangeLowerBound, keyrangeUpperBound))
++	fmt.Printf("Using request distribution '%s' a keyrange of [%d %d]\n", requestDistrib, keyrangeLowerBound, keyrangeUpperBound)
+ 
+ 	c.fieldChooser = generator.NewUniform(0, c.fieldCount-1)
+ 	switch scanLengthDistrib {
+@@ -685,7 +692,7 @@ func (coreCreator) Create(p *properties.Properties) (ycsb.Workload, error) {
+ 	case "zipfian":
+ 		c.scanLength = generator.NewZipfianWithRange(minScanLength, maxScanLength, generator.ZipfianConstant)
+ 	default:
+-		util.Fatalf("distribution %s not allowed for scan length", scanLengthDistrib)
++		return nil, fmt.Errorf("distribution %s not allowed for scan length", scanLengthDistrib)
+ 	}
+ 
+ 	c.insertionRetryLimit = p.GetInt64(prop.InsertionRetryLimit, prop.InsertionRetryLimitDefault)
+diff --git a/pkg/workload/core_test.go b/pkg/workload/core_test.go
+index d7bf2b0e5c1ea5aa74e1fa1ac6acd0d859b394bc..a6080545368c7aede4600fed1ad621d8df00a7e0 100644
+--- a/pkg/workload/core_test.go
++++ b/pkg/workload/core_test.go
+@@ -11,8 +11,20 @@
+ package workload
+ 
+ import (
+-	"github.com/magiconair/properties"
++	"context"
++	"encoding/hex"
++	"errors"
++	"fmt"
++	"reflect"
++	"sort"
++	"strings"
+ 	"testing"
++
++	"github.com/magiconair/properties"
++	"github.com/pingcap/go-ycsb/pkg/client"
++	"github.com/pingcap/go-ycsb/pkg/measurement"
++	"github.com/pingcap/go-ycsb/pkg/prop"
++	"github.com/pingcap/go-ycsb/pkg/ycsb"
+ )
+ 
+ func Test_core_buildKeyName(t *testing.T) {
+@@ -38,10 +50,153 @@ func Test_core_buildKeyName(t *testing.T) {
+ 	}
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
+-			c := core{p: properties.MustLoadFiles([]string{"workloads/workloadc"}, properties.UTF8, false)}
++			c := core{p: properties.NewProperties()}
+ 			if got := c.buildKeyName(tt.args.keyNum); got != tt.want {
+ 				t.Errorf("buildKeyName() = %v, want %v", got, tt.want)
+ 			}
+ 		})
+ 	}
+ }
++
++type traceDB struct {
++	trace   []string
++	readErr error
++}
++
++func (*traceDB) Close() error                                             { return nil }
++func (*traceDB) InitThread(ctx context.Context, _, _ int) context.Context { return ctx }
++func (*traceDB) CleanupThread(context.Context)                            {}
++func (db *traceDB) Read(context.Context, string, string, []string) (map[string][]byte, error) {
++	if db.readErr != nil {
++		return nil, db.readErr
++	}
++	return map[string][]byte{"field0": []byte("value")}, nil
++}
++func (db *traceDB) Scan(_ context.Context, _ string, key string, count int, _ []string) ([]map[string][]byte, error) {
++	db.trace = append(db.trace, fmt.Sprintf("S:%s:%d", key, count))
++	return nil, nil
++}
++func (db *traceDB) Update(_ context.Context, _ string, key string, values map[string][]byte) error {
++	fields := make([]string, 0, len(values))
++	for field := range values {
++		fields = append(fields, field)
++	}
++	sort.Strings(fields)
++	parts := []string{"U", key}
++	for _, field := range fields {
++		parts = append(parts, field+"="+hex.EncodeToString(values[field]))
++	}
++	db.trace = append(db.trace, strings.Join(parts, ":"))
++	return nil
++}
++func (*traceDB) Insert(context.Context, string, string, map[string][]byte) error { return nil }
++func (*traceDB) Delete(context.Context, string, string) error                    { return nil }
++
++func deterministicProperties(t *testing.T, distribution string, scanOnly bool) *properties.Properties {
++	t.Helper()
++	p := properties.NewProperties()
++	values := map[string]string{
++		prop.RecordCount:         "1000",
++		prop.OperationCount:      "64",
++		prop.FieldCount:          "3",
++		prop.FieldLength:         "16",
++		prop.RequestDistribution: distribution,
++		prop.ReadProportion:      "0",
++		prop.UpdateProportion:    "1",
++		prop.ScanProportion:      "0",
++		prop.MinScanLength:       "1",
++		prop.MaxScanLength:       "100",
++	}
++	if scanOnly {
++		values[prop.UpdateProportion] = "0"
++		values[prop.ScanProportion] = "1"
++	}
++	for key, value := range values {
++		if _, _, err := p.Set(key, value); err != nil {
++			t.Fatal(err)
++		}
++	}
++	return p
++}
++
++func workloadTrace(t *testing.T, distribution string, scanOnly bool, seed int64) []string {
++	t.Helper()
++	workload, err := (coreCreator{}).Create(deterministicProperties(t, distribution, scanOnly))
++	if err != nil {
++		t.Fatal(err)
++	}
++	ctx := workload.InitThread(ycsb.WithThreadSeed(context.Background(), seed), 0, 1)
++	db := new(traceDB)
++	for i := 0; i < 64; i++ {
++		if err := workload.DoTransaction(ctx, db); err != nil {
++			t.Fatal(err)
++		}
++	}
++	return db.trace
++}
++
++func TestDeterministicCoreOperationKeyValueAndScanSequences(t *testing.T) {
++	tests := []struct {
++		name         string
++		distribution string
++		scanOnly     bool
++	}{
++		{name: "uniform", distribution: "uniform"},
++		{name: "zipfian", distribution: "zipfian"},
++		{name: "latest", distribution: "latest"},
++		{name: "scan", distribution: "uniform", scanOnly: true},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			first := workloadTrace(t, test.distribution, test.scanOnly, 42591)
++			second := workloadTrace(t, test.distribution, test.scanOnly, 42591)
++			third := workloadTrace(t, test.distribution, test.scanOnly, 42592)
++			if !reflect.DeepEqual(first, second) {
++				t.Fatalf("same seed produced different traces\nfirst=%v\nsecond=%v", first, second)
++			}
++			if reflect.DeepEqual(first, third) {
++				t.Fatalf("different seeds produced the same trace: %v", first)
++			}
++		})
++	}
++}
++
++func TestFailedReadModifyWriteIsNotMeasuredAsSuccess(t *testing.T) {
++	p := deterministicProperties(t, "uniform", false)
++	_, _, _ = p.Set(prop.UpdateProportion, "0")
++	_, _, _ = p.Set(prop.ReadModifyWriteProportion, "1")
++	measurement.InitMeasure(p)
++	measurement.EnableWarmUp(false)
++	workload, err := (coreCreator{}).Create(p)
++	if err != nil {
++		t.Fatal(err)
++	}
++	ctx := workload.InitThread(ycsb.WithThreadSeed(context.Background(), 773), 0, 1)
++	err = workload.DoTransaction(ctx, client.DbWrapper{DB: &traceDB{}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	snapshot := measurement.Snapshot()
++	if snapshot["READ_MODIFY_WRITE"].Count != 1 || snapshot["READ"].Count != 1 || snapshot["UPDATE"].Count != 1 {
++		t.Fatalf("successful RMW DB-call counts are incomplete: %+v", snapshot)
++	}
++
++	measurement.InitMeasure(p)
++	measurement.EnableWarmUp(false)
++	workload, err = (coreCreator{}).Create(p)
++	if err != nil {
++		t.Fatal(err)
++	}
++	ctx = workload.InitThread(ycsb.WithThreadSeed(context.Background(), 773), 0, 1)
++	err = workload.DoTransaction(ctx, client.DbWrapper{DB: &traceDB{readErr: errors.New("read failed")}})
++	if err == nil {
++		t.Fatal("RMW unexpectedly succeeded")
++	}
++	snapshot = measurement.Snapshot()
++	if summary := snapshot["READ_MODIFY_WRITE"]; summary.Count != 0 {
++		t.Fatalf("failed RMW was measured as successful: %+v", summary)
++	}
++	if snapshot["READ_ERROR"].Count != 1 || snapshot["UPDATE"].Count != 0 {
++		t.Fatalf("failed RMW DB-call counts are incorrect: %+v", snapshot)
++	}
++}
+diff --git a/pkg/ycsb/seed.go b/pkg/ycsb/seed.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..b1d3a58342c7fa0960670de1c0ed88c03035e3f6
+--- /dev/null
++++ b/pkg/ycsb/seed.go
+@@ -0,0 +1,16 @@
++package ycsb
++
++import "context"
++
++type threadSeedKey struct{}
++
++// WithThreadSeed attaches the deterministic workload RNG seed for one worker.
++func WithThreadSeed(ctx context.Context, seed int64) context.Context {
++	return context.WithValue(ctx, threadSeedKey{}, seed)
++}
++
++// ThreadSeed returns a deterministic worker seed when the client supplied one.
++func ThreadSeed(ctx context.Context) (int64, bool) {
++	seed, ok := ctx.Value(threadSeedKey{}).(int64)
++	return seed, ok
++}

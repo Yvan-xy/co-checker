@@ -1,6 +1,6 @@
 // tidb_sql is a deliberately small SQL control utility for the online TPC-C
-// workflow. It is run from the TiDB module so it reuses TiDB's pinned MySQL
-// driver instead of adding another dependency to co-checker.
+// and YCSB workflows. It is run from the TiDB module so it reuses TiDB's
+// pinned MySQL driver instead of adding another dependency to co-checker.
 package main
 
 import (
@@ -25,18 +25,43 @@ import (
 
 const tpccTables = "customer,district,history,item,new_order,order_line,orders,stock,warehouse"
 
+const (
+	ycsbTableName       = "usertable"
+	ycsbKeyLength       = 64
+	ycsbDefaultFields   = 10
+	ycsbDefaultFieldLen = 100
+	ycsbDefaultPageSize = 4096
+	ycsbRetryLimit      = "100"
+)
+
 var identifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
+var expectedCheckedSessionVariables = map[string]string{
+	"transaction_isolation":             "REPEATABLE-READ",
+	"tidb_txn_mode":                     "OPTIMISTIC",
+	"tidb_enable_async_commit":          "0",
+	"tidb_enable_1pc":                   "0",
+	"tidb_low_resolution_tso":           "0",
+	"tidb_read_staleness":               "0",
+	"tidb_snapshot":                     "",
+	"tidb_store_batch_size":             "0",
+	"tidb_allow_batch_cop":              "0",
+	"tidb_index_lookup_pushdown_policy": "FORCE",
+}
+
 type options struct {
-	action    string
-	address   string
-	user      string
-	password  string
-	database  string
-	params    string
-	tables    string
-	statement string
-	timeout   time.Duration
+	action         string
+	address        string
+	user           string
+	password       string
+	database       string
+	params         string
+	tables         string
+	statement      string
+	timeout        time.Duration
+	fieldCount     int
+	fieldLength    int
+	digestPageSize int
 }
 
 type planResult struct {
@@ -53,7 +78,7 @@ type gateReport struct {
 
 func main() {
 	var cfg options
-	flag.StringVar(&cfg.action, "action", "ping", "ping, exec, assert-empty, tpcc-digest, or tpcc-gate")
+	flag.StringVar(&cfg.action, "action", "ping", "ping, exec, assert-empty, tpcc-digest, tpcc-gate, ycsb-schema, assert-ycsb-empty, ycsb-digest, or ycsb-gate")
 	flag.StringVar(&cfg.address, "address", "127.0.0.1:4000", "TiDB SQL address")
 	flag.StringVar(&cfg.user, "user", "root", "SQL user")
 	flag.StringVar(&cfg.password, "password", "", "SQL password")
@@ -62,6 +87,9 @@ func main() {
 	flag.StringVar(&cfg.tables, "tables", tpccTables, "comma-separated table names")
 	flag.StringVar(&cfg.statement, "statement", "", "SQL statement for the exec action")
 	flag.DurationVar(&cfg.timeout, "timeout", 30*time.Second, "operation timeout")
+	flag.IntVar(&cfg.fieldCount, "field-count", ycsbDefaultFields, "YCSB FIELD column count")
+	flag.IntVar(&cfg.fieldLength, "field-length", ycsbDefaultFieldLen, "YCSB FIELD VARCHAR length")
+	flag.IntVar(&cfg.digestPageSize, "digest-page-size", ycsbDefaultPageSize, "maximum YCSB rows per digest transaction")
 	flag.Parse()
 
 	if err := run(cfg); err != nil {
@@ -78,8 +106,12 @@ func run(cfg options) error {
 		return fmt.Errorf("invalid database identifier %q", cfg.database)
 	}
 
+	selectedDatabase := cfg.database
+	if cfg.action == "ycsb-schema" {
+		selectedDatabase = ""
+	}
 	dsn := fmt.Sprintf("%s:%s@tcp(%s)/%s?parseTime=true&multiStatements=true&tls=false",
-		cfg.user, cfg.password, cfg.address, cfg.database)
+		cfg.user, cfg.password, cfg.address, selectedDatabase)
 	if strings.TrimSpace(cfg.params) != "" {
 		dsn += "&" + strings.TrimPrefix(strings.TrimSpace(cfg.params), "&")
 	}
@@ -117,6 +149,14 @@ func run(cfg options) error {
 		return tpccDigest(ctx, connection)
 	case "new-order-gate", "tpcc-gate":
 		return tpccGate(ctx, connection)
+	case "ycsb-schema":
+		return ycsbSchema(ctx, connection, cfg.database, cfg.fieldCount, cfg.fieldLength)
+	case "assert-ycsb-empty":
+		return assertYCSBEmpty(ctx, connection)
+	case "ycsb-digest":
+		return ycsbDigest(ctx, connection, cfg.fieldCount, cfg.digestPageSize)
+	case "ycsb-gate":
+		return ycsbGate(ctx, connection, cfg.database, cfg.fieldCount, cfg.fieldLength)
 	default:
 		return fmt.Errorf("unknown action %q", cfg.action)
 	}
@@ -165,6 +205,289 @@ func assertEmpty(ctx context.Context, connection *sql.Conn, tableText string) er
 	encoder := json.NewEncoder(os.Stdout)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(counts)
+}
+
+type ycsbSchemaReport struct {
+	FormatVersion int    `json:"format_version"`
+	Database      string `json:"database"`
+	Table         string `json:"table"`
+	FieldCount    int    `json:"field_count"`
+	FieldLength   int    `json:"field_length"`
+	Outcome       string `json:"outcome"`
+}
+
+func validateYCSBShapeParameters(fieldCount, fieldLength int) error {
+	if fieldCount < 1 || fieldCount > 1024 {
+		return fmt.Errorf("YCSB field count %d is outside [1,1024]", fieldCount)
+	}
+	if fieldLength < 1 || fieldLength > 65535 {
+		return fmt.Errorf("YCSB field length %d is outside [1,65535]", fieldLength)
+	}
+	return nil
+}
+
+func ycsbColumnNames(fieldCount int) []string {
+	columns := make([]string, fieldCount)
+	for index := range columns {
+		columns[index] = fmt.Sprintf("FIELD%d", index)
+	}
+	return columns
+}
+
+func ycsbCreateTableSQL(database string, fieldCount, fieldLength int) (string, error) {
+	if !identifierPattern.MatchString(database) {
+		return "", fmt.Errorf("invalid database identifier %q", database)
+	}
+	if err := validateYCSBShapeParameters(fieldCount, fieldLength); err != nil {
+		return "", err
+	}
+	var builder strings.Builder
+	fmt.Fprintf(&builder, "CREATE TABLE IF NOT EXISTS `%s`.`%s` (YCSB_KEY VARCHAR(%d) PRIMARY KEY /*T![clustered_index] CLUSTERED */", database, ycsbTableName, ycsbKeyLength)
+	for index := 0; index < fieldCount; index++ {
+		fmt.Fprintf(&builder, ", FIELD%d VARCHAR(%d)", index, fieldLength)
+	}
+	builder.WriteString(");")
+	return builder.String(), nil
+}
+
+func ycsbSchema(ctx context.Context, connection *sql.Conn, database string, fieldCount, fieldLength int) error {
+	createTable, err := ycsbCreateTableSQL(database, fieldCount, fieldLength)
+	if err != nil {
+		return err
+	}
+	if _, err := connection.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+database+"`"); err != nil {
+		return fmt.Errorf("create YCSB database: %w", err)
+	}
+	if _, err := connection.ExecContext(ctx, createTable); err != nil {
+		return fmt.Errorf("create YCSB table: %w", err)
+	}
+	report := ycsbSchemaReport{
+		FormatVersion: 1,
+		Database:      database,
+		Table:         ycsbTableName,
+		FieldCount:    fieldCount,
+		FieldLength:   fieldLength,
+		Outcome:       "pass",
+	}
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(report)
+}
+
+type ycsbEmptyReport struct {
+	FormatVersion int    `json:"format_version"`
+	Table         string `json:"table"`
+	RowCount      uint64 `json:"row_count"`
+	Outcome       string `json:"outcome"`
+}
+
+func assertYCSBEmpty(ctx context.Context, connection *sql.Conn) error {
+	var count uint64
+	if err := connection.QueryRowContext(ctx, "SELECT COUNT(*) FROM `"+ycsbTableName+"`").Scan(&count); err != nil {
+		return fmt.Errorf("count YCSB table: %w", err)
+	}
+	if count != 0 {
+		return fmt.Errorf("YCSB template is not empty: %d row(s)", count)
+	}
+	report := ycsbEmptyReport{FormatVersion: 1, Table: ycsbTableName, RowCount: count, Outcome: "pass"}
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(report)
+}
+
+type ycsbDigestCell struct {
+	present bool
+	value   []byte
+}
+
+type ycsbDigestRow struct {
+	key    []byte
+	fields []ycsbDigestCell
+}
+
+type ycsbDigestReport struct {
+	FormatVersion       int    `json:"format_version"`
+	Algorithm           string `json:"algorithm"`
+	Encoding            string `json:"canonical_encoding"`
+	Digest              string `json:"database_digest_sha256"`
+	SchemaDigest        string `json:"schema_digest_sha256"`
+	DataDigest          string `json:"data_digest_sha256"`
+	TotalRows           uint64 `json:"total_rows"`
+	PageCount           uint64 `json:"page_count"`
+	ConfiguredPageSize  int    `json:"configured_page_size"`
+	MaximumObservedPage int    `json:"maximum_observed_page_size"`
+}
+
+type ycsbPageFetcher func(afterKey string, limit int) ([]ycsbDigestRow, error)
+
+func buildYCSBDigest(createStatement string, fieldCount, pageSize int, fetch ycsbPageFetcher) (ycsbDigestReport, error) {
+	report := ycsbDigestReport{
+		FormatVersion:      1,
+		Algorithm:          "sha256",
+		Encoding:           "schema frames table name and exact SHOW CREATE TABLE text; data frames ordered column names and keyset-ordered rows with uint64-le lengths plus one-byte NULL/present field markers",
+		ConfiguredPageSize: pageSize,
+	}
+	if strings.TrimSpace(createStatement) == "" {
+		return report, errors.New("YCSB digest requires a nonempty CREATE TABLE statement")
+	}
+	if err := validateYCSBShapeParameters(fieldCount, 1); err != nil {
+		return report, err
+	}
+	if pageSize <= 0 {
+		return report, fmt.Errorf("YCSB digest page size must be positive, got %d", pageSize)
+	}
+	if fetch == nil {
+		return report, errors.New("YCSB digest requires a page fetcher")
+	}
+
+	schemaDigest := sha256.New()
+	writeDigestBytes(schemaDigest, []byte(ycsbTableName))
+	writeDigestBytes(schemaDigest, []byte(createStatement))
+
+	dataDigest := sha256.New()
+	writeDigestBytes(dataDigest, []byte(ycsbTableName))
+	columns := append([]string{"YCSB_KEY"}, ycsbColumnNames(fieldCount)...)
+	var frame [8]byte
+	binary.LittleEndian.PutUint64(frame[:], uint64(len(columns)))
+	_, _ = dataDigest.Write(frame[:])
+	for _, column := range columns {
+		writeDigestBytes(dataDigest, []byte(column))
+	}
+
+	afterKey := ""
+	for {
+		page, err := fetch(afterKey, pageSize)
+		if err != nil {
+			return report, err
+		}
+		report.PageCount++
+		if len(page) > pageSize {
+			return report, fmt.Errorf("YCSB digest page returned %d rows, limit %d", len(page), pageSize)
+		}
+		if len(page) > report.MaximumObservedPage {
+			report.MaximumObservedPage = len(page)
+		}
+		previousKey := afterKey
+		for _, row := range page {
+			key := string(row.key)
+			if key <= previousKey {
+				return report, fmt.Errorf("YCSB digest keys are not strictly increasing: %q after %q", key, previousKey)
+			}
+			if len(row.fields) != fieldCount {
+				return report, fmt.Errorf("YCSB digest row %q has %d fields, want %d", key, len(row.fields), fieldCount)
+			}
+			writeDigestBytes(dataDigest, row.key)
+			for _, field := range row.fields {
+				if !field.present {
+					_, _ = dataDigest.Write([]byte{0})
+					continue
+				}
+				_, _ = dataDigest.Write([]byte{1})
+				writeDigestBytes(dataDigest, field.value)
+			}
+			previousKey = key
+			report.TotalRows++
+		}
+		if len(page) != 0 {
+			afterKey = string(page[len(page)-1].key)
+		}
+		if len(page) < pageSize {
+			break
+		}
+	}
+	binary.LittleEndian.PutUint64(frame[:], report.TotalRows)
+	_, _ = dataDigest.Write(frame[:])
+
+	schemaSum := schemaDigest.Sum(nil)
+	dataSum := dataDigest.Sum(nil)
+	combined := sha256.New()
+	writeDigestBytes(combined, schemaSum)
+	writeDigestBytes(combined, dataSum)
+	report.SchemaDigest = hex.EncodeToString(schemaSum)
+	report.DataDigest = hex.EncodeToString(dataSum)
+	report.Digest = hex.EncodeToString(combined.Sum(nil))
+	return report, nil
+}
+
+func fetchYCSBDigestPage(ctx context.Context, connection *sql.Conn, columns []string, afterKey string, limit int) ([]ycsbDigestRow, error) {
+	// TiDB rejects SQL READ ONLY transaction syntax unless its no-op-functions
+	// compatibility switch is enabled. Keep the controlled DSN exact and make
+	// this transaction read-only by construction: it executes only the bounded
+	// SELECT below before commit.
+	tx, err := connection.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin query-only YCSB digest page after %q: %w", afterKey, err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	query := "SELECT YCSB_KEY," + strings.Join(columns, ",") + " FROM `" + ycsbTableName + "` WHERE YCSB_KEY > ? ORDER BY YCSB_KEY LIMIT ?"
+	rows, err := tx.QueryContext(ctx, query, afterKey, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query YCSB digest page after %q: %w", afterKey, err)
+	}
+	page := make([]ycsbDigestRow, 0, limit)
+	for rows.Next() {
+		var key sql.RawBytes
+		fields := make([]sql.RawBytes, len(columns))
+		destinations := make([]any, 0, len(columns)+1)
+		destinations = append(destinations, &key)
+		for index := range fields {
+			destinations = append(destinations, &fields[index])
+		}
+		if err := rows.Scan(destinations...); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan YCSB digest row: %w", err)
+		}
+		row := ycsbDigestRow{key: append([]byte(nil), key...), fields: make([]ycsbDigestCell, len(fields))}
+		for index, field := range fields {
+			if field != nil {
+				row.fields[index] = ycsbDigestCell{present: true, value: append([]byte(nil), field...)}
+			}
+		}
+		page = append(page, row)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("scan YCSB digest page: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close YCSB digest page: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit YCSB digest page: %w", err)
+	}
+	committed = true
+	return page, nil
+}
+
+func ycsbDigest(ctx context.Context, connection *sql.Conn, fieldCount, pageSize int) error {
+	if err := validateYCSBShapeParameters(fieldCount, 1); err != nil {
+		return err
+	}
+	if pageSize <= 0 {
+		return fmt.Errorf("YCSB digest page size must be positive, got %d", pageSize)
+	}
+	var shownName, createStatement string
+	if err := connection.QueryRowContext(ctx, "SHOW CREATE TABLE `"+ycsbTableName+"`").Scan(&shownName, &createStatement); err != nil {
+		return fmt.Errorf("digest YCSB schema: %w", err)
+	}
+	if !strings.EqualFold(shownName, ycsbTableName) {
+		return fmt.Errorf("digest YCSB schema: SHOW CREATE returned table %q", shownName)
+	}
+	columns := ycsbColumnNames(fieldCount)
+	report, err := buildYCSBDigest(createStatement, fieldCount, pageSize, func(afterKey string, limit int) ([]ycsbDigestRow, error) {
+		return fetchYCSBDigestPage(ctx, connection, columns, afterKey, limit)
+	})
+	if err != nil {
+		return err
+	}
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(report)
 }
 
 type tpccDigestTable struct {
@@ -290,27 +613,510 @@ func tpccDigest(ctx context.Context, connection *sql.Conn) error {
 	return encoder.Encode(report)
 }
 
+type ycsbColumnShape struct {
+	name       string
+	columnType string
+	nullable   string
+	columnKey  string
+}
+
+type ycsbIndexShape struct {
+	name      string
+	column    string
+	sequence  int
+	nonUnique int
+}
+
+type ycsbTableShape struct {
+	tableType     string
+	createOptions string
+	createSQL     string
+	partitioned   bool
+	columns       []ycsbColumnShape
+	indexes       []ycsbIndexShape
+}
+
+func validateYCSBTableShape(shape ycsbTableShape, fieldCount, fieldLength int) error {
+	if err := validateYCSBShapeParameters(fieldCount, fieldLength); err != nil {
+		return err
+	}
+	if !strings.EqualFold(shape.tableType, "BASE TABLE") {
+		return fmt.Errorf("YCSB table type is %q, want BASE TABLE", shape.tableType)
+	}
+	if strings.TrimSpace(shape.createOptions) != "" {
+		return fmt.Errorf("YCSB table has unexpected create options %q", shape.createOptions)
+	}
+	if shape.partitioned {
+		return errors.New("YCSB table must not be partitioned")
+	}
+	createLower := strings.ToLower(shape.createSQL)
+	if !strings.Contains(createLower, "clustered") {
+		return errors.New("YCSB primary key is not declared CLUSTERED")
+	}
+	for _, unsupported := range []string{" temporary", " cached", " partition by"} {
+		if strings.Contains(createLower, unsupported) {
+			return fmt.Errorf("YCSB table uses unsupported schema feature %q", strings.TrimSpace(unsupported))
+		}
+	}
+	if len(shape.columns) != fieldCount+1 {
+		return fmt.Errorf("YCSB table has %d columns, want %d", len(shape.columns), fieldCount+1)
+	}
+	expected := make([]ycsbColumnShape, 0, fieldCount+1)
+	expected = append(expected, ycsbColumnShape{
+		name: "YCSB_KEY", columnType: fmt.Sprintf("varchar(%d)", ycsbKeyLength), nullable: "NO", columnKey: "PRI",
+	})
+	for index := 0; index < fieldCount; index++ {
+		expected = append(expected, ycsbColumnShape{
+			name: fmt.Sprintf("FIELD%d", index), columnType: fmt.Sprintf("varchar(%d)", fieldLength), nullable: "YES",
+		})
+	}
+	for index := range expected {
+		got := shape.columns[index]
+		want := expected[index]
+		if !strings.EqualFold(got.name, want.name) ||
+			!strings.EqualFold(got.columnType, want.columnType) ||
+			!strings.EqualFold(got.nullable, want.nullable) ||
+			!strings.EqualFold(got.columnKey, want.columnKey) {
+			return fmt.Errorf("YCSB column %d is %#v, want %#v", index, got, want)
+		}
+	}
+	if len(shape.indexes) != 1 {
+		return fmt.Errorf("YCSB table has %d index columns, want exactly the clustered primary key", len(shape.indexes))
+	}
+	index := shape.indexes[0]
+	if !strings.EqualFold(index.name, "PRIMARY") || !strings.EqualFold(index.column, "YCSB_KEY") || index.sequence != 1 || index.nonUnique != 0 {
+		return fmt.Errorf("YCSB primary index is %#v, want PRIMARY(YCSB_KEY)", index)
+	}
+	return nil
+}
+
+func readYCSBTableShape(ctx context.Context, connection *sql.Conn, database string) (ycsbTableShape, error) {
+	var shape ycsbTableShape
+	if err := connection.QueryRowContext(ctx, `SELECT TABLE_TYPE, COALESCE(CREATE_OPTIONS, '')
+		FROM information_schema.tables WHERE table_schema = ? AND table_name = ?`, database, ycsbTableName).Scan(&shape.tableType, &shape.createOptions); err != nil {
+		return shape, fmt.Errorf("read YCSB table metadata: %w", err)
+	}
+	var shownName string
+	if err := connection.QueryRowContext(ctx, "SHOW CREATE TABLE `"+ycsbTableName+"`").Scan(&shownName, &shape.createSQL); err != nil {
+		return shape, fmt.Errorf("read YCSB CREATE TABLE: %w", err)
+	}
+	if !strings.EqualFold(shownName, ycsbTableName) {
+		return shape, fmt.Errorf("SHOW CREATE returned YCSB table %q", shownName)
+	}
+	var partitions int
+	if err := connection.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.partitions
+		WHERE table_schema = ? AND table_name = ? AND partition_name IS NOT NULL`, database, ycsbTableName).Scan(&partitions); err != nil {
+		return shape, fmt.Errorf("read YCSB partitions: %w", err)
+	}
+	shape.partitioned = partitions != 0
+
+	rows, err := connection.QueryContext(ctx, `SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY
+		FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ORDINAL_POSITION`, database, ycsbTableName)
+	if err != nil {
+		return shape, fmt.Errorf("read YCSB columns: %w", err)
+	}
+	for rows.Next() {
+		var column ycsbColumnShape
+		if err := rows.Scan(&column.name, &column.columnType, &column.nullable, &column.columnKey); err != nil {
+			rows.Close()
+			return shape, fmt.Errorf("scan YCSB column: %w", err)
+		}
+		shape.columns = append(shape.columns, column)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return shape, fmt.Errorf("scan YCSB columns: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return shape, fmt.Errorf("close YCSB columns: %w", err)
+	}
+
+	rows, err = connection.QueryContext(ctx, `SELECT INDEX_NAME, COLUMN_NAME, SEQ_IN_INDEX, NON_UNIQUE
+		FROM information_schema.statistics WHERE table_schema = ? AND table_name = ? ORDER BY INDEX_NAME, SEQ_IN_INDEX`, database, ycsbTableName)
+	if err != nil {
+		return shape, fmt.Errorf("read YCSB indexes: %w", err)
+	}
+	for rows.Next() {
+		var index ycsbIndexShape
+		if err := rows.Scan(&index.name, &index.column, &index.sequence, &index.nonUnique); err != nil {
+			rows.Close()
+			return shape, fmt.Errorf("scan YCSB index: %w", err)
+		}
+		shape.indexes = append(shape.indexes, index)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return shape, fmt.Errorf("scan YCSB indexes: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return shape, fmt.Errorf("close YCSB indexes: %w", err)
+	}
+	return shape, nil
+}
+
+type ycsbGatePlanQuery struct {
+	name        string
+	textSQL     string
+	preparedSQL string
+	arguments   []any
+	mustRead    bool
+}
+
+type ycsbProbeResult struct {
+	Name         string `json:"name"`
+	Protocol     string `json:"protocol"`
+	RowsObserved int64  `json:"rows_observed"`
+}
+
+type ycsbGateReport struct {
+	FormatVersion    int               `json:"format_version"`
+	Database         string            `json:"database"`
+	Table            string            `json:"table"`
+	FieldCount       int               `json:"field_count"`
+	FieldLength      int               `json:"field_length"`
+	SessionVariables map[string]string `json:"session_variables"`
+	Plans            []planResult      `json:"plans"`
+	Probes           []ycsbProbeResult `json:"probes"`
+	Outcome          string            `json:"outcome"`
+}
+
+func sqlStringLiteral(value string) (string, error) {
+	for _, character := range value {
+		if !(character == '-' || character == '_' || character >= '0' && character <= '9' || character >= 'A' && character <= 'Z' || character >= 'a' && character <= 'z') {
+			return "", fmt.Errorf("value %q cannot be represented by the controlled SQL literal encoder", value)
+		}
+	}
+	return "'" + value + "'", nil
+}
+
+func ycsbInsertShape(fieldCount int, key, valuePrefix string, prepared bool) (string, []any, error) {
+	columns := append([]string{"YCSB_KEY"}, ycsbColumnNames(fieldCount)...)
+	if prepared {
+		placeholders := make([]string, len(columns))
+		arguments := make([]any, 0, len(columns))
+		for index := range placeholders {
+			placeholders[index] = "?"
+			if index == 0 {
+				arguments = append(arguments, key)
+			} else {
+				arguments = append(arguments, fmt.Sprintf("%s%d", valuePrefix, index-1))
+			}
+		}
+		return "INSERT IGNORE INTO `" + ycsbTableName + "` (" + strings.Join(columns, ",") + ") VALUES (" + strings.Join(placeholders, ",") + ")", arguments, nil
+	}
+	values := make([]string, len(columns))
+	for index := range values {
+		value := key
+		if index != 0 {
+			value = fmt.Sprintf("%s%d", valuePrefix, index-1)
+		}
+		literal, err := sqlStringLiteral(value)
+		if err != nil {
+			return "", nil, err
+		}
+		values[index] = literal
+	}
+	return "INSERT IGNORE INTO `" + ycsbTableName + "` (" + strings.Join(columns, ",") + ") VALUES (" + strings.Join(values, ",") + ")", nil, nil
+}
+
+func ycsbGatePlanQueries(existingKey string, fieldCount int) ([]ycsbGatePlanQuery, error) {
+	existingLiteral, err := sqlStringLiteral(existingKey)
+	if err != nil {
+		return nil, err
+	}
+	missingKey := "co_checker_gate_missing"
+	missingLiteral, _ := sqlStringLiteral(missingKey)
+	insertSQL, _, err := ycsbInsertShape(fieldCount, "co_checker_gate_plan_insert", "gate", false)
+	if err != nil {
+		return nil, err
+	}
+	preparedInsert, insertArguments, err := ycsbInsertShape(fieldCount, "co_checker_gate_plan_insert", "gate", true)
+	if err != nil {
+		return nil, err
+	}
+	fields := strings.Join(ycsbColumnNames(fieldCount), ",")
+	pointPrefix := "SELECT " + fields + " FROM `" + ycsbTableName + "` FORCE INDEX(`PRIMARY`) WHERE YCSB_KEY = "
+	return []ycsbGatePlanQuery{
+		{name: "point_select", textSQL: pointPrefix + existingLiteral, preparedSQL: pointPrefix + "?", arguments: []any{existingKey}, mustRead: true},
+		{name: "missing_select", textSQL: pointPrefix + missingLiteral, preparedSQL: pointPrefix + "?", arguments: []any{missingKey}, mustRead: true},
+		{name: "point_update", textSQL: "UPDATE `" + ycsbTableName + "` SET FIELD0 = 'gate_text' WHERE YCSB_KEY = " + existingLiteral, preparedSQL: "UPDATE `" + ycsbTableName + "` SET FIELD0 = ? WHERE YCSB_KEY = ?", arguments: []any{"gate_prepared", existingKey}, mustRead: true},
+		{name: "insert_ignore", textSQL: insertSQL, preparedSQL: preparedInsert, arguments: insertArguments},
+		{name: "range_select", textSQL: "SELECT " + fields + " FROM `" + ycsbTableName + "` WHERE YCSB_KEY >= " + existingLiteral + " LIMIT 3", preparedSQL: "SELECT " + fields + " FROM `" + ycsbTableName + "` WHERE YCSB_KEY >= ? LIMIT ?", arguments: []any{existingKey, 3}, mustRead: true},
+		{name: "point_delete", textSQL: "DELETE FROM `" + ycsbTableName + "` WHERE YCSB_KEY = " + existingLiteral, preparedSQL: "DELETE FROM `" + ycsbTableName + "` WHERE YCSB_KEY = ?", arguments: []any{existingKey}, mustRead: true},
+	}, nil
+}
+
+type queryContextExecutor interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func consumeYCSBRows(ctx context.Context, executor queryContextExecutor, query string, fieldCount int, arguments ...any) (int64, error) {
+	rows, err := executor.QueryContext(ctx, query, arguments...)
+	if err != nil {
+		return 0, err
+	}
+	return consumeYCSBResultRows(rows, fieldCount)
+}
+
+func consumePreparedYCSBRows(ctx context.Context, statement *sql.Stmt, fieldCount int, arguments ...any) (int64, error) {
+	rows, err := statement.QueryContext(ctx, arguments...)
+	if err != nil {
+		return 0, err
+	}
+	return consumeYCSBResultRows(rows, fieldCount)
+}
+
+func consumeYCSBResultRows(rows *sql.Rows, fieldCount int) (int64, error) {
+	defer rows.Close()
+	var count int64
+	for rows.Next() {
+		values := make([]sql.RawBytes, fieldCount)
+		destinations := make([]any, fieldCount)
+		for index := range values {
+			destinations[index] = &values[index]
+		}
+		if err := rows.Scan(destinations...); err != nil {
+			return count, err
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		return count, err
+	}
+	return count, rows.Close()
+}
+
+func requireAffected(result sql.Result, operation string) (int64, error) {
+	count, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("%s rows affected: %w", operation, err)
+	}
+	if count != 1 {
+		return count, fmt.Errorf("%s affected %d rows, want 1", operation, count)
+	}
+	return count, nil
+}
+
+func ycsbGate(ctx context.Context, connection *sql.Conn, database string, fieldCount, fieldLength int) error {
+	if !identifierPattern.MatchString(database) {
+		return fmt.Errorf("invalid database identifier %q", database)
+	}
+	shape, err := readYCSBTableShape(ctx, connection, database)
+	if err != nil {
+		return err
+	}
+	if err := validateYCSBTableShape(shape, fieldCount, fieldLength); err != nil {
+		return fmt.Errorf("YCSB capability gate: %w", err)
+	}
+	variables, err := readCheckedSessionVariables(ctx, connection)
+	if err != nil {
+		return err
+	}
+	if err := validateYCSBSessionVariables("YCSB capability gate", variables); err != nil {
+		return err
+	}
+
+	var existingKey string
+	if err := connection.QueryRowContext(ctx, "SELECT YCSB_KEY FROM `"+ycsbTableName+"` ORDER BY YCSB_KEY LIMIT 1").Scan(&existingKey); err != nil {
+		return fmt.Errorf("YCSB capability gate requires a loaded row: %w", err)
+	}
+	planQueries, err := ycsbGatePlanQueries(existingKey, fieldCount)
+	if err != nil {
+		return fmt.Errorf("YCSB capability gate plan shapes: %w", err)
+	}
+	report := ycsbGateReport{
+		FormatVersion:    1,
+		Database:         database,
+		Table:            ycsbTableName,
+		FieldCount:       fieldCount,
+		FieldLength:      fieldLength,
+		SessionVariables: variables,
+		Plans:            make([]planResult, 0, 2*len(planQueries)),
+	}
+	for _, query := range planQueries {
+		operators, rows, err := explainPlan(ctx, connection, query.textSQL)
+		if err != nil {
+			return fmt.Errorf("YCSB capability gate: explain %s text: %w", query.name, err)
+		}
+		if err := validateTPCPlan(query.name+"_text", operators, rows, query.mustRead); err != nil {
+			return err
+		}
+		report.Plans = append(report.Plans, planResult{Name: query.name + "_text", Operators: operators, Rows: rows})
+		operators, rows, err = explainPlan(ctx, connection, query.preparedSQL, query.arguments...)
+		if err != nil {
+			return fmt.Errorf("YCSB capability gate: explain %s prepared: %w", query.name, err)
+		}
+		if err := validateTPCPlan(query.name+"_prepared", operators, rows, query.mustRead); err != nil {
+			return err
+		}
+		report.Plans = append(report.Plans, planResult{Name: query.name + "_prepared", Operators: operators, Rows: rows})
+	}
+
+	fields := strings.Join(ycsbColumnNames(fieldCount), ",")
+	existingLiteral, _ := sqlStringLiteral(existingKey)
+	missingKey := "co_checker_gate_missing"
+	missingLiteral, _ := sqlStringLiteral(missingKey)
+	pointPrefix := "SELECT " + fields + " FROM `" + ycsbTableName + "` FORCE INDEX(`PRIMARY`) WHERE YCSB_KEY = "
+	textCount, err := consumeYCSBRows(ctx, connection, pointPrefix+existingLiteral, fieldCount)
+	if err != nil || textCount != 1 {
+		return fmt.Errorf("YCSB text point probe observed %d rows: %w", textCount, err)
+	}
+	report.Probes = append(report.Probes, ycsbProbeResult{Name: "point_select", Protocol: "text", RowsObserved: textCount})
+	preparedPoint, err := connection.PrepareContext(ctx, pointPrefix+"?")
+	if err != nil {
+		return fmt.Errorf("prepare YCSB point probe: %w", err)
+	}
+	preparedCount, queryErr := consumePreparedYCSBRows(ctx, preparedPoint, fieldCount, existingKey)
+	closeErr := preparedPoint.Close()
+	if queryErr != nil || closeErr != nil || preparedCount != 1 {
+		return fmt.Errorf("YCSB prepared point probe observed %d rows: query=%v close=%v", preparedCount, queryErr, closeErr)
+	}
+	report.Probes = append(report.Probes, ycsbProbeResult{Name: "point_select", Protocol: "prepared", RowsObserved: preparedCount})
+
+	textCount, err = consumeYCSBRows(ctx, connection, pointPrefix+missingLiteral, fieldCount)
+	if err != nil || textCount != 0 {
+		return fmt.Errorf("YCSB text missing probe observed %d rows: %w", textCount, err)
+	}
+	report.Probes = append(report.Probes, ycsbProbeResult{Name: "missing_select", Protocol: "text", RowsObserved: textCount})
+	preparedMissing, err := connection.PrepareContext(ctx, pointPrefix+"?")
+	if err != nil {
+		return fmt.Errorf("prepare YCSB missing probe: %w", err)
+	}
+	preparedCount, queryErr = consumePreparedYCSBRows(ctx, preparedMissing, fieldCount, missingKey)
+	closeErr = preparedMissing.Close()
+	if queryErr != nil || closeErr != nil || preparedCount != 0 {
+		return fmt.Errorf("YCSB prepared missing probe observed %d rows: query=%v close=%v", preparedCount, queryErr, closeErr)
+	}
+	report.Probes = append(report.Probes, ycsbProbeResult{Name: "missing_select", Protocol: "prepared", RowsObserved: preparedCount})
+
+	rangeText := "SELECT " + fields + " FROM `" + ycsbTableName + "` WHERE YCSB_KEY >= " + existingLiteral + " LIMIT 3"
+	textCount, err = consumeYCSBRows(ctx, connection, rangeText, fieldCount)
+	if err != nil || textCount < 1 || textCount > 3 {
+		return fmt.Errorf("YCSB text range probe observed %d rows: %w", textCount, err)
+	}
+	report.Probes = append(report.Probes, ycsbProbeResult{Name: "range_select", Protocol: "text", RowsObserved: textCount})
+	preparedRange, err := connection.PrepareContext(ctx, "SELECT "+fields+" FROM `"+ycsbTableName+"` WHERE YCSB_KEY >= ? LIMIT ?")
+	if err != nil {
+		return fmt.Errorf("prepare YCSB range probe: %w", err)
+	}
+	preparedCount, queryErr = consumePreparedYCSBRows(ctx, preparedRange, fieldCount, existingKey, 3)
+	closeErr = preparedRange.Close()
+	if queryErr != nil || closeErr != nil || preparedCount < 1 || preparedCount > 3 {
+		return fmt.Errorf("YCSB prepared range probe observed %d rows: query=%v close=%v", preparedCount, queryErr, closeErr)
+	}
+	report.Probes = append(report.Probes, ycsbProbeResult{Name: "range_select", Protocol: "prepared", RowsObserved: preparedCount})
+
+	if err := runYCSBMutatingProbes(ctx, connection, existingKey, fieldCount, &report); err != nil {
+		return err
+	}
+	report.Outcome = "pass"
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(report)
+}
+
+func runYCSBMutatingProbes(ctx context.Context, connection *sql.Conn, existingKey string, fieldCount int, report *ycsbGateReport) error {
+	tx, err := connection.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin YCSB mutating probes: %w", err)
+	}
+	defer tx.Rollback()
+	existingLiteral, _ := sqlStringLiteral(existingKey)
+	result, err := tx.ExecContext(ctx, "UPDATE `"+ycsbTableName+"` SET FIELD0 = 'gate_text' WHERE YCSB_KEY = "+existingLiteral)
+	if err != nil {
+		return fmt.Errorf("YCSB text update probe: %w", err)
+	}
+	count, err := requireAffected(result, "YCSB text update probe")
+	if err != nil {
+		return err
+	}
+	report.Probes = append(report.Probes, ycsbProbeResult{Name: "point_update", Protocol: "text", RowsObserved: count})
+	prepared, err := tx.PrepareContext(ctx, "UPDATE `"+ycsbTableName+"` SET FIELD0 = ? WHERE YCSB_KEY = ?")
+	if err != nil {
+		return fmt.Errorf("prepare YCSB update probe: %w", err)
+	}
+	result, execErr := prepared.ExecContext(ctx, "gate_prepared", existingKey)
+	closeErr := prepared.Close()
+	if execErr != nil || closeErr != nil {
+		return fmt.Errorf("YCSB prepared update probe: execute=%v close=%v", execErr, closeErr)
+	}
+	count, err = requireAffected(result, "YCSB prepared update probe")
+	if err != nil {
+		return err
+	}
+	report.Probes = append(report.Probes, ycsbProbeResult{Name: "point_update", Protocol: "prepared", RowsObserved: count})
+
+	textInsertKey := "co_checker_gate_text_insert"
+	preparedInsertKey := "co_checker_gate_prepared_insert"
+	textInsert, _, err := ycsbInsertShape(fieldCount, textInsertKey, "text", false)
+	if err != nil {
+		return err
+	}
+	result, err = tx.ExecContext(ctx, textInsert)
+	if err != nil {
+		return fmt.Errorf("YCSB text insert probe: %w", err)
+	}
+	count, err = requireAffected(result, "YCSB text insert probe")
+	if err != nil {
+		return err
+	}
+	report.Probes = append(report.Probes, ycsbProbeResult{Name: "insert_ignore", Protocol: "text", RowsObserved: count})
+	preparedInsert, insertArguments, err := ycsbInsertShape(fieldCount, preparedInsertKey, "prepared", true)
+	if err != nil {
+		return err
+	}
+	prepared, err = tx.PrepareContext(ctx, preparedInsert)
+	if err != nil {
+		return fmt.Errorf("prepare YCSB insert probe: %w", err)
+	}
+	result, execErr = prepared.ExecContext(ctx, insertArguments...)
+	closeErr = prepared.Close()
+	if execErr != nil || closeErr != nil {
+		return fmt.Errorf("YCSB prepared insert probe: execute=%v close=%v", execErr, closeErr)
+	}
+	count, err = requireAffected(result, "YCSB prepared insert probe")
+	if err != nil {
+		return err
+	}
+	report.Probes = append(report.Probes, ycsbProbeResult{Name: "insert_ignore", Protocol: "prepared", RowsObserved: count})
+
+	textInsertLiteral, _ := sqlStringLiteral(textInsertKey)
+	result, err = tx.ExecContext(ctx, "DELETE FROM `"+ycsbTableName+"` WHERE YCSB_KEY = "+textInsertLiteral)
+	if err != nil {
+		return fmt.Errorf("YCSB text delete probe: %w", err)
+	}
+	count, err = requireAffected(result, "YCSB text delete probe")
+	if err != nil {
+		return err
+	}
+	report.Probes = append(report.Probes, ycsbProbeResult{Name: "point_delete", Protocol: "text", RowsObserved: count})
+	prepared, err = tx.PrepareContext(ctx, "DELETE FROM `"+ycsbTableName+"` WHERE YCSB_KEY = ?")
+	if err != nil {
+		return fmt.Errorf("prepare YCSB delete probe: %w", err)
+	}
+	result, execErr = prepared.ExecContext(ctx, preparedInsertKey)
+	closeErr = prepared.Close()
+	if execErr != nil || closeErr != nil {
+		return fmt.Errorf("YCSB prepared delete probe: execute=%v close=%v", execErr, closeErr)
+	}
+	count, err = requireAffected(result, "YCSB prepared delete probe")
+	if err != nil {
+		return err
+	}
+	report.Probes = append(report.Probes, ycsbProbeResult{Name: "point_delete", Protocol: "prepared", RowsObserved: count})
+	if err := tx.Rollback(); err != nil {
+		return fmt.Errorf("rollback YCSB mutating probes: %w", err)
+	}
+	return nil
+}
+
 func tpccGate(ctx context.Context, connection *sql.Conn) error {
 	variables, err := readCheckedSessionVariables(ctx, connection)
 	if err != nil {
 		return err
 	}
-	expected := map[string]string{
-		"transaction_isolation":             "REPEATABLE-READ",
-		"tidb_txn_mode":                     "OPTIMISTIC",
-		"tidb_enable_async_commit":          "0",
-		"tidb_enable_1pc":                   "0",
-		"tidb_low_resolution_tso":           "0",
-		"tidb_read_staleness":               "0",
-		"tidb_snapshot":                     "",
-		"tidb_store_batch_size":             "0",
-		"tidb_allow_batch_cop":              "0",
-		"tidb_index_lookup_pushdown_policy": "FORCE",
-	}
-	for name, want := range expected {
-		if got := strings.ToUpper(variables[name]); got != want {
-			return fmt.Errorf("capability gate: %s=%q, want %q", name, variables[name], want)
-		}
+	if err := validateCheckedSessionVariables("capability gate", variables); err != nil {
+		return err
 	}
 
 	queries := tpccPlanQueries()
@@ -350,8 +1156,8 @@ func readCheckedSessionVariables(ctx context.Context, connection *sql.Conn) (map
 		@@tidb_enable_async_commit, @@tidb_enable_1pc,
 		@@tidb_low_resolution_tso, @@tidb_read_staleness, @@tidb_snapshot,
 		@@tidb_store_batch_size, @@tidb_allow_batch_cop,
-		@@tidb_index_lookup_pushdown_policy`
-	values := make([]sql.NullString, 10)
+		@@tidb_index_lookup_pushdown_policy, @@tidb_retry_limit`
+	values := make([]sql.NullString, 11)
 	arguments := make([]any, len(values))
 	for i := range values {
 		arguments[i] = &values[i]
@@ -363,7 +1169,7 @@ func readCheckedSessionVariables(ctx context.Context, connection *sql.Conn) (map
 		"transaction_isolation", "tidb_txn_mode", "tidb_enable_async_commit",
 		"tidb_enable_1pc", "tidb_low_resolution_tso", "tidb_read_staleness", "tidb_snapshot",
 		"tidb_store_batch_size", "tidb_allow_batch_cop",
-		"tidb_index_lookup_pushdown_policy",
+		"tidb_index_lookup_pushdown_policy", "tidb_retry_limit",
 	}
 	result := make(map[string]string, len(names))
 	for i, name := range names {
@@ -372,6 +1178,33 @@ func readCheckedSessionVariables(ctx context.Context, connection *sql.Conn) (map
 		}
 	}
 	return result, nil
+}
+
+func validateCheckedSessionVariables(gate string, variables map[string]string) error {
+	for name, want := range expectedCheckedSessionVariables {
+		got, exists := variables[name]
+		if !exists {
+			return fmt.Errorf("%s: session variable %s is missing", gate, name)
+		}
+		if strings.ToUpper(got) != want {
+			return fmt.Errorf("%s: %s=%q, want %q", gate, name, got, want)
+		}
+	}
+	return nil
+}
+
+func validateYCSBSessionVariables(gate string, variables map[string]string) error {
+	if err := validateCheckedSessionVariables(gate, variables); err != nil {
+		return err
+	}
+	got, exists := variables["tidb_retry_limit"]
+	if !exists {
+		return fmt.Errorf("%s: session variable tidb_retry_limit is missing", gate)
+	}
+	if got != ycsbRetryLimit {
+		return fmt.Errorf("%s: tidb_retry_limit=%q, want %q", gate, got, ycsbRetryLimit)
+	}
+	return nil
 }
 
 type namedPlanQuery struct {
