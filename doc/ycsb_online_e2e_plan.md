@@ -1,8 +1,8 @@
 # Add deterministic YCSB support and measure online-checker overhead
 
 Status: in progress; Milestones 0-6 and Milestone 7 smoke/calibration are
-complete; the requested 100,000-row diagnostic is complete and the five-trial
-four-mode publication matrix remains paused at the user's request
+complete; the corrected 100,000-row, single-trial four-mode diagnostic is
+complete and the five-trial publication matrix remains paused
 
 Scope: `/home/dyf/code/db-consistency/co-checker`,
 `/home/dyf/code/db-consistency/tidb-online`, and a pinned go-ycsb v1.0.3 source
@@ -144,6 +144,31 @@ validation succeeds. Failed detail is retained temporarily for diagnosis.
   transaction path across 47.37 events/publication and remains CPU-saturated.
   Preserved 5.2 MiB of compact profile evidence and recorded the diagnosis
   before pruning temporary stores/logs.
+- [x] (2026-08-10 17:31Z) The newly requested four-mode diagnostic failed
+  closed in its B baseline smoke because the checked-in go-ycsb patch did not
+  contain the Zipfian inclusive-upper-bound correction already described by
+  this plan. Restored the one-line correction, added the deterministic
+  10,000-draw regression (the old code returns unloaded key 10,000 at draw
+  6,656 with seed 1), and passed the five-package normal/race/vet selections
+  plus `go build` from a fresh pinned checkout.
+- [x] (2026-08-10 18:21Z) Re-ran the fixed-seed 100,000-row A-F diagnostic in
+  all four modes. The mandatory smoke and measured matrices were each 24/24
+  valid, every full verdict was `pass`, and every cell succeeded on its first
+  attempt. Capture-only, order-only, and full arithmetic-mean fixed-work
+  overhead across A-F was 48.76%, 52.70%, and 53.18%, respectively. The final
+  root is 392 KB after automatic raw-success pruning.
+- [x] (2026-08-10 18:49Z) At user request, also ran the same four-stage split
+  for pinned Sysbench 1.0.20 point-only OLTP read/write with 500,000 successful
+  events per mode. Baseline/capture/order/full throughput was
+  3495.79/3347.68/3246.72/3227.75 tx/s (4.24%, 7.12%, and 7.67% overhead), and
+  capture/order/full closed as `capture-only-complete`,
+  `order-only-complete`, and `pass`. The validated compact root is 384 KB.
+- [x] (2026-08-10 18:52Z) Re-applied the final go-ycsb patch to a fresh pinned
+  checkout and passed the five-package normal and race tests, five-package
+  `go vet`, and `go build`. The YCSB analyzer fixtures passed 9/9 and the fresh
+  native Release CTest suite passed 5/5. Final artifact validation reports
+  24/24 YCSB rows and 4/4 Sysbench modes valid, with no retained stores,
+  running clients/servers, or occupied benchmark ports.
 - [ ] Complete at least five valid paired measured trials per selected workload
   and publish the raw and summarized overhead results.
 
@@ -273,6 +298,12 @@ validation succeeds. Failed detail is retained temporarily for diagnosis.
   that samples 10,000 Zipfian keys and requires every key to remain in
   `[0, recordcount)`. The complete patched package, race, and vet selections
   pass from a fresh export.
+- Observation: on 2026-08-10 the living-plan prose and repository source had
+  drifted: the plan claimed the Zipfian correction was present, but the
+  versioned patch at HEAD omitted it. The fixed-seed B smoke selected
+  `Hash64(10000)` after loading only numeric keys 0 through 9,999, and strict
+  row validation correctly stopped the run before measurement. Source and
+  executable tests, not the stale prose, determined the repair.
 - Observation: `TIDB_ONLINE_CHECKER_CLUSTER_EPOCH` is an unsigned integer, not
   a free-form run label. The first checked runner startup failed closed when an
   otherwise unique nanosecond epoch had workload/mode suffixes. The runner now
@@ -373,6 +404,17 @@ validation succeeds. Failed detail is retained temporarily for diagnosis.
   similarly to YCSB E. It is not comparable to 25,731 one-event C
   transactions/s solely by client count or total SQL statement count.
   Evidence: `/home/dyf/code/db-consistency/results/tpcc-global-lock-20260724-3x600s/tpcc-report.md`.
+- Observation: upstream Sysbench 1.0.20 point-only OLTP RW does not preserve a
+  100,000-row count under TiDB Error 9007 whole-event retries when the schema's
+  primary key is AUTO_INCREMENT. The completed four-mode run ended with
+  100,264-100,267 rows and 477-606 ignored 9007 errors even though every mode
+  reported exactly 500,000 successful events. Baseline inspection found 267
+  IDs above 100,000 and two missing IDs in the original range. This behavior
+  was outside the timed-success invariant used by the previous Sysbench run;
+  the corrected runner strictly gates the initial 100,000 rows and records,
+  rather than rejects, final row drift.
+  Evidence:
+  `/home/dyf/code/db-consistency/sysbench-online-results/sysbench_rw_point_only_four_modes_500k_20260810T183741Z/`.
 
 ## Decision Log
 
@@ -426,6 +468,13 @@ validation succeeds. Failed detail is retained temporarily for diagnosis.
   read would turn deterministic client key-generation corruption into an
   apparently valid database operation and violate zero-error conservation.
   Date/Author: 2026-08-09 / Codex.
+- Decision: restore the missing Zipfian correction before restarting the
+  four-mode benchmark; do not retry the deterministic failing seed and do not
+  weaken strict missing-row validation.
+  Rationale: either alternative would conceal an out-of-domain workload key
+  and invalidate operation conservation. The smallest correct change is the
+  inclusive upper bound `insertStart + insertCount + expectedNewKeys - 1`.
+  Date/Author: 2026-08-10 / Codex.
 - Decision: derive workload and throttle seeds with two domain-separated
   SplitMix64-v1 streams and carry the workload seed in the worker context.
   Rationale: this preserves the upstream interfaces, gives every thread stable
@@ -610,6 +659,21 @@ validation succeeds. Failed detail is retained temporarily for diagnosis.
   CPU/perf profiles needed to revisit symbol attribution plus human-readable
   reports, exact run summaries, and headline/TPC-C reference CSVs.
   Date/Author: 2026-08-09 / Codex.
+- Decision: treat the requested one-trial YCSB/Sysbench four-mode runs as
+  preliminary diagnostics, not as completion of the five-paired-trial
+  publication acceptance criterion.
+  Rationale: they provide the requested capture/order cost split, but one
+  sample cannot quantify run-to-run variance or support medians/MADs.
+  Date/Author: 2026-08-10 / Codex.
+- Decision: for the pinned Sysbench comparison, require exactly 100,000 rows
+  after load and exactly 500,000 successful measured events, but record final
+  AUTO_INCREMENT row drift instead of requiring the final count to remain
+  100,000.
+  Rationale: strict final equality is not an invariant of the pinned upstream
+  workload under its configured Error 9007 whole-event retry behavior and was
+  not part of the prior baseline/full comparison. Reporting the drift and retry
+  counts preserves the evidence without silently changing the workload.
+  Date/Author: 2026-08-10 / Codex.
 
 ## Outcomes & Retrospective
 
@@ -654,13 +718,15 @@ binary and full `go version -m` evidence are retained under
 commit, patch hash, tests, and matching independent build hashes.
 
 The first strict live runner warm-up subsequently exposed the upstream
-Zipfian inclusive-bound error described above. The corrected current patch is
-2,495 lines with SHA-256
-`8bc3b361130b6a159a5847ccb126a1ebc1cdd9ff383002099467bc35f52bb6d5`;
+Zipfian inclusive-bound error described above. After restoring the correction
+that repository source had lost despite this plan's earlier prose, the current
+patch is 2,497 lines with SHA-256
+`bb0c0e5a50cb16deba3f99053f01a5e82483ff27f8d0e90d3e75b26d687e4611`;
 the original Milestone 2 artifact remains historical evidence and is
 superseded for every E2E run. A fresh export again passed the five-package,
-race, and vet selections. The current immutable live diagnostic client has
-SHA-256 `d6de1f2a202f2146d41c90eb9dd02cb0fce2c8479efb353499aa4e57ee8b145f`.
+race, and vet selections. The corrected immutable client used by the
+2026-08-10 four-mode diagnostic has SHA-256
+`76adf8cff0fb4d4b79986159da8293599ecc7a47de865dd795ae858fe95d3ccf`.
 
 Milestone 3 added the six `co-checker-ycsb-core-v1` property profiles with
 hard-coded SHA-256 expectations, exact schema/emptiness actions, a canonical
@@ -829,6 +895,40 @@ perf, and blocking-stack evidence is retained under
 `/home/dyf/code/db-consistency/ycsb-online-results/ycsb_overhead_profile_20260809T200930Z`;
 the `SHA256SUMS` file hashes to
 `b2e072b27d03d9546090d6abc80830749046e025ba4a93041444016f4d0f262e`.
+
+The corrected four-mode, single-trial YCSB diagnostic is
+`/home/dyf/code/db-consistency/ycsb-online-results/ycsb_four_modes_fixed_100k_basic_20260810T172553Z`.
+Its smoke and measured matrices are each 24/24 valid; no cell retried, every
+full verdict is `pass`, and `valid.json` records 24 valid measured rows. Fixed-
+work overhead for capture/order/full is A 63.95/66.05/66.69%, B
+54.11/59.03/59.48%, C 51.54/58.50/58.70%, D 53.29/59.24/59.46%, E
+6.97/8.44/10.14%, and F 62.68/64.94/64.64%. The arithmetic means across A-F
+are 48.76/52.70/53.18%. The final root is 392 KB; SHA-256 values are
+`2775a333514d278269116697ffe2a84eaab8bbd6c9e4a4fd02dcc13b71c7b360`
+for `ycsb-trials.csv`,
+`2feecace6aee7da0f3267255629c8cc14b000b76c6ee370c4fb9ec217f0fe08b`
+for `ycsb-performance.csv`,
+`fe93cc101b093ac59ee2da25890a289d865a7f9c5fa91fa27123677c46ab88fe`
+for `ycsb-summary.json`, and
+`d92e97eadd293663d3c1a0ee6ecca828c23283f48e0164e0052de5e18d5d89d3`
+for `ycsb-report.md`.
+
+The adjacent requested four-mode Sysbench result is
+`/home/dyf/code/db-consistency/sysbench-online-results/sysbench_rw_point_only_four_modes_500k_20260810T183741Z`.
+Every mode completed exactly 500,000 successful events. Baseline throughput is
+3495.79 tx/s; capture/order/full throughput is 3347.68/3246.72/3227.75 tx/s,
+or 4.24/7.12/7.67% overhead. The checked measured intervals contain 500,016
+publications (500,000 workload events plus 16 thread-init session gates), have
+balanced attempt/abort/publication lifecycles, and full checks all 10,498,491
+accepted events with zero violations. The final root is 384 KB and
+`validation.json` passes 4/4 modes with no retained stores or build binary.
+SHA-256 values are
+`b1d92f8d7c3d9fe31d21288af97aaca615d2c2ec1bba4d297ce65fc2a377e577`
+for `sysbench-results.csv`,
+`4ed5b3c1b68d5bd2e7d3d08e54bd4a89378924b994879a7af3b8333a439c05a9`
+for `summary.json`, and
+`a9bbf9595717508f2f602c5b4a935172b31ab506b521ae12363db92b32b6c41b`
+for `validation.json`.
 
 No complete five-trial performance result exists yet.
 When each milestone finishes, record the commands, test outcomes, artifact
@@ -1631,3 +1731,11 @@ therefore `requested = successful + failed` remains invariant without hiding
 peer cancellation. Successful RMW is the only path that records the logical
 RMW histogram, while READ/UPDATE DB-call measurements remain independently
 visible.
+
+2026-08-10: Restored the documented but missing Zipfian inclusive-bound fix
+after the fixed-seed B smoke selected the first unloaded key. A fresh pinned
+checkout passed normal/race/vet tests and build, then the corrected 100,000-row
+A-F four-mode diagnostic passed 24/24 smoke and measured cells. The requested
+adjacent Sysbench 500,000-event four-mode split also passed and documented the
+upstream Error 9007/AUTO_INCREMENT final-row drift instead of changing the
+pinned workload.

@@ -2243,6 +2243,15 @@ index 0df29fc1614e75ae700451743c7af756f4df6cee..79fe02c6f9e7d7b9397c498e1ff6e040
  	}
  
  	if p.GetString(prop.InsertOrder, prop.InsertOrderDefault) == "hashed" {
+@@ -661,7 +668,7 @@ func (coreCreator) Create(p *properties.Properties) (ycsb.Workload, error) {
+ 		insertProportion := p.GetFloat64(prop.InsertProportion, prop.InsertProportionDefault)
+ 		opCount := p.GetInt64(prop.OperationCount, 0)
+ 		expectedNewKeys := int64(float64(opCount) * insertProportion * 2.0)
+-		keyrangeUpperBound = insertStart + insertCount + expectedNewKeys
++		keyrangeUpperBound = insertStart + insertCount + expectedNewKeys - 1
+ 		c.keyChooser = generator.NewScrambledZipfian(keyrangeLowerBound, keyrangeUpperBound, generator.ZipfianConstant)
+ 	case "latest":
+ 		c.keyChooser = generator.NewSkewedLatest(c.transactionInsertKeySequence)
 @@ -674,9 +681,9 @@ func (coreCreator) Create(p *properties.Properties) (ycsb.Workload, error) {
  		frac := p.GetFloat64(prop.ExponentialFrac, prop.ExponentialFracDefault)
  		c.keyChooser = generator.NewExponential(percentile, float64(c.recordCount)*frac)
@@ -2268,7 +2277,7 @@ diff --git a/pkg/workload/core_test.go b/pkg/workload/core_test.go
 index d7bf2b0e5c1ea5aa74e1fa1ac6acd0d859b394bc..a6080545368c7aede4600fed1ad621d8df00a7e0 100644
 --- a/pkg/workload/core_test.go
 +++ b/pkg/workload/core_test.go
-@@ -11,8 +11,20 @@
+@@ -11,8 +11,21 @@
  package workload
  
  import (
@@ -2277,6 +2286,7 @@ index d7bf2b0e5c1ea5aa74e1fa1ac6acd0d859b394bc..a6080545368c7aede4600fed1ad621d8
 +	"encoding/hex"
 +	"errors"
 +	"fmt"
++	"math/rand"
 +	"reflect"
 +	"sort"
 +	"strings"
@@ -2290,7 +2300,7 @@ index d7bf2b0e5c1ea5aa74e1fa1ac6acd0d859b394bc..a6080545368c7aede4600fed1ad621d8
  )
  
  func Test_core_buildKeyName(t *testing.T) {
-@@ -38,10 +50,153 @@ func Test_core_buildKeyName(t *testing.T) {
+@@ -38,10 +51,171 @@ func Test_core_buildKeyName(t *testing.T) {
  	}
  	for _, tt := range tests {
  		t.Run(tt.name, func(t *testing.T) {
@@ -2362,6 +2372,24 @@ index d7bf2b0e5c1ea5aa74e1fa1ac6acd0d859b394bc..a6080545368c7aede4600fed1ad621d8
 +		}
 +	}
 +	return p
++}
++
++func TestZipfianReadRangeExcludesFirstUnloadedKey(t *testing.T) {
++	p := deterministicProperties(t, "zipfian", false)
++	_, _, _ = p.Set(prop.RecordCount, "10000")
++	_, _, _ = p.Set(prop.OperationCount, "10000")
++	_, _, _ = p.Set(prop.InsertProportion, "0")
++	workload, err := (coreCreator{}).Create(p)
++	if err != nil {
++		t.Fatal(err)
++	}
++	c := workload.(*core)
++	r := rand.New(rand.NewSource(1))
++	for i := 0; i < 10000; i++ {
++		if key := c.keyChooser.Next(r); key < 0 || key >= 10000 {
++			t.Fatalf("zipfian chooser returned unloaded key %d at draw %d", key, i)
++		}
++	}
 +}
 +
 +func workloadTrace(t *testing.T, distribution string, scanOnly bool, seed int64) []string {
