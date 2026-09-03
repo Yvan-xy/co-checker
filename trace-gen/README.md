@@ -115,3 +115,97 @@ preprocessor:
 cmake --build build --target trace-preprocess
 ./build/trace-preprocess -o traces/tpcc/tpcc.yaml --rename traces/tpcc/raw/tpcc.raw.yaml
 ```
+
+## Generate YCSB Traces
+
+Generate a real TiDB YCSB trace with PingCAP `go-ycsb`:
+
+```bash
+THETA=0.8 OPS_PER_TXN=8 SESSIONS=4 \
+  RECORD_COUNT=1000 TXN_COUNT=1000 \
+  ./trace-gen/generate_ycsb.sh
+```
+
+The script uses the instrumented checkout at `../tidb-tracegen`, starts a local
+UniStore TiDB, loads the initial YCSB rows, runs the workload, preprocesses the
+raw YAML, and writes the matching binary trace. Outputs default to
+`./traces/ycsb/` and `./bin_traces/ycsb/`.
+
+For large traces or binary-only experiments, set `BINARY_ONLY=1`. This uses
+`raw_trace_to_binary.py` to filter, commit-sort, densify sessions, and encode the
+raw TiDB stream in two passes while retaining only transaction metadata and one
+transaction's events in memory. It skips the normalized YAML entirely.
+
+Stock `go-ycsb` v1.0.3 pins Zipfian theta to `0.99` and executes MySQL
+operations in autocommit mode. On its first run, this script clones that pinned
+official release under `./build`, applies
+`go_ycsb_v1.0.3_grouped_txn.patch`, and builds it. The small patch adds:
+
+- `zipfianconstant`, computed over the actual loaded-key domain so theta sweeps
+  remain comparable;
+- `operationspertransaction`, which runs exactly that many independently
+  selected YCSB operations between `BEGIN` and `COMMIT`;
+- `retryconflictedtransactions`, which retries TiDB error 9007/1213/8022 groups
+  without consuming their successful-transaction quota;
+- transaction boundaries on each worker's pinned MySQL connection;
+- `mysql.params`, used by default to select optimistic TiDB transactions; and
+- a switch to omit the irrelevant post-load `ANALYZE TABLE` transaction.
+
+The primary knobs are:
+
+- `THETA`: Zipfian theta, strictly between `0` and `1`;
+- `OPS_PER_TXN`: logical operations in every measured YCSB transaction; and
+- `SESSIONS`: measured workers, each backed by one pinned TiDB connection.
+
+`TXN_COUNT` is the successful measured-transaction target when
+`RETRY_CONFLICTED_TXNS=1` (the default). The wrapper derives go-ycsb's
+successful logical-operation target as `TXN_COUNT * OPS_PER_TXN` and
+distributes whole transactions across workers. Set `RETRY_CONFLICTED_TXNS=0`
+only when failed groups should consume the attempted-transaction quota.
+`RECORD_COUNT`, `LOAD_THREADS`, and `LOAD_BATCH_SIZE` control initialization.
+The record count must be divisible by `LOAD_THREADS * LOAD_BATCH_SIZE`, because
+upstream batch loading otherwise overshoots its requested count.
+
+Optimistic concurrent updates can lose a commit race. Load errors and unexpected
+run errors are always fatal. With the default retry setting, TiDB
+write-conflict/deadlock/retryable KV groups (error 9007, 1213, or 8022) are
+rolled back and retried
+as fresh grouped transactions until every worker reaches its successful quota.
+The trace preprocessor removes all aborted attempts. Set
+`FAIL_ON_RUN_ERRORS=1` when an experiment should reject a run that encountered
+even these successfully retried aborts.
+
+The default workload file is `trace-gen/ycsb_workloada.properties` (50% reads,
+50% updates). Supply `WORKLOAD_FILE` to change the operation mix. The wrapper
+still forces zero warm-up and an initial key range of `[0, RECORD_COUNT)` so a
+custom profile cannot silently add uncounted traced transactions or change the
+loaded key population. Connection, binary, checkout, port, output, table, and
+transaction-mode paths/settings all have environment overrides; run
+`./trace-gen/generate_ycsb.sh --help` for the common ones. In particular:
+
+```bash
+TIDB_REPO=/path/to/tidb-tracegen \
+GO_YCSB_BIN=/path/to/already-patched/go-ycsb \
+TIDB_SERVER_BIN=/path/to/instrumented/tidb-server \
+TRACE_PREPROCESS=/path/to/trace-preprocess \
+TRACE_CONVERT=/path/to/trace-convert \
+OUTPUT_DIR=/tmp/ycsb-yaml BIN_TRACE_DIR=/tmp/ycsb-binary \
+RETRY_CONFLICTED_TXNS=1 \
+MYSQL_PARAMS='tidb_txn_mode=optimistic' \
+  ./trace-gen/generate_ycsb.sh
+```
+
+The initial load is intentionally traced. Offline checkers reconstruct database
+state only from writes in the trace, so a run-only trace would make reads of
+preloaded rows look like reads without a visible version. Consequently,
+`SESSIONS` controls the measured run, while the normalized filename's leading
+`<sessions>s` count can be larger because it reports all load/setup and measured
+connections retained in the self-contained trace.
+
+Finally, `OPS_PER_TXN` counts logical YCSB operations. For example,
+`TXN_COUNT=1000000 OPS_PER_TXN=10` fixes 10,000,000 successful logical
+operations, not 10,000,000 checker events. The filename's `<events>e` count is
+lower-level TiDB KV reads and writes; it cannot be derived exactly from the
+logical operation count. Fixing the successful transaction and operation
+counts makes session-sweep event totals statistically comparable, while their
+actual header counts remain authoritative.

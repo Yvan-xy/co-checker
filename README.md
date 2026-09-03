@@ -63,9 +63,20 @@ Regenerate the trace fixtures with:
 ./trace-gen/generate.sh
 ```
 
-By default this expects the instrumented TiDB checkout at `../tidb`, writes YAML
-fixtures into `./traces`, and writes binary fixtures into `./bin_traces`. See
-`trace-gen/README.md` for path overrides and manual preprocessing commands.
+Generate a parameterized YCSB trace with the official PingCAP client plus the
+checked-in grouped-transaction patch:
+
+```bash
+THETA=0.8 OPS_PER_TXN=8 SESSIONS=4 \
+  RECORD_COUNT=1000 TXN_COUNT=1000 \
+  ./trace-gen/generate_ycsb.sh
+```
+
+The fixture generator expects its historical instrumented checkout at `../tidb`;
+the YCSB runner defaults to the checkout in this workspace at
+`../tidb-tracegen`. Both write YAML under `./traces` and matching binary files
+under `./bin_traces`. See `trace-gen/README.md` for path overrides, workload
+knobs, and manual preprocessing commands.
 
 ## Online Engine Design
 

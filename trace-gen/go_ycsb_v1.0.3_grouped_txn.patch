@@ -1,0 +1,1024 @@
+diff --git a/db/mysql/db.go b/db/mysql/db.go
+index 4c48876..a22cade 100644
+--- a/db/mysql/db.go
++++ b/db/mysql/db.go
+@@ -38,6 +38,7 @@ const (
+ 	mysqlUser       = "mysql.user"
+ 	mysqlPassword   = "mysql.password"
+ 	mysqlDBName     = "mysql.db"
++	mysqlParams     = "mysql.params"
+ 	mysqlForceIndex = "mysql.force_index"
+ 	// TODO: support batch and auto commit
+ 
+@@ -56,12 +57,21 @@ func (drv *muxDriver) Open(name string) (driver.Conn, error) {
+ 	return drv.internal.Open(drv.instances[int(k)%len(drv.instances)])
+ }
+ 
+-func openTiDBInstances(addrs []string, user string, pass string, db string) (*sql.DB, error) {
++func dsnWithParams(dsn string, params string) string {
++	params = strings.TrimSpace(params)
++	params = strings.TrimPrefix(params, "?")
++	if params == "" {
++		return dsn
++	}
++	return dsn + "?" + params
++}
++
++func openTiDBInstances(addrs []string, user string, pass string, db string, params string) (*sql.DB, error) {
+ 	instances := make([]string, len(addrs))
+ 	hash := sha1.New()
+ 	for i, addr := range addrs {
+-		hash.Write([]byte("+" + addr))
+-		instances[i] = fmt.Sprintf("%s:%s@tcp(%s)/%s", user, pass, addr, db)
++		instances[i] = dsnWithParams(fmt.Sprintf("%s:%s@tcp(%s)/%s", user, pass, addr, db), params)
++		hash.Write([]byte("+" + instances[i]))
+ 	}
+ 	digest := hash.Sum(nil)
+ 	driver := "tidb:" + hex.EncodeToString(digest[:])
+@@ -107,6 +117,7 @@ func (c mysqlCreator) Create(p *properties.Properties) (ycsb.DB, error) {
+ 	user := p.GetString(mysqlUser, "root")
+ 	password := p.GetString(mysqlPassword, "")
+ 	dbName := p.GetString(mysqlDBName, "test")
++	params := p.GetString(mysqlParams, "")
+ 	tidbList := p.GetString(tidbInstances, "")
+ 
+ 	var (
+@@ -121,9 +132,9 @@ func (c mysqlCreator) Create(p *properties.Properties) (ycsb.DB, error) {
+ 		}
+ 	}
+ 	if len(tidbs) > 0 {
+-		db, err = openTiDBInstances(tidbs, user, password, dbName)
++		db, err = openTiDBInstances(tidbs, user, password, dbName, params)
+ 	} else {
+-		dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s", user, password, host, port, dbName)
++		dsn := dsnWithParams(fmt.Sprintf("%s:%s@tcp(%s:%d)/%s", user, password, host, port, dbName), params)
+ 		db, err = sql.Open("mysql", dsn)
+ 	}
+ 	if err != nil {
+@@ -210,6 +221,27 @@ func (db *mysqlDB) CleanupThread(ctx context.Context) {
+ 	state.conn.Close()
+ }
+ 
++func (db *mysqlDB) execTransactionControl(ctx context.Context, statement string) error {
++	state := ctx.Value(stateKey).(*mysqlState)
++	_, err := state.conn.ExecContext(ctx, statement)
++	return err
++}
++
++// BeginTransaction starts a transaction on the worker's pinned connection.
++func (db *mysqlDB) BeginTransaction(ctx context.Context) error {
++	return db.execTransactionControl(ctx, "BEGIN")
++}
++
++// CommitTransaction commits the transaction on the worker's pinned connection.
++func (db *mysqlDB) CommitTransaction(ctx context.Context) error {
++	return db.execTransactionControl(ctx, "COMMIT")
++}
++
++// RollbackTransaction rolls back the transaction on the worker's pinned connection.
++func (db *mysqlDB) RollbackTransaction(ctx context.Context) error {
++	return db.execTransactionControl(ctx, "ROLLBACK")
++}
++
+ func (db *mysqlDB) getAndCacheStmt(ctx context.Context, query string) (*sql.Stmt, error) {
+ 	state := ctx.Value(stateKey).(*mysqlState)
+ 
+diff --git a/db/mysql/db_test.go b/db/mysql/db_test.go
+new file mode 100644
+index 0000000..52197c6
+--- /dev/null
++++ b/db/mysql/db_test.go
+@@ -0,0 +1,37 @@
++// Copyright 2026 PingCAP, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package mysql
++
++import "testing"
++
++func TestDSNWithParams(t *testing.T) {
++	const base = "root:@tcp(127.0.0.1:4000)/test"
++	tests := []struct {
++		name   string
++		params string
++		want   string
++	}{
++		{name: "empty", want: base},
++		{name: "plain", params: "tidb_txn_mode=optimistic", want: base + "?tidb_txn_mode=optimistic"},
++		{name: "leading question mark", params: "?tidb_txn_mode=optimistic", want: base + "?tidb_txn_mode=optimistic"},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if got := dsnWithParams(base, tt.params); got != tt.want {
++				t.Fatalf("dsnWithParams() = %q, want %q", got, tt.want)
++			}
++		})
++	}
++}
+diff --git a/pkg/client/client.go b/pkg/client/client.go
+index 7537ce0..68f72fc 100644
+--- a/pkg/client/client.go
++++ b/pkg/client/client.go
+@@ -15,37 +15,53 @@ package client
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"math/rand"
+ 	"os"
++	"strconv"
++	"strings"
+ 	"sync"
+ 	"time"
+ 
++	"github.com/go-sql-driver/mysql"
+ 	"github.com/magiconair/properties"
+ 	"github.com/pingcap/go-ycsb/pkg/measurement"
+ 	"github.com/pingcap/go-ycsb/pkg/prop"
++	"github.com/pingcap/go-ycsb/pkg/util"
+ 	"github.com/pingcap/go-ycsb/pkg/ycsb"
+ )
+ 
+ type worker struct {
+-	p               *properties.Properties
+-	workDB          ycsb.DB
+-	workload        ycsb.Workload
+-	doTransactions  bool
+-	doBatch         bool
+-	batchSize       int
+-	opCount         int64
+-	targetOpsPerMs  float64
+-	threadID        int
+-	targetOpsTickNs int64
+-	opsDone         int64
++	p                           *properties.Properties
++	workDB                      ycsb.DB
++	workload                    ycsb.Workload
++	doTransactions              bool
++	groupTransactions           bool
++	retryConflictedTransactions bool
++	doBatch                     bool
++	batchSize                   int
++	operationsPerTransaction    int
++	opCount                     int64
++	unlimited                   bool
++	targetOpsPerMs              float64
++	threadID                    int
++	targetOpsTickNs             int64
++	opsDone                     int64
++	retryConflicts              int64
+ }
+ 
+ func newWorker(p *properties.Properties, threadID int, threadCount int, workload ycsb.Workload, db ycsb.DB) *worker {
+ 	w := new(worker)
+ 	w.p = p
+ 	w.doTransactions = p.GetBool(prop.DoTransactions, true)
++	_, w.groupTransactions = p.Get(prop.OperationsPerTransaction)
++	w.retryConflictedTransactions = p.GetBool(
++		prop.RetryConflictedTransactions,
++		prop.RetryConflictedTransactionsDefault,
++	)
+ 	w.batchSize = p.GetInt(prop.BatchSize, prop.DefaultBatchSize)
++	w.operationsPerTransaction = p.GetInt(prop.OperationsPerTransaction, prop.OperationsPerTransactionDefault)
+ 	if w.batchSize > 1 {
+ 		w.doBatch = true
+ 	}
+@@ -64,20 +80,29 @@ func newWorker(p *properties.Properties, threadID int, threadCount int, workload
+ 		}
+ 	}
+ 
+-	if totalOpCount < int64(threadCount) {
+-		fmt.Printf("totalOpCount(%s/%s/%s): %d should be bigger than threadCount: %d",
+-			prop.OperationCount,
+-			prop.InsertCount,
+-			prop.RecordCount,
+-			totalOpCount,
+-			threadCount)
++	if w.doTransactions && w.groupTransactions {
++		w.unlimited = totalOpCount == 0
++		transactionCount := totalOpCount / int64(w.operationsPerTransaction)
++		w.opCount = transactionCount / int64(threadCount) * int64(w.operationsPerTransaction)
++		if threadID < int(transactionCount%int64(threadCount)) {
++			w.opCount += int64(w.operationsPerTransaction)
++		}
++	} else {
++		if totalOpCount < int64(threadCount) {
++			fmt.Printf("totalOpCount(%s/%s/%s): %d should be bigger than threadCount: %d",
++				prop.OperationCount,
++				prop.InsertCount,
++				prop.RecordCount,
++				totalOpCount,
++				threadCount)
+ 
+-		os.Exit(-1)
+-	}
++			os.Exit(-1)
++		}
+ 
+-	w.opCount = totalOpCount / int64(threadCount)
+-	if threadID < int(totalOpCount%int64(threadCount)) {
+-		w.opCount++
++		w.opCount = totalOpCount / int64(threadCount)
++		if threadID < int(totalOpCount%int64(threadCount)) {
++			w.opCount++
++		}
+ 	}
+ 
+ 	targetPerThreadPerms := float64(-1)
+@@ -94,6 +119,87 @@ func newWorker(p *properties.Properties, threadID int, threadCount int, workload
+ 	return w
+ }
+ 
++func validateTransactionGrouping(p *properties.Properties) error {
++	if !p.GetBool(prop.DoTransactions, true) {
++		return nil
++	}
++	rawOperationsPerTransaction, ok := p.Get(prop.OperationsPerTransaction)
++	if !ok {
++		return nil
++	}
++
++	operationsPerTransaction, err := strconv.Atoi(strings.TrimSpace(rawOperationsPerTransaction))
++	if err != nil {
++		return fmt.Errorf("invalid %s %q: %w", prop.OperationsPerTransaction, rawOperationsPerTransaction, err)
++	}
++	if _, _, err := p.Set(prop.OperationsPerTransaction, strconv.Itoa(operationsPerTransaction)); err != nil {
++		return fmt.Errorf("normalize %s: %w", prop.OperationsPerTransaction, err)
++	}
++	if operationsPerTransaction < 1 {
++		return fmt.Errorf("%s must be at least 1, got %d", prop.OperationsPerTransaction, operationsPerTransaction)
++	}
++	if batchSize := p.GetInt(prop.BatchSize, prop.DefaultBatchSize); batchSize > 1 {
++		return fmt.Errorf("%s cannot be combined with %s greater than 1", prop.OperationsPerTransaction, prop.BatchSize)
++	}
++
++	operationCount := p.GetInt64(prop.OperationCount, 0)
++	if operationCount < 0 {
++		return fmt.Errorf("%s must not be negative, got %d", prop.OperationCount, operationCount)
++	}
++	if operationCount != 0 && operationCount%int64(operationsPerTransaction) != 0 {
++		return fmt.Errorf("%s (%d) must be divisible by %s (%d)", prop.OperationCount, operationCount,
++			prop.OperationsPerTransaction, operationsPerTransaction)
++	}
++	return nil
++}
++
++func transactionDB(db ycsb.DB) (ycsb.TransactionDB, bool) {
++	txDB, ok := db.(ycsb.TransactionDB)
++	if ok {
++		return txDB, true
++	}
++	if wrapper, ok := db.(DbWrapper); ok {
++		txDB, ok = wrapper.DB.(ycsb.TransactionDB)
++		return txDB, ok
++	}
++	return nil, false
++}
++
++func (w *worker) runGroupedTransaction(ctx context.Context) error {
++	db, ok := transactionDB(w.workDB)
++	if !ok {
++		return fmt.Errorf("database %T does not support grouped transactions", w.workDB)
++	}
++	if err := db.BeginTransaction(ctx); err != nil {
++		return err
++	}
++
++	for i := 0; i < w.operationsPerTransaction; i++ {
++		if err := w.workload.DoTransaction(ctx, w.workDB); err != nil {
++			if rollbackErr := db.RollbackTransaction(ctx); rollbackErr != nil {
++				return fmt.Errorf("operation failed: %w; rollback failed: %v", err, rollbackErr)
++			}
++			return err
++		}
++	}
++
++	if err := db.CommitTransaction(ctx); err != nil {
++		if rollbackErr := db.RollbackTransaction(ctx); rollbackErr != nil {
++			return fmt.Errorf("commit failed: %w; rollback failed: %v", err, rollbackErr)
++		}
++		return err
++	}
++	return nil
++}
++
++func isRetryableTransactionConflict(err error) bool {
++	var mysqlErr *mysql.MySQLError
++	if !errors.As(err, &mysqlErr) {
++		return false
++	}
++	return mysqlErr.Number == 9007 || mysqlErr.Number == 1213 || mysqlErr.Number == 8022
++}
++
+ func (w *worker) throttle(ctx context.Context, startTime time.Time) {
+ 	if w.targetOpsPerMs <= 0 {
+ 		return
+@@ -111,6 +217,12 @@ func (w *worker) throttle(ctx context.Context, startTime time.Time) {
+ }
+ 
+ func (w *worker) run(ctx context.Context) {
++	defer func() {
++		if w.retryConflicts > 0 && !w.p.GetBool(prop.Silence, prop.SilenceDefault) {
++			fmt.Printf("retryable transaction conflicts: %d\n", w.retryConflicts)
++		}
++	}()
++
+ 	// spread the thread operation out so they don't all hit the DB at the same time
+ 	if w.targetOpsPerMs > 0.0 && w.targetOpsPerMs <= 1.0 {
+ 		time.Sleep(time.Duration(rand.Int63n(w.targetOpsTickNs)))
+@@ -118,11 +230,14 @@ func (w *worker) run(ctx context.Context) {
+ 
+ 	startTime := time.Now()
+ 
+-	for w.opCount == 0 || w.opsDone < w.opCount {
++	for w.unlimited || w.opsDone < w.opCount {
+ 		var err error
+ 		opsCount := 1
+ 		if w.doTransactions {
+-			if w.doBatch {
++			if w.groupTransactions {
++				err = w.runGroupedTransaction(ctx)
++				opsCount = w.operationsPerTransaction
++			} else if w.doBatch {
+ 				err = w.workload.DoBatchTransaction(ctx, w.batchSize, w.workDB)
+ 				opsCount = w.batchSize
+ 			} else {
+@@ -137,11 +252,17 @@ func (w *worker) run(ctx context.Context) {
+ 			}
+ 		}
+ 
+-		if err != nil && !w.p.GetBool(prop.Silence, prop.SilenceDefault) {
++		retryConflict := err != nil && w.groupTransactions &&
++			w.retryConflictedTransactions && isRetryableTransactionConflict(err)
++		if retryConflict {
++			w.retryConflicts++
++		}
++		if err != nil && !retryConflict &&
++			!w.p.GetBool(prop.Silence, prop.SilenceDefault) {
+ 			fmt.Printf("operation err: %v\n", err)
+ 		}
+ 
+-		if measurement.IsWarmUpFinished() {
++		if measurement.IsWarmUpFinished() && !retryConflict {
+ 			w.opsDone += int64(opsCount)
+ 			w.throttle(ctx, startTime)
+ 		}
+@@ -171,6 +292,17 @@ func NewClient(p *properties.Properties, workload ycsb.Workload, db ycsb.DB) *Cl
+ func (c *Client) Run(ctx context.Context) {
+ 	var wg sync.WaitGroup
+ 	threadCount := c.p.GetInt(prop.ThreadCount, 1)
++	if err := validateTransactionGrouping(c.p); err != nil {
++		util.Fatalf("invalid transaction grouping: %v", err)
++	}
++	if c.p.GetBool(prop.DoTransactions, true) {
++		_, groupTransactions := c.p.Get(prop.OperationsPerTransaction)
++		if groupTransactions {
++			if _, ok := transactionDB(c.db); !ok {
++				util.Fatalf("database %T does not support grouped transactions", c.db)
++			}
++		}
++	}
+ 
+ 	wg.Add(threadCount)
+ 	measureCtx, measureCancel := context.WithCancel(ctx)
+@@ -219,7 +351,8 @@ func (c *Client) Run(ctx context.Context) {
+ 	}
+ 
+ 	wg.Wait()
+-	if !c.p.GetBool(prop.DoTransactions, true) {
++	if !c.p.GetBool(prop.DoTransactions, true) &&
++		c.p.GetBool(prop.AnalyzeAfterLoad, prop.AnalyzeAfterLoadDefault) {
+ 		// when loading is finished, try to analyze table if possible.
+ 		if analyzeDB, ok := c.db.(ycsb.AnalyzeDB); ok {
+ 			analyzeDB.Analyze(ctx, c.p.GetString(prop.TableName, prop.TableNameDefault))
+diff --git a/pkg/client/client_grouped_transaction_test.go b/pkg/client/client_grouped_transaction_test.go
+new file mode 100644
+index 0000000..9e36ec9
+--- /dev/null
++++ b/pkg/client/client_grouped_transaction_test.go
+@@ -0,0 +1,346 @@
++// Copyright 2026 PingCAP, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package client
++
++import (
++	"context"
++	"errors"
++	"reflect"
++	"strconv"
++	"testing"
++
++	"github.com/go-sql-driver/mysql"
++	"github.com/magiconair/properties"
++	"github.com/pingcap/go-ycsb/pkg/prop"
++	"github.com/pingcap/go-ycsb/pkg/ycsb"
++)
++
++type recordingDB struct {
++	events       []string
++	commitErr    error
++	commitErrors []error
++	commitCalls  int
++	analyzeCalls int
++}
++
++func (db *recordingDB) Close() error { return nil }
++
++func (db *recordingDB) InitThread(ctx context.Context, _ int, _ int) context.Context {
++	return ctx
++}
++
++func (db *recordingDB) CleanupThread(context.Context) {}
++
++func (db *recordingDB) Read(context.Context, string, string, []string) (map[string][]byte, error) {
++	return nil, nil
++}
++
++func (db *recordingDB) Scan(context.Context, string, string, int, []string) ([]map[string][]byte, error) {
++	return nil, nil
++}
++
++func (db *recordingDB) Update(context.Context, string, string, map[string][]byte) error {
++	return nil
++}
++
++func (db *recordingDB) Insert(context.Context, string, string, map[string][]byte) error {
++	return nil
++}
++
++func (db *recordingDB) Delete(context.Context, string, string) error { return nil }
++
++func (db *recordingDB) BeginTransaction(context.Context) error {
++	db.events = append(db.events, "begin")
++	return nil
++}
++
++func (db *recordingDB) CommitTransaction(context.Context) error {
++	db.events = append(db.events, "commit")
++	db.commitCalls++
++	if len(db.commitErrors) > 0 {
++		err := db.commitErrors[0]
++		db.commitErrors = db.commitErrors[1:]
++		return err
++	}
++	return db.commitErr
++}
++
++func (db *recordingDB) RollbackTransaction(context.Context) error {
++	db.events = append(db.events, "rollback")
++	return nil
++}
++
++func (db *recordingDB) Analyze(context.Context, string) error {
++	db.analyzeCalls++
++	return nil
++}
++
++type recordingWorkload struct {
++	db     *recordingDB
++	calls  int
++	failAt int
++}
++
++func (w *recordingWorkload) Close() error { return nil }
++
++func (w *recordingWorkload) InitThread(ctx context.Context, _ int, _ int) context.Context {
++	return ctx
++}
++
++func (w *recordingWorkload) CleanupThread(context.Context) {}
++
++func (w *recordingWorkload) Load(context.Context, ycsb.DB, int64) error { return nil }
++
++func (w *recordingWorkload) DoInsert(context.Context, ycsb.DB) error { return nil }
++
++func (w *recordingWorkload) DoBatchInsert(context.Context, int, ycsb.DB) error { return nil }
++
++func (w *recordingWorkload) DoTransaction(context.Context, ycsb.DB) error {
++	w.calls++
++	w.db.events = append(w.db.events, "operation")
++	if w.calls == w.failAt {
++		return errors.New("injected operation failure")
++	}
++	return nil
++}
++
++func (w *recordingWorkload) DoBatchTransaction(context.Context, int, ycsb.DB) error {
++	return nil
++}
++
++func groupedProperties(operationCount int, operationsPerTransaction int) *properties.Properties {
++	p := properties.NewProperties()
++	p.Set(prop.DoTransactions, "true")
++	p.Set(prop.OperationCount, strconv.Itoa(operationCount))
++	p.Set(prop.OperationsPerTransaction, strconv.Itoa(operationsPerTransaction))
++	p.Set(prop.Silence, "true")
++	return p
++}
++
++func TestWorkerGroupedTransactionCommitsAfterKOperations(t *testing.T) {
++	p := groupedProperties(3, 3)
++	db := &recordingDB{}
++	workload := &recordingWorkload{db: db}
++	w := newWorker(p, 0, 1, workload, DbWrapper{DB: db})
++
++	w.run(context.Background())
++
++	want := []string{"begin", "operation", "operation", "operation", "commit"}
++	if !reflect.DeepEqual(db.events, want) {
++		t.Fatalf("events = %v, want %v", db.events, want)
++	}
++	if w.opsDone != 3 {
++		t.Fatalf("opsDone = %d, want 3 logical operations", w.opsDone)
++	}
++}
++
++func TestWorkerGroupedTransactionRollsBackOnOperationError(t *testing.T) {
++	p := groupedProperties(3, 3)
++	db := &recordingDB{}
++	workload := &recordingWorkload{db: db, failAt: 2}
++	w := newWorker(p, 0, 1, workload, db)
++
++	w.run(context.Background())
++
++	want := []string{"begin", "operation", "operation", "rollback"}
++	if !reflect.DeepEqual(db.events, want) {
++		t.Fatalf("events = %v, want %v", db.events, want)
++	}
++}
++
++func TestWorkerGroupedTransactionRollsBackOnCommitError(t *testing.T) {
++	p := groupedProperties(2, 2)
++	db := &recordingDB{commitErr: errors.New("injected commit failure")}
++	workload := &recordingWorkload{db: db}
++	w := newWorker(p, 0, 1, workload, db)
++
++	w.run(context.Background())
++
++	want := []string{"begin", "operation", "operation", "commit", "rollback"}
++	if !reflect.DeepEqual(db.events, want) {
++		t.Fatalf("events = %v, want %v", db.events, want)
++	}
++}
++
++func TestWorkerRetriesConflictUntilTransactionCommits(t *testing.T) {
++	p := groupedProperties(2, 2)
++	p.Set(prop.RetryConflictedTransactions, "true")
++	db := &recordingDB{commitErrors: []error{
++		&mysql.MySQLError{Number: 9007, Message: "Write conflict"},
++	}}
++	workload := &recordingWorkload{db: db}
++	w := newWorker(p, 0, 1, workload, db)
++
++	w.run(context.Background())
++
++	want := []string{
++		"begin", "operation", "operation", "commit", "rollback",
++		"begin", "operation", "operation", "commit",
++	}
++	if !reflect.DeepEqual(db.events, want) {
++		t.Fatalf("events = %v, want %v", db.events, want)
++	}
++	if db.commitCalls != 2 {
++		t.Fatalf("commit calls = %d, want 2", db.commitCalls)
++	}
++	if w.retryConflicts != 1 {
++		t.Fatalf("retry conflicts = %d, want 1", w.retryConflicts)
++	}
++	if w.opsDone != 2 {
++		t.Fatalf("opsDone = %d, want 2 successful logical operations", w.opsDone)
++	}
++}
++
++func TestRetryableTransactionConflictCodes(t *testing.T) {
++	for _, code := range []uint16{9007, 1213, 8022} {
++		if !isRetryableTransactionConflict(&mysql.MySQLError{Number: code}) {
++			t.Errorf("MySQL error %d should be retryable", code)
++		}
++	}
++	if isRetryableTransactionConflict(&mysql.MySQLError{Number: 1062}) {
++		t.Error("duplicate-key error should not be retryable")
++	}
++}
++
++func TestWorkerDoesNotRetryUnexpectedGroupedError(t *testing.T) {
++	p := groupedProperties(2, 2)
++	p.Set(prop.RetryConflictedTransactions, "true")
++	db := &recordingDB{commitErr: errors.New("unexpected commit failure")}
++	workload := &recordingWorkload{db: db}
++	w := newWorker(p, 0, 1, workload, db)
++
++	w.run(context.Background())
++
++	if db.commitCalls != 1 {
++		t.Fatalf("commit calls = %d, want 1", db.commitCalls)
++	}
++	if w.opsDone != 2 {
++		t.Fatalf("opsDone = %d, want 2 attempted logical operations", w.opsDone)
++	}
++}
++
++func TestWorkerExplicitOneOperationUsesGroupedTransaction(t *testing.T) {
++	p := groupedProperties(1, 1)
++	db := &recordingDB{}
++	workload := &recordingWorkload{db: db}
++	w := newWorker(p, 0, 1, workload, db)
++
++	w.run(context.Background())
++
++	want := []string{"begin", "operation", "commit"}
++	if !reflect.DeepEqual(db.events, want) {
++		t.Fatalf("events = %v, want %v", db.events, want)
++	}
++}
++
++func TestWorkerUsesNormalizedOperationsPerTransaction(t *testing.T) {
++	p := groupedProperties(2, 2)
++	p.Set(prop.OperationsPerTransaction, " 2 ")
++	if err := validateTransactionGrouping(p); err != nil {
++		t.Fatalf("validate whitespace-padded operationspertransaction: %v", err)
++	}
++	db := &recordingDB{}
++	workload := &recordingWorkload{db: db}
++	w := newWorker(p, 0, 1, workload, db)
++
++	w.run(context.Background())
++
++	want := []string{"begin", "operation", "operation", "commit"}
++	if !reflect.DeepEqual(db.events, want) {
++		t.Fatalf("events = %v, want %v", db.events, want)
++	}
++}
++
++func TestWorkerAbsentOperationsPerTransactionUsesStockAutocommitPath(t *testing.T) {
++	p := properties.NewProperties()
++	p.Set(prop.DoTransactions, "true")
++	p.Set(prop.OperationCount, "1")
++	p.Set(prop.Silence, "true")
++	db := &recordingDB{}
++	workload := &recordingWorkload{db: db}
++	w := newWorker(p, 0, 1, workload, db)
++
++	w.run(context.Background())
++
++	want := []string{"operation"}
++	if !reflect.DeepEqual(db.events, want) {
++		t.Fatalf("events = %v, want %v", db.events, want)
++	}
++}
++
++func TestValidateTransactionGrouping(t *testing.T) {
++	if err := validateTransactionGrouping(groupedProperties(12, 3)); err != nil {
++		t.Fatalf("valid grouping rejected: %v", err)
++	}
++	if err := validateTransactionGrouping(groupedProperties(10, 3)); err == nil {
++		t.Fatal("non-divisible operationcount was accepted")
++	}
++	if err := validateTransactionGrouping(groupedProperties(10, 0)); err == nil {
++		t.Fatal("zero operationspertransaction was accepted")
++	}
++	invalid := groupedProperties(10, 1)
++	invalid.Set(prop.OperationsPerTransaction, "garbage")
++	if err := validateTransactionGrouping(invalid); err == nil {
++		t.Fatal("nonnumeric operationspertransaction was accepted")
++	}
++}
++
++func TestGroupedOperationCountIsDistributedAsWholeTransactions(t *testing.T) {
++	p := groupedProperties(10, 2)
++	db := &recordingDB{}
++	workload := &recordingWorkload{db: db}
++
++	var total int64
++	for threadID := 0; threadID < 3; threadID++ {
++		w := newWorker(p, threadID, 3, workload, db)
++		if w.opCount%2 != 0 {
++			t.Fatalf("thread %d got %d logical operations", threadID, w.opCount)
++		}
++		total += w.opCount
++	}
++	if total != 10 {
++		t.Fatalf("distributed operationcount = %d, want 10", total)
++	}
++}
++
++func TestAnalyzeAfterLoadCanBeDisabled(t *testing.T) {
++	tests := []struct {
++		name          string
++		setProperty   bool
++		propertyValue string
++		wantCalls     int
++	}{
++		{name: "default enabled", wantCalls: 1},
++		{name: "disabled", setProperty: true, propertyValue: "false", wantCalls: 0},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			p := properties.NewProperties()
++			p.Set(prop.DoTransactions, "false")
++			p.Set(prop.RecordCount, "1")
++			p.Set(prop.ThreadCount, "1")
++			if tt.setProperty {
++				p.Set(prop.AnalyzeAfterLoad, tt.propertyValue)
++			}
++			db := &recordingDB{}
++			workload := &recordingWorkload{db: db}
++
++			NewClient(p, workload, db).Run(context.Background())
++
++			if db.analyzeCalls != tt.wantCalls {
++				t.Fatalf("Analyze calls = %d, want %d", db.analyzeCalls, tt.wantCalls)
++			}
++		})
++	}
++}
+diff --git a/pkg/generator/scrambled_zipfian.go b/pkg/generator/scrambled_zipfian.go
+index a9bdf7d..330a96e 100644
+--- a/pkg/generator/scrambled_zipfian.go
++++ b/pkg/generator/scrambled_zipfian.go
+@@ -48,21 +48,14 @@ type ScrambledZipfian struct {
+ 
+ // NewScrambledZipfian creates a ScrambledZipfian generator.
+ func NewScrambledZipfian(min int64, max int64, zipfianConstant float64) *ScrambledZipfian {
+-	const (
+-		zetan               = float64(26.46902820178302)
+-		usedZipfianConstant = float64(0.99)
+-		itemCount           = int64(10000000000)
+-	)
+-
+ 	s := new(ScrambledZipfian)
+ 	s.min = min
+ 	s.max = max
+ 	s.itemCount = max - min + 1
+-	if zipfianConstant == usedZipfianConstant {
+-		s.gen = NewZipfian(0, itemCount, zipfianConstant, zetan)
+-	} else {
+-		s.gen = NewZipfianWithRange(0, itemCount, zipfianConstant)
+-	}
++	// Use the selected key-space size for every theta. Besides avoiding the
++	// upstream 10-billion-item custom-theta initialization, this keeps theta
++	// sweeps comparable instead of changing domains at theta 0.99.
++	s.gen = NewZipfianWithRange(0, s.itemCount-1, zipfianConstant)
+ 	return s
+ }
+ 
+diff --git a/pkg/generator/scrambled_zipfian_test.go b/pkg/generator/scrambled_zipfian_test.go
+new file mode 100644
+index 0000000..efe7863
+--- /dev/null
++++ b/pkg/generator/scrambled_zipfian_test.go
+@@ -0,0 +1,48 @@
++// Copyright 2026 PingCAP, Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package generator
++
++import (
++	"fmt"
++	"math/rand"
++	"testing"
++)
++
++func TestScrambledZipfianUsesActualRangeForEveryTheta(t *testing.T) {
++	const (
++		min = int64(17)
++		max = int64(116)
++	)
++
++	for _, theta := range []float64{0.8, ZipfianConstant} {
++		t.Run(fmt.Sprint(theta), func(t *testing.T) {
++			g := NewScrambledZipfian(min, max, theta)
++			if g.gen.items != max-min+1 {
++				t.Fatalf("underlying item count = %d, want %d", g.gen.items, max-min+1)
++			}
++			if g.gen.theta != theta {
++				t.Fatalf("theta = %v, want %v", g.gen.theta, theta)
++			}
++
++			r := rand.New(rand.NewSource(1))
++			for i := 0; i < 1000; i++ {
++				value := g.Next(r)
++				if value < min || value > max {
++					t.Fatalf("value %d is outside [%d, %d]", value, min, max)
++				}
++			}
++		})
++	}
++}
+diff --git a/pkg/prop/prop.go b/pkg/prop/prop.go
+index 6c6daa7..599cbf3 100644
+--- a/pkg/prop/prop.go
++++ b/pkg/prop/prop.go
+@@ -19,21 +19,25 @@ const (
+ 	InsertCount        = "insertcount"
+ 	InsertStartDefault = int64(0)
+ 
+-	OperationCount     = "operationcount"
+-	RecordCount        = "recordcount"
+-	RecordCountDefault = int64(0)
+-	Workload           = "workload"
+-	DB                 = "db"
+-	Exporter           = "exporter"
+-	ExportFile         = "exportfile"
+-	ThreadCount        = "threadcount"
+-	ThreadCountDefault = int64(200)
+-	Target             = "target"
+-	MaxExecutiontime   = "maxexecutiontime"
+-	WarmUpTime         = "warmuptime"
+-	DoTransactions     = "dotransactions"
+-	Status             = "status"
+-	Label              = "label"
++	OperationCount                     = "operationcount"
++	OperationsPerTransaction           = "operationspertransaction"
++	OperationsPerTransactionDefault    = int(1)
++	RetryConflictedTransactions        = "retryconflictedtransactions"
++	RetryConflictedTransactionsDefault = false
++	RecordCount                        = "recordcount"
++	RecordCountDefault                 = int64(0)
++	Workload                           = "workload"
++	DB                                 = "db"
++	Exporter                           = "exporter"
++	ExportFile                         = "exportfile"
++	ThreadCount                        = "threadcount"
++	ThreadCountDefault                 = int64(200)
++	Target                             = "target"
++	MaxExecutiontime                   = "maxexecutiontime"
++	WarmUpTime                         = "warmuptime"
++	DoTransactions                     = "dotransactions"
++	Status                             = "status"
++	Label                              = "label"
+ 	// batch mode
+ 	BatchSize        = "batch.size"
+ 	DefaultBatchSize = int(1)
+@@ -69,6 +73,8 @@ const (
+ 	// "uniform", "zipfian", "latest"
+ 	RequestDistribution        = "requestdistribution"
+ 	RequestDistributionDefault = "uniform"
++	ZipfianConstant            = "zipfianconstant"
++	ZipfianConstantDefault     = float64(0.99)
+ 	ZeroPadding                = "zeropadding"
+ 	ZeroPaddingDefault         = int64(1)
+ 	MinScanLength              = "minscanlength"
+@@ -111,6 +117,9 @@ const (
+ 
+ 	LogInterval = "measurement.interval"
+ 
++	AnalyzeAfterLoad        = "analyzeafterload"
++	AnalyzeAfterLoadDefault = true
++
+ 	MeasurementType          = "measurementtype"
+ 	MeasurementTypeDefault   = "histogram"
+ 	MeasurementRawOutputFile = "measurement.output_file"
+diff --git a/pkg/workload/core.go b/pkg/workload/core.go
+index 0df29fc..9338403 100644
+--- a/pkg/workload/core.go
++++ b/pkg/workload/core.go
+@@ -621,6 +621,18 @@ func (coreCreator) Create(p *properties.Properties) (ycsb.Workload, error) {
+ 	}
+ 
+ 	requestDistrib := p.GetString(prop.RequestDistribution, prop.RequestDistributionDefault)
++	zipfianConstant := prop.ZipfianConstantDefault
++	if raw, ok := p.Get(prop.ZipfianConstant); ok {
++		var err error
++		zipfianConstant, err = strconv.ParseFloat(strings.TrimSpace(raw), 64)
++		if err != nil {
++			return nil, fmt.Errorf("invalid %s %q: %w", prop.ZipfianConstant, raw, err)
++		}
++	}
++	if math.IsNaN(zipfianConstant) || math.IsInf(zipfianConstant, 0) ||
++		zipfianConstant <= 0 || zipfianConstant >= 1 {
++		return nil, fmt.Errorf("%s must be finite and between 0 and 1 (exclusive), got %v", prop.ZipfianConstant, zipfianConstant)
++	}
+ 	minScanLength := p.GetInt64(prop.MinScanLength, prop.MinScanLengthDefault)
+ 	maxScanLength := p.GetInt64(prop.MaxScanLength, prop.MaxScanLengthDefault)
+ 	scanLengthDistrib := p.GetString(prop.ScanLengthDistribution, prop.ScanLengthDistributionDefault)
+@@ -661,8 +673,8 @@ func (coreCreator) Create(p *properties.Properties) (ycsb.Workload, error) {
+ 		insertProportion := p.GetFloat64(prop.InsertProportion, prop.InsertProportionDefault)
+ 		opCount := p.GetInt64(prop.OperationCount, 0)
+ 		expectedNewKeys := int64(float64(opCount) * insertProportion * 2.0)
+-		keyrangeUpperBound = insertStart + insertCount + expectedNewKeys
+-		c.keyChooser = generator.NewScrambledZipfian(keyrangeLowerBound, keyrangeUpperBound, generator.ZipfianConstant)
++		keyrangeUpperBound = insertStart + insertCount + expectedNewKeys - 1
++		c.keyChooser = generator.NewScrambledZipfian(keyrangeLowerBound, keyrangeUpperBound, zipfianConstant)
+ 	case "latest":
+ 		c.keyChooser = generator.NewSkewedLatest(c.transactionInsertKeySequence)
+ 	case "hotspot":
+diff --git a/pkg/workload/core_test.go b/pkg/workload/core_test.go
+index d7bf2b0..3778cb1 100644
+--- a/pkg/workload/core_test.go
++++ b/pkg/workload/core_test.go
+@@ -11,8 +11,11 @@
+ package workload
+ 
+ import (
+-	"github.com/magiconair/properties"
++	"math/rand"
+ 	"testing"
++
++	"github.com/magiconair/properties"
++	"github.com/pingcap/go-ycsb/pkg/prop"
+ )
+ 
+ func Test_core_buildKeyName(t *testing.T) {
+@@ -38,10 +41,46 @@ func Test_core_buildKeyName(t *testing.T) {
+ 	}
+ 	for _, tt := range tests {
+ 		t.Run(tt.name, func(t *testing.T) {
+-			c := core{p: properties.MustLoadFiles([]string{"workloads/workloadc"}, properties.UTF8, false)}
++			c := core{p: properties.MustLoadFiles([]string{"../../workloads/workloadc"}, properties.UTF8, false)}
+ 			if got := c.buildKeyName(tt.args.keyNum); got != tt.want {
+ 				t.Errorf("buildKeyName() = %v, want %v", got, tt.want)
+ 			}
+ 		})
+ 	}
+ }
++
++func zipfianProperties(theta string) *properties.Properties {
++	p := properties.NewProperties()
++	p.Set(prop.RequestDistribution, "zipfian")
++	p.Set(prop.ZipfianConstant, theta)
++	p.Set(prop.RecordCount, "17")
++	p.Set(prop.InsertStart, "7")
++	p.Set(prop.InsertCount, "10")
++	p.Set(prop.OperationCount, "0")
++	return p
++}
++
++func TestCoreRejectsInvalidZipfianConstant(t *testing.T) {
++	for _, theta := range []string{"0", "1", "-0.1", "NaN", "Inf", "garbage"} {
++		t.Run(theta, func(t *testing.T) {
++			if _, err := (coreCreator{}).Create(zipfianProperties(theta)); err == nil {
++				t.Fatalf("zipfianconstant %q was accepted", theta)
++			}
++		})
++	}
++}
++
++func TestCoreCustomZipfianKeysStayInInclusiveRange(t *testing.T) {
++	workload, err := (coreCreator{}).Create(zipfianProperties("0.8"))
++	if err != nil {
++		t.Fatalf("create core workload: %v", err)
++	}
++	c := workload.(*core)
++	r := rand.New(rand.NewSource(1))
++	for i := 0; i < 1000; i++ {
++		key := c.keyChooser.Next(r)
++		if key < 7 || key > 16 {
++			t.Fatalf("key %d is outside [7, 16]", key)
++		}
++	}
++}
+diff --git a/pkg/ycsb/db.go b/pkg/ycsb/db.go
+index c4545c8..837826e 100644
+--- a/pkg/ycsb/db.go
++++ b/pkg/ycsb/db.go
+@@ -70,6 +70,15 @@ type DB interface {
+ 	Delete(ctx context.Context, table string, key string) error
+ }
+ 
++// TransactionDB can group multiple workload operations in one database
++// transaction. Implementations must execute all three methods on the same
++// connection associated with ctx.
++type TransactionDB interface {
++	BeginTransaction(ctx context.Context) error
++	CommitTransaction(ctx context.Context) error
++	RollbackTransaction(ctx context.Context) error
++}
++
+ type BatchDB interface {
+ 	// BatchInsert inserts batch records in the database.
+ 	// table: The name of the table.
