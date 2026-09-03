@@ -34,8 +34,8 @@ from typing import Any, Iterable, Sequence
 TRACE_HEADER = struct.Struct("<8sIIQQ")
 TRACE_MAGIC = b"COTRACE1"
 TRACE_VERSION = 1
-TRACE_FLAGS = 0
-PINNED_TIMEKILLER_COMMIT = "092df846d739e088e026c58c3679a6eba8f4165c"
+TRACE_FLAGS = 1
+PINNED_TIMEKILLER_COMMIT = "5b7a4a754cd2cf49d3a12b6a7b9f10a99cc5493f"
 DEFAULT_JAVA_OPTIONS = "-Xms1g -Xmx48g -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError"
 DEFAULT_CONVERTER_TEMPLATE = "{converter} --stats {stats} {trace} {json}"
 
@@ -46,7 +46,12 @@ CO_RESULT_RE = re.compile(
     re.MULTILINE,
 )
 TIMEKILLER_CHECK_RE = re.compile(
-    r"^\|\s*Checking time:\s*(?P<seconds>[0-9]+(?:\.[0-9]+)?)\s+s\s*\|\s*$",
+    r"^\|\s*Checking time \(excluding sorting\):\s*"
+    r"(?P<seconds>[0-9]+(?:\.[0-9]+)?)\s+s\s*\|\s*$",
+    re.MULTILINE,
+)
+TIMEKILLER_SORT_RE = re.compile(
+    r"^\|\s*Sorting time:\s*(?P<seconds>[0-9]+(?:\.[0-9]+)?)\s+s\s*\|\s*$",
     re.MULTILINE,
 )
 TIMEKILLER_PASS_RE = re.compile(r"^Satisfy SI\s*$", re.MULTILINE)
@@ -69,8 +74,9 @@ TRIAL_FIELDS = [
     "outcome",
     "verdict",
     "checker_ms",
+    "sorting_ms",
     "wall_seconds",
-    "peak_rss_kib",
+    "peak_rss_mib",
     "transactions_per_second_checker",
     "operations_per_second_checker",
     "transactions_per_second_wall",
@@ -103,7 +109,7 @@ CONVERSION_FIELDS = [
     "signal",
     "outcome",
     "wall_seconds",
-    "peak_rss_kib",
+    "peak_rss_mib",
     "timed_out",
     "oom",
     "failure_evidence",
@@ -116,22 +122,13 @@ CONVERSION_FIELDS = [
 ]
 
 SUMMARY_FIELDS = [
-    "run_id",
-    "trace",
+    "testcase",
     "transactions",
     "events",
-    "tool",
-    "measured_attempts",
-    "valid_trials",
-    "verdict",
-    "median_checker_ms",
-    "median_wall_seconds",
-    "median_peak_rss_kib",
-    "median_transactions_per_second_checker",
-    "median_operations_per_second_checker",
-    "median_transactions_per_second_wall",
-    "median_operations_per_second_wall",
-    "outcomes",
+    "co_checker_ms",
+    "timekiller_ms",
+    "co_checker_peak_rss_mib",
+    "timekiller_peak_rss_mib",
 ]
 
 
@@ -235,8 +232,8 @@ def read_trace_header(path: Path) -> TraceInfo:
         )
     if flags != TRACE_FLAGS:
         raise ValueError(
-            f"trace {path} uses unsupported header flags 0x{flags:x}; "
-            f"expected 0x{TRACE_FLAGS:x}"
+            f"trace {path} is not a dense-ID COTRACE1 input: flags=0x{flags:x}; "
+            f"expected dense flags 0x{TRACE_FLAGS:x}"
         )
     return TraceInfo(
         path=path.resolve(),
@@ -253,7 +250,9 @@ def discover_traces(args: argparse.Namespace) -> list[TraceInfo]:
     if args.trace:
         candidates.extend(Path(item).expanduser() for item in args.trace)
     else:
-        patterns = args.trace_glob or [str(args.repo_root / "bin_traces/tpcc/*.trace")]
+        patterns = args.trace_glob or [
+            str(args.repo_root / "bin_traces/dense/tpcc/*.dense.trace")
+        ]
         for pattern in patterns:
             expanded = Path(pattern).expanduser()
             if not expanded.is_absolute():
@@ -483,7 +482,7 @@ def classify_conversion(
         "exit_status": process.exit_status,
         "signal": process.signal_number,
         "wall_seconds": process.wall_seconds,
-        "peak_rss_kib": process.peak_rss_kib,
+        "peak_rss_mib": kib_to_mib(process.peak_rss_kib),
         "timed_out": process.timed_out,
         "oom": oom,
         "failure_evidence": evidence,
@@ -566,6 +565,7 @@ def parse_checker_result(
     oom, evidence = process_failure_evidence(process, output)
     verdict = ""
     checker_ms: float | None = None
+    sorting_ms: float | None = None
     malformed = ""
 
     if tool == "co-checker":
@@ -584,6 +584,7 @@ def parse_checker_result(
         )
     elif tool == "timekiller":
         check_matches = list(TIMEKILLER_CHECK_RE.finditer(output))
+        sort_matches = list(TIMEKILLER_SORT_RE.finditer(output))
         pass_matches = list(TIMEKILLER_PASS_RE.finditer(output))
         fail_matches = list(TIMEKILLER_FAIL_RE.finditer(output))
         if len(check_matches) == 1:
@@ -592,6 +593,12 @@ def parse_checker_result(
             malformed = "missing TimeKiller Checking time line"
         else:
             malformed = "multiple TimeKiller Checking time lines"
+        if len(sort_matches) == 1:
+            sorting_ms = float(sort_matches[0].group("seconds")) * 1000.0
+        elif not sort_matches:
+            malformed = join_evidence(malformed, "missing TimeKiller Sorting time line")
+        else:
+            malformed = join_evidence(malformed, "multiple TimeKiller Sorting time lines")
         if len(pass_matches) == 1 and not fail_matches:
             verdict = "pass"
         elif len(fail_matches) == 1 and not pass_matches:
@@ -629,8 +636,9 @@ def parse_checker_result(
         "outcome": outcome,
         "verdict": verdict,
         "checker_ms": checker_ms,
+        "sorting_ms": sorting_ms,
         "wall_seconds": process.wall_seconds,
-        "peak_rss_kib": process.peak_rss_kib,
+        "peak_rss_mib": kib_to_mib(process.peak_rss_kib),
         "transactions_per_second_checker": rate(trace.transactions, checker_seconds),
         "operations_per_second_checker": rate(trace.events, checker_seconds),
         "transactions_per_second_wall": rate(trace.transactions, wall_seconds),
@@ -655,6 +663,12 @@ def rate(count: int, seconds: float | None) -> float | None:
     if seconds is None or seconds <= 0:
         return None
     return count / seconds
+
+
+def kib_to_mib(value: int | float | None) -> float | None:
+    if value is None:
+        return None
+    return value / 1024.0
 
 
 def checker_command(args: argparse.Namespace, tool: str, trace_path: Path) -> list[str]:
@@ -767,62 +781,96 @@ def as_float(value: Any) -> float | None:
         return None
 
 
-def median_field(rows: Sequence[dict[str, str]], field: str) -> float | None:
+def average_field(rows: Sequence[dict[str, str]], field: str) -> float | None:
     values = [value for row in rows if (value := as_float(row.get(field))) is not None]
-    return statistics.median(values) if values else None
+    return statistics.fmean(values) if values else None
+
+
+def summary_prefix(tool: str) -> str:
+    if tool == "co-checker":
+        return "co_checker"
+    if tool == "timekiller":
+        return "timekiller"
+    raise ValueError(f"unsupported summary tool: {tool}")
+
+
+def summarize_tool(
+    rows: Sequence[dict[str, str]], trace: TraceInfo, tool: str, prefix: str
+) -> dict[str, Any]:
+    measured = [
+        row
+        for row in rows
+        if row["trace"] == trace.name
+        and row["tool"] == tool
+        and row["phase"] == "measure"
+    ]
+    valid = [row for row in measured if row["outcome"] == "success"]
+    verdicts = sorted({row["verdict"] for row in valid if row["verdict"]})
+    outcomes: dict[str, int] = {}
+    for row in measured:
+        outcomes[row["outcome"]] = outcomes.get(row["outcome"], 0) + 1
+
+    summary = {
+        f"{prefix}_measured_attempts": len(measured),
+        f"{prefix}_valid_trials": len(valid),
+        f"{prefix}_verdict": (
+            verdicts[0] if len(verdicts) == 1 else ("mixed" if verdicts else "")
+        ),
+        f"{prefix}_ms": average_field(valid, "checker_ms"),
+        f"{prefix}_wall_seconds": average_field(valid, "wall_seconds"),
+        f"{prefix}_peak_rss_mib": average_field(valid, "peak_rss_mib"),
+        f"{prefix}_transactions_per_second_checker": average_field(
+            valid, "transactions_per_second_checker"
+        ),
+        f"{prefix}_operations_per_second_checker": average_field(
+            valid, "operations_per_second_checker"
+        ),
+        f"{prefix}_transactions_per_second_wall": average_field(
+            valid, "transactions_per_second_wall"
+        ),
+        f"{prefix}_operations_per_second_wall": average_field(
+            valid, "operations_per_second_wall"
+        ),
+        f"{prefix}_outcomes": json.dumps(
+            outcomes, sort_keys=True, separators=(",", ":")
+        ),
+    }
+    if tool == "timekiller":
+        summary["timekiller_sorting_ms"] = average_field(valid, "sorting_ms")
+    return summary
 
 
 def write_summary(args: argparse.Namespace, traces: Sequence[TraceInfo]) -> list[dict[str, Any]]:
     rows = read_csv(args.result_dir / "trials.csv")
     summaries: list[dict[str, Any]] = []
     for trace in traces:
-        for tool in ("co-checker", "timekiller"):
-            measured = [
-                row
-                for row in rows
-                if row["trace"] == trace.name
-                and row["tool"] == tool
-                and row["phase"] == "measure"
-            ]
-            valid = [row for row in measured if row["outcome"] == "success"]
-            verdicts = sorted({row["verdict"] for row in valid if row["verdict"]})
-            outcomes: dict[str, int] = {}
-            for row in measured:
-                outcomes[row["outcome"]] = outcomes.get(row["outcome"], 0) + 1
-            summary = {
-                "run_id": args.run_id,
-                "trace": trace.name,
-                "transactions": trace.transactions,
-                "events": trace.events,
-                "tool": tool,
-                "measured_attempts": len(measured),
-                "valid_trials": len(valid),
-                "verdict": verdicts[0] if len(verdicts) == 1 else ("mixed" if verdicts else ""),
-                "median_checker_ms": median_field(valid, "checker_ms"),
-                "median_wall_seconds": median_field(valid, "wall_seconds"),
-                "median_peak_rss_kib": median_field(valid, "peak_rss_kib"),
-                "median_transactions_per_second_checker": median_field(
-                    valid, "transactions_per_second_checker"
-                ),
-                "median_operations_per_second_checker": median_field(
-                    valid, "operations_per_second_checker"
-                ),
-                "median_transactions_per_second_wall": median_field(
-                    valid, "transactions_per_second_wall"
-                ),
-                "median_operations_per_second_wall": median_field(
-                    valid, "operations_per_second_wall"
-                ),
-                "outcomes": json.dumps(outcomes, sort_keys=True, separators=(",", ":")),
-            }
-            summaries.append(summary)
+        summary = {
+            "run_id": args.run_id,
+            "testcase": trace.name,
+            "trace": trace.name,
+            "transactions": trace.transactions,
+            "events": trace.events,
+        }
+        summary.update(summarize_tool(rows, trace, "co-checker", "co_checker"))
+        summary.update(summarize_tool(rows, trace, "timekiller", "timekiller"))
+        summaries.append(summary)
 
     path = args.result_dir / "summary.csv"
     with path.open("w", encoding="utf-8", newline="") as output:
         writer = csv.DictWriter(output, fieldnames=SUMMARY_FIELDS)
         writer.writeheader()
         for row in summaries:
-            writer.writerow({field: csv_value(row.get(field)) for field in SUMMARY_FIELDS})
+            csv_row = dict(row)
+            for prefix in ("co_checker", "timekiller"):
+                if (
+                    row[f"{prefix}_measured_attempts"] != args.trials
+                    or row[f"{prefix}_valid_trials"] != args.trials
+                ):
+                    csv_row[f"{prefix}_ms"] = None
+                    csv_row[f"{prefix}_peak_rss_mib"] = None
+            writer.writerow(
+                {field: csv_value(csv_row.get(field)) for field in SUMMARY_FIELDS}
+            )
     return summaries
 
 
@@ -857,14 +905,14 @@ def write_report(
 ) -> None:
     conversions = read_csv(args.result_dir / "conversion.csv")
     trials = read_csv(args.result_dir / "trials.csv")
-    summary_by_key = {(row["trace"], row["tool"]): row for row in summaries}
+    summary_by_trace = {row["trace"]: row for row in summaries}
     conversion_by_trace = {row["trace"]: row for row in conversions}
 
     environment_text = (args.result_dir / "environment.txt").read_text(
         encoding="utf-8", errors="replace"
     )
     lines = [
-        "# TimeKiller/Chronos versus snapshot-so-ww benchmark",
+        "# TimeKiller/Chronos versus snapshot-so-ww dense-input benchmark",
         "",
         f"Run ID: `{args.run_id}`. Generated at `{utc_now()}`.",
         "",
@@ -899,7 +947,7 @@ def write_report(
         "## Input traces",
         "",
         markdown_table(
-            ["Trace", "Transactions", "Events", "Binary bytes"],
+            ["Trace", "Transactions", "Events", "Dense binary bytes"],
             (
                 (trace.name, f"{trace.transactions:,}", f"{trace.events:,}", f"{trace.size_bytes:,}")
                 for trace in traces
@@ -916,7 +964,7 @@ def write_report(
                     conversion_by_trace.get(trace.name, {}).get("outcome", "missing"),
                     format_number(conversion_by_trace.get(trace.name, {}).get("wall_seconds")),
                     format_number(
-                        divide(conversion_by_trace.get(trace.name, {}).get("peak_rss_kib"), 1024.0)
+                        conversion_by_trace.get(trace.name, {}).get("peak_rss_mib")
                     ),
                     format_number(
                         divide(
@@ -931,10 +979,11 @@ def write_report(
             ),
         ),
         "",
-        "## Median checker-only and end-to-end results",
+        "## Average checker-only and tool-run results",
         "",
-        "Medians include only successful measured trials. Each metric uses the trials for "
-        "which that metric was recorded; the raw CSV preserves any missing measurements.",
+        "Arithmetic averages include only successful measured trials. Each metric uses "
+        "the trials for which that metric was recorded; the raw CSV preserves any missing "
+        "measurements.",
         "",
         markdown_table(
             [
@@ -943,43 +992,57 @@ def write_report(
                 "Valid/attempted",
                 "Verdict",
                 "Checker ms",
-                "E2E s",
+                "Sorting ms",
+                "Tool wall s",
                 "Peak RSS MiB",
                 "Tx/s checker",
                 "Ops/s checker",
-                "Tx/s E2E",
-                "Ops/s E2E",
+                "Tx/s wall",
+                "Ops/s wall",
             ],
             (
                 (
                     trace.name,
                     tool,
-                    f"{summary_by_key[(trace.name, tool)]['valid_trials']}/"
-                    f"{summary_by_key[(trace.name, tool)]['measured_attempts']}",
-                    summary_by_key[(trace.name, tool)]["verdict"] or "—",
-                    format_number(summary_by_key[(trace.name, tool)]["median_checker_ms"]),
-                    format_number(summary_by_key[(trace.name, tool)]["median_wall_seconds"]),
+                    f"{summary_by_trace[trace.name][summary_prefix(tool) + '_valid_trials']}/"
+                    f"{summary_by_trace[trace.name][summary_prefix(tool) + '_measured_attempts']}",
+                    summary_by_trace[trace.name][summary_prefix(tool) + "_verdict"] or "—",
                     format_number(
-                        divide(summary_by_key[(trace.name, tool)]["median_peak_rss_kib"], 1024.0)
+                        summary_by_trace[trace.name][summary_prefix(tool) + "_ms"]
                     ),
-                    format_rate(
-                        summary_by_key[(trace.name, tool)][
-                            "median_transactions_per_second_checker"
+                    format_number(
+                        summary_by_trace[trace.name].get(
+                            summary_prefix(tool) + "_sorting_ms"
+                        )
+                    ),
+                    format_number(
+                        summary_by_trace[trace.name][
+                            summary_prefix(tool) + "_wall_seconds"
+                        ]
+                    ),
+                    format_number(
+                        summary_by_trace[trace.name][
+                            summary_prefix(tool) + "_peak_rss_mib"
                         ]
                     ),
                     format_rate(
-                        summary_by_key[(trace.name, tool)][
-                            "median_operations_per_second_checker"
+                        summary_by_trace[trace.name][
+                            summary_prefix(tool) + "_transactions_per_second_checker"
                         ]
                     ),
                     format_rate(
-                        summary_by_key[(trace.name, tool)][
-                            "median_transactions_per_second_wall"
+                        summary_by_trace[trace.name][
+                            summary_prefix(tool) + "_operations_per_second_checker"
                         ]
                     ),
                     format_rate(
-                        summary_by_key[(trace.name, tool)][
-                            "median_operations_per_second_wall"
+                        summary_by_trace[trace.name][
+                            summary_prefix(tool) + "_transactions_per_second_wall"
+                        ]
+                    ),
+                    format_rate(
+                        summary_by_trace[trace.name][
+                            summary_prefix(tool) + "_operations_per_second_wall"
                         ]
                     ),
                 )
@@ -1033,26 +1096,39 @@ def write_report(
         [
             "## Measurement caveats",
             "",
-            "- Both reported checker timers exclude input decoding and construction of "
-            "their neutral transaction/operation models. The required TimeKiller timing "
-            "patch includes its explicit pre-check GC, dense initial state and per-key "
-            "writer-index construction, sorting, and SI check. co-checker includes its "
-            "snapshot/change-list construction and check. Both exclude result printing.",
-            "- End-to-end wall time includes parsing/loading and all output. A large "
-            "TimeKiller violation set can increase both wall time and log size after its "
+            "- Raw-to-dense preprocessing is outside both measured tools. co-checker reads "
+            "the persistent dense-ID COTRACE1 binary; TimeKiller reads JSON projected from "
+            "those exact IDs without re-interning raw keys or values.",
+            "- Both reported checker timers exclude compact-input decoding, construction of "
+            "their neutral transaction/operation models, and commit-timestamp sorting. "
+            "TimeKiller reports sorting separately; its self-identifying `Checking time "
+            "(excluding sorting)` includes explicit pre-check GC, dense initial state and "
+            "per-key writer-index construction, and the SI check. co-checker includes "
+            "snapshot/change-list construction and checking. Both exclude result printing.",
+            "- Tool-run wall time includes that tool's compact-input parsing/loading and "
+            "output. The encodings still differ (dense binary versus JSON), so wall time is "
+            "not a byte-for-byte same-input comparison. The one-time dense-to-JSON projection "
+            "is reported separately. A large "
+            "TimeKiller violation set can also increase wall time and log size after its "
             "reported checker timer stops.",
+            "- `snapshot-so-ww` and Chronos's timestamp-based SI checker implement different "
+            "decision procedures. Treat these results as a performance comparison on the "
+            "same valid histories, not as evidence that the two predicates are equivalent. "
+            "The harness records verdict differences but does not fail the run on them.",
+            "- TimeKiller runs with `--enable_session false`; `snapshot-so-ww` still uses "
+            "session order when constructing snapshots. This avoids folding TimeKiller's "
+            "load-time SESSION pass into its wall measurement, but it is a semantic "
+            "asymmetry that must be disclosed.",
             "- Each TimeKiller trial starts a new JVM. Warm-ups can warm filesystem/page "
             "cache state, but do not preserve JVM JIT state between trials.",
             "- Caches were not dropped. Within each phase, co-checker always ran before "
             "TimeKiller, so fixed order and page-cache effects may bias the comparison. "
             "Background host activity, CPU frequency scaling, and NUMA placement can also "
             "affect results.",
-            "- Peak RSS is GNU time's Maximum resident set size measurement for the wrapped "
-            "command; it is neither an aggregate of simultaneously resident processes nor "
-            "allocated heap capacity. Fixed Java heap limits and the exact JVM are recorded "
-            "above.",
-            "- Verdict differences are recorded as benchmark results and are not treated "
-            "as harness failures.",
+            "- Peak RSS is GNU time's whole-process maximum for compact-input loading, model "
+            "construction, and checking, converted from native KiB to MiB. It is not "
+            "checker-owned heap allocation. Fixed Java heap limits and the exact JVM are "
+            "recorded above.",
             "",
             "Raw evidence is in `conversion.csv`, `trials.csv`, `summary.csv`, and `logs/` "
             "beside this report.",
@@ -1241,7 +1317,7 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.warmups < 0:
         raise ValueError("--warmups must be non-negative")
     if args.trials < 1:
-        raise ValueError("--trials must be at least one (the default is three)")
+        raise ValueError("--trials must be at least one (the default is ten)")
     if args.timeout_seconds <= 0:
         raise ValueError("--timeout-seconds must be positive")
     if args.conversion_timeout_seconds is not None and args.conversion_timeout_seconds <= 0:
@@ -1257,6 +1333,7 @@ def validate_args(args: argparse.Namespace) -> None:
 def make_parser() -> argparse.ArgumentParser:
     script = Path(__file__).resolve()
     repo_root = script.parents[2]
+    timekiller_root = repo_root.parent / "timekiller"
     run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     external_root = Path("/tmp/co-checker-timekiller-benchmark")
     parser = argparse.ArgumentParser(
@@ -1280,8 +1357,8 @@ def make_parser() -> argparse.ArgumentParser:
         help="trace glob relative to repo root or absolute; repeatable",
     )
     parser.add_argument("--max-traces", type=int, help="limit the event-sorted trace list")
-    parser.add_argument("--warmups", type=int, default=1)
-    parser.add_argument("--trials", type=int, default=3)
+    parser.add_argument("--warmups", type=int, default=0)
+    parser.add_argument("--trials", type=int, default=10)
     parser.add_argument("--timeout-seconds", type=float, default=7200.0)
     parser.add_argument(
         "--conversion-timeout-seconds",
@@ -1294,16 +1371,11 @@ def make_parser() -> argparse.ArgumentParser:
         default=DEFAULT_JAVA_OPTIONS,
         help="fixed JVM arguments, parsed with POSIX shell quoting but never run through a shell",
     )
-    parser.add_argument(
-        "--timekiller-source", type=Path, default=Path("/home/dyf/code/db-consistency/TimeKiller")
-    )
+    parser.add_argument("--timekiller-source", type=Path, default=timekiller_root)
     parser.add_argument(
         "--timekiller-jar",
         type=Path,
-        default=Path(
-            "/home/dyf/code/db-consistency/TimeKiller/target/"
-            "TimeKiller-jar-with-dependencies.jar"
-        ),
+        default=timekiller_root / "target/TimeKiller-jar-with-dependencies.jar",
     )
     parser.add_argument(
         "--expected-timekiller-commit", default=PINNED_TIMEKILLER_COMMIT
@@ -1341,7 +1413,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--smoke-test",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="run one unmeasured trial of both tools on the smallest trace first",
     )
     parser.add_argument("--time-binary", default="/usr/bin/time")
@@ -1354,7 +1426,10 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--list-traces",
         action="store_true",
-        help="validate, event-sort, and print selected trace headers without requiring built tools",
+        help=(
+            "validate and print selected trace headers, ordered by event count, "
+            "without requiring built tools"
+        ),
     )
     return parser
 

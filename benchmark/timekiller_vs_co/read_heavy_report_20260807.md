@@ -28,8 +28,8 @@ before all checker-specific work:
 Result printing remains outside the timer. This matches co-checker's boundary:
 binary parsing and neutral `Trace` construction are excluded, while
 snapshot/change-list construction, checking, and checker-local teardown are
-included. The reproducible source patch is
-`timekiller-post-parse-timing.patch`.
+included. The exact source diff used by this historical run remains available
+in co-checker commit `0201fb992144ff11dc577900be196fee5310ff59`.
 
 ## Real TPC-C results
 
