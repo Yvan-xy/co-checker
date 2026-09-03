@@ -51,6 +51,10 @@ struct Trace {
   std::vector<ValueId> event_value_ids;
   std::size_t key_count   = 0;
   std::size_t value_count = 0;
+  // Dense-ID traces intentionally omit the original key/value byte strings.
+  // Only checkers whose complete data dependency is the parallel dense-ID
+  // arrays may consume such a trace.
+  bool has_raw_payload = true;
 
   const Transaction &getTxn(const TxnId txn_id) const {
     assert(txn_id < transactions.size());

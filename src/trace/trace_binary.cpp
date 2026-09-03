@@ -23,7 +23,6 @@ namespace common {
 namespace {
 
 constexpr std::uint32_t kBinaryTraceVersion = 1;
-constexpr std::uint32_t kBinaryTraceFlags   = 0;
 
 constexpr std::uint8_t kEventHasValue = 1U << 0U;
 constexpr std::uint8_t kEventDelete   = 1U << 1U;
@@ -192,6 +191,11 @@ std::uint8_t encode_op(const EventOp op) { return op == EventOp::Read ? 0 : 1; }
 struct BinaryTraceHeaderRecord {
   std::uint64_t transaction_count = 0;
   std::uint64_t event_count       = 0;
+  std::uint32_t flags             = kBinaryTraceRawFlags;
+
+  [[nodiscard]] bool has_dense_ids() const {
+    return (flags & kBinaryTraceDenseIdsFlag) != 0;
+  }
 };
 
 struct BinaryTransactionRecord {
@@ -209,8 +213,12 @@ struct BinaryEventRecord {
   EventOp op                      = EventOp::Read;
   Key key;
   std::optional<Value> value;
-  bool is_delete = false;
-  bool is_miss   = false;
+  KeyId key_id       = 0;
+  ValueId value_id   = kNullValueId;
+  bool has_dense_ids = false;
+  bool has_value     = false;
+  bool is_delete     = false;
+  bool is_miss       = false;
 };
 
 struct BinaryDecodeStats {
@@ -247,10 +255,11 @@ Result<BinaryDecodeStats> decode_binary_trace_stream(std::istream &input,
     return decode_error<BinaryDecodeStats>("unsupported binary trace version " +
                                            std::to_string(version));
   }
-  if (flags != kBinaryTraceFlags) {
+  if ((flags & ~kBinaryTraceDenseIdsFlag) != 0) {
     return decode_error<BinaryDecodeStats>("unsupported binary trace flags " +
                                            std::to_string(flags));
   }
+  header.flags = flags;
   if (header.transaction_count > std::numeric_limits<TxnId>::max()) {
     return decode_error<BinaryDecodeStats>(
         "binary trace has too many transactions");
@@ -269,6 +278,8 @@ Result<BinaryDecodeStats> decode_binary_trace_stream(std::istream &input,
   std::unordered_set<Timestamp> seen_commit_ts;
   std::optional<Timestamp> previous_commit_ts;
   std::uint64_t observed_events = 0;
+  std::uint64_t next_key_id     = 0;
+  std::uint64_t next_value_id   = 0;
 
   for (std::uint64_t txn_index = 0; txn_index < header.transaction_count;
        ++txn_index) {
@@ -344,19 +355,61 @@ Result<BinaryDecodeStats> decode_binary_trace_stream(std::istream &input,
       }
       event.op = *op;
 
-      std::string error;
-      auto key = read_hex_value(input, error);
-      if (!key.has_value()) {
-        return decode_error<BinaryDecodeStats>(std::move(error));
-      }
-      event.key = std::move(*key);
-
-      if ((event_flags & kEventHasValue) != 0) {
-        auto value = read_hex_value(input, error);
-        if (!value.has_value()) {
+      event.has_dense_ids = header.has_dense_ids();
+      event.has_value     = (event_flags & kEventHasValue) != 0;
+      if (event.has_dense_ids) {
+        if (!read_u32(input, event.key_id) ||
+            !read_u32(input, event.value_id)) {
+          return decode_error<BinaryDecodeStats>(
+              "truncated dense IDs at transaction " +
+              std::to_string(txn_index) + ", event " +
+              std::to_string(event_index));
+        }
+        if (event.key_id == std::numeric_limits<KeyId>::max() ||
+            event.key_id > next_key_id) {
+          return decode_error<BinaryDecodeStats>(
+              "dense key IDs must be contiguous in first-seen order at "
+              "transaction " +
+              std::to_string(txn_index) + ", event " +
+              std::to_string(event_index));
+        }
+        if (event.key_id == next_key_id) {
+          ++next_key_id;
+        }
+        if (event.has_value) {
+          if (event.value_id == kNullValueId ||
+              event.value_id > next_value_id) {
+            return decode_error<BinaryDecodeStats>(
+                "dense value IDs must be contiguous in first-seen order at "
+                "transaction " +
+                std::to_string(txn_index) + ", event " +
+                std::to_string(event_index));
+          }
+          if (event.value_id == next_value_id) {
+            ++next_value_id;
+          }
+        } else if (event.value_id != kNullValueId) {
+          return decode_error<BinaryDecodeStats>(
+              "dense event without a value must use the null value ID at "
+              "transaction " +
+              std::to_string(txn_index) + ", event " +
+              std::to_string(event_index));
+        }
+      } else {
+        std::string error;
+        auto key = read_hex_value(input, error);
+        if (!key.has_value()) {
           return decode_error<BinaryDecodeStats>(std::move(error));
         }
-        event.value = std::move(*value);
+        event.key = std::move(*key);
+
+        if (event.has_value) {
+          auto value = read_hex_value(input, error);
+          if (!value.has_value()) {
+            return decode_error<BinaryDecodeStats>(std::move(error));
+          }
+          event.value = std::move(*value);
+        }
       }
       event.is_delete = (event_flags & kEventDelete) != 0;
       event.is_miss   = (event_flags & kEventMiss) != 0;
@@ -369,13 +422,13 @@ Result<BinaryDecodeStats> decode_binary_trace_stream(std::istream &input,
       }
       previous_seq = event.seq;
 
-      if (event.is_miss && event.value.has_value()) {
+      if (event.is_miss && event.has_value) {
         return decode_error<BinaryDecodeStats>(
             "read event cannot have both miss and value at transaction " +
             std::to_string(txn_index) + ", event " +
             std::to_string(event_index));
       }
-      if (event.is_delete && event.value.has_value()) {
+      if (event.is_delete && event.has_value) {
         return decode_error<BinaryDecodeStats>(
             "write event cannot have both delete and value at transaction " +
             std::to_string(txn_index) + ", event " +
@@ -449,6 +502,7 @@ public:
   bool on_header(const BinaryTraceHeaderRecord &header, std::string &error) {
     expected_transactions_ = header.transaction_count;
     expected_events_       = header.event_count;
+    dense_input_           = header.has_dense_ids();
     return write("[", error);
   }
 
@@ -501,19 +555,31 @@ public:
 
   bool on_event(BinaryEventRecord record, std::string &error) {
     std::int64_t key_id = 0;
-    if (!intern(key_ids_, std::move(record.key), next_key_id_, key_id, "key",
-                error)) {
-      return false;
-    }
-
     std::optional<std::int64_t> value_id;
-    if (record.value.has_value()) {
-      std::int64_t id = 0;
-      if (!intern(value_ids_, std::move(*record.value), next_value_id_, id,
-                  "value", error)) {
+    if (record.has_dense_ids) {
+      key_id = static_cast<std::int64_t>(record.key_id);
+      dense_key_count_ =
+          std::max(dense_key_count_, static_cast<std::uint64_t>(record.key_id) +
+                                         1U);
+      if (record.has_value) {
+        value_id = static_cast<std::int64_t>(record.value_id);
+        dense_value_count_ =
+            std::max(dense_value_count_,
+                     static_cast<std::uint64_t>(record.value_id) + 1U);
+      }
+    } else {
+      if (!intern(key_ids_, std::move(record.key), next_key_id_, key_id, "key",
+                  error)) {
         return false;
       }
-      value_id = id;
+      if (record.value.has_value()) {
+        std::int64_t id = 0;
+        if (!intern(value_ids_, std::move(*record.value), next_value_id_, id,
+                    "value", error)) {
+          return false;
+        }
+        value_id = id;
+      }
     }
 
     if (current_transaction_events_ != 0 && !write(",", error)) {
@@ -558,8 +624,12 @@ public:
   [[nodiscard]] TimeKillerJsonStats stats() const {
     return {.transactions = transactions_,
             .events       = events_,
-            .keys         = static_cast<std::uint64_t>(key_ids_.size()),
-            .values       = static_cast<std::uint64_t>(value_ids_.size()),
+            .keys         = dense_input_
+                                ? dense_key_count_
+                                : static_cast<std::uint64_t>(key_ids_.size()),
+            .values       = dense_input_
+                                ? dense_value_count_
+                                : static_cast<std::uint64_t>(value_ids_.size()),
             .output_bytes = output_bytes_};
   }
 
@@ -623,6 +693,143 @@ private:
   std::uint64_t events_                     = 0;
   std::uint64_t current_transaction_events_ = 0;
   std::uint64_t output_bytes_               = 0;
+  std::uint64_t dense_key_count_             = 0;
+  std::uint64_t dense_value_count_           = 0;
+  bool dense_input_                          = false;
+};
+
+class DenseBinaryConsumer {
+public:
+  explicit DenseBinaryConsumer(std::ostream &output) : output_(output) {}
+
+  bool on_header(const BinaryTraceHeaderRecord &header, std::string &error) {
+    if (header.has_dense_ids()) {
+      error = "dense trace input is already densified";
+      return false;
+    }
+    expected_transactions_ = header.transaction_count;
+    expected_events_       = header.event_count;
+    if (!write_exact(output_, kBinaryTraceMagic.data(),
+                     kBinaryTraceMagic.size()) ||
+        !write_u32(output_, kBinaryTraceVersion) ||
+        !write_u32(output_, kBinaryTraceDenseIdsFlag) ||
+        !write_u64(output_, header.transaction_count) ||
+        !write_u64(output_, header.event_count)) {
+      error = "failed to write dense binary trace header";
+      return false;
+    }
+    output_bytes_ = static_cast<std::uint64_t>(kBinaryTraceMagic.size()) +
+                    sizeof(std::uint32_t) * 2U + sizeof(std::uint64_t) * 2U;
+    return true;
+  }
+
+  bool on_transaction_begin(const BinaryTransactionRecord &record,
+                            std::string &error) {
+    if (!write_u32(output_, record.session_id) ||
+        !write_u64(output_, record.start_ts) ||
+        !write_u64(output_, record.commit_ts) ||
+        !write_u32(output_, record.event_count)) {
+      error = "failed to write dense transaction record at index " +
+              std::to_string(record.index);
+      return false;
+    }
+    output_bytes_ += sizeof(std::uint32_t) * 2U +
+                     sizeof(std::uint64_t) * 2U;
+    ++transactions_;
+    return true;
+  }
+
+  bool on_event(BinaryEventRecord record, std::string &error) {
+    KeyId key_id = 0;
+    if (!intern(key_ids_, std::move(record.key), next_key_id_, key_id, "key",
+                error)) {
+      return false;
+    }
+
+    ValueId value_id = kNullValueId;
+    if (record.value.has_value() &&
+        !intern(value_ids_, std::move(*record.value), next_value_id_, value_id,
+                "value", error)) {
+      return false;
+    }
+
+    std::uint8_t flags = 0;
+    if (record.has_value) {
+      flags |= kEventHasValue;
+    }
+    if (record.is_delete) {
+      flags |= kEventDelete;
+    }
+    if (record.is_miss) {
+      flags |= kEventMiss;
+    }
+    if (!write_u32(output_, record.seq) ||
+        !write_u8(output_, encode_op(record.op)) ||
+        !write_u8(output_, flags) || !write_u16(output_, 0) ||
+        !write_u32(output_, key_id) || !write_u32(output_, value_id)) {
+      error = "failed to write dense event record at index " +
+              std::to_string(record.index);
+      return false;
+    }
+    output_bytes_ += sizeof(std::uint32_t) * 3U + sizeof(std::uint8_t) * 2U +
+                     sizeof(std::uint16_t);
+    ++events_;
+    return true;
+  }
+
+  bool on_transaction_end(const BinaryTransactionRecord &,
+                          std::string &) {
+    return true;
+  }
+
+  bool on_trace_end(std::string &error) {
+    if (transactions_ != expected_transactions_ || events_ != expected_events_) {
+      error = "densified record counts do not match the binary trace header";
+      return false;
+    }
+    return true;
+  }
+
+  [[nodiscard]] DenseBinaryTraceStats stats() const {
+    return {.transactions = transactions_,
+            .events       = events_,
+            .keys         = static_cast<std::uint64_t>(key_ids_.size()),
+            .values       = static_cast<std::uint64_t>(value_ids_.size()),
+            .output_bytes = output_bytes_};
+  }
+
+private:
+  using KeyIdMap   = std::unordered_map<HexValue, KeyId, HexValueHash>;
+  using ValueIdMap = std::unordered_map<HexValue, ValueId, HexValueHash>;
+
+  template <typename Id, typename Map>
+  bool intern(Map &ids, HexValue value, std::uint64_t &next_id, Id &id,
+              const std::string_view kind, std::string &error) {
+    const auto found = ids.find(value);
+    if (found != ids.end()) {
+      id = found->second;
+      return true;
+    }
+    if (next_id >= std::numeric_limits<Id>::max()) {
+      error = "dense trace exceeds the " + std::string(kind) + " ID range";
+      return false;
+    }
+    id = static_cast<Id>(next_id);
+    ids.emplace(std::move(value), id);
+    ++next_id;
+    return true;
+  }
+
+  std::ostream &output_;
+  KeyIdMap key_ids_;
+  ValueIdMap value_ids_;
+  std::uint64_t next_key_id_           = 0;
+  std::uint64_t next_value_id_         = 0;
+  std::uint64_t expected_transactions_ = 0;
+  std::uint64_t expected_events_       = 0;
+  std::uint64_t transactions_          = 0;
+  std::uint64_t events_                = 0;
+  std::uint64_t output_bytes_          = 0;
 };
 
 } // namespace
@@ -660,6 +867,23 @@ Result<TimeKillerJsonStats> write_timekiller_json(std::istream &input,
   return Result<TimeKillerJsonStats>::ok(consumer.stats());
 }
 
+Result<DenseBinaryTraceStats>
+write_dense_binary_trace(std::istream &input, std::ostream &output,
+                         ParseOptions options) {
+  DenseBinaryConsumer consumer(output);
+  auto decoded = decode_binary_trace_stream(input, options, consumer);
+  if (!decoded) {
+    return Result<DenseBinaryTraceStats>::err(decoded.error());
+  }
+
+  output.flush();
+  if (!output) {
+    return decode_error<DenseBinaryTraceStats>(
+        "failed to flush dense binary trace output");
+  }
+  return Result<DenseBinaryTraceStats>::ok(consumer.stats());
+}
+
 Result<Trace> read_binary_trace_stream(std::istream &input,
                                        ParseOptions options) {
   std::array<char, kBinaryTraceMagic.size()> magic{};
@@ -681,10 +905,11 @@ Result<Trace> read_binary_trace_stream(std::istream &input,
     return single_error("unsupported binary trace version " +
                         std::to_string(version));
   }
-  if (flags != kBinaryTraceFlags) {
+  if ((flags & ~kBinaryTraceDenseIdsFlag) != 0) {
     return single_error("unsupported binary trace flags " +
                         std::to_string(flags));
   }
+  const bool has_dense_ids = (flags & kBinaryTraceDenseIdsFlag) != 0;
   if (txn_count > std::numeric_limits<TxnId>::max()) {
     return single_error("binary trace has too many transactions");
   }
@@ -693,6 +918,7 @@ Result<Trace> read_binary_trace_stream(std::istream &input,
   }
 
   Trace trace;
+  trace.has_raw_payload = !has_dense_ids;
   trace.transactions.reserve(static_cast<std::size_t>(txn_count));
   trace.events.reserve(static_cast<std::size_t>(event_count));
   trace.event_key_ids.reserve(static_cast<std::size_t>(event_count));
@@ -704,6 +930,8 @@ Result<Trace> read_binary_trace_stream(std::istream &input,
   DiagnosticList diagnostics;
   std::unordered_set<Timestamp> seen_commit_ts;
   std::optional<Timestamp> previous_commit_ts;
+  std::uint64_t next_key_id   = 0;
+  std::uint64_t next_value_id = 0;
 
   for (std::uint64_t txn_index = 0; txn_index < txn_count; ++txn_index) {
     std::uint32_t session_id      = 0;
@@ -722,6 +950,11 @@ Result<Trace> read_binary_trace_stream(std::istream &input,
           binary_error("transaction " + std::to_string(txn_index) +
                        " has commit_ts smaller than previous commit_ts"));
       return Result<Trace>::err(std::move(diagnostics));
+    }
+    if (txn_event_count > event_count - trace.events.size()) {
+      return single_error("binary trace event count exceeds header at "
+                          "transaction " +
+                          std::to_string(txn_index));
     }
     if (options.reject_duplicate_commit_ts &&
         !seen_commit_ts.insert(commit_ts).second) {
@@ -770,19 +1003,63 @@ Result<Trace> read_binary_trace_stream(std::istream &input,
                             std::to_string(event_index));
       }
 
-      std::string error;
-      auto key = read_hex_value(input, error);
-      if (!key.has_value()) {
-        return single_error(error);
-      }
-
+      const bool has_value = (event_flags & kEventHasValue) != 0;
+      Key key;
       std::optional<Value> value;
-      if ((event_flags & kEventHasValue) != 0) {
-        auto parsed_value = read_hex_value(input, error);
-        if (!parsed_value.has_value()) {
+      KeyId dense_key_id     = 0;
+      ValueId dense_value_id = kNullValueId;
+      if (has_dense_ids) {
+        if (!read_u32(input, dense_key_id) ||
+            !read_u32(input, dense_value_id)) {
+          return single_error("truncated dense IDs at transaction " +
+                              std::to_string(txn_index) + ", event " +
+                              std::to_string(event_index));
+        }
+        if (dense_key_id == std::numeric_limits<KeyId>::max() ||
+            dense_key_id > next_key_id) {
+          return single_error(
+              "dense key IDs must be contiguous in first-seen order at "
+              "transaction " +
+              std::to_string(txn_index) + ", event " +
+              std::to_string(event_index));
+        }
+        if (dense_key_id == next_key_id) {
+          ++next_key_id;
+        }
+        if (has_value) {
+          if (dense_value_id == kNullValueId ||
+              dense_value_id > next_value_id) {
+            return single_error(
+                "dense value IDs must be contiguous in first-seen order at "
+                "transaction " +
+                std::to_string(txn_index) + ", event " +
+                std::to_string(event_index));
+          }
+          if (dense_value_id == next_value_id) {
+            ++next_value_id;
+          }
+        } else if (dense_value_id != kNullValueId) {
+          return single_error(
+              "dense event without a value must use the null value ID at "
+              "transaction " +
+              std::to_string(txn_index) + ", event " +
+              std::to_string(event_index));
+        }
+      } else {
+        std::string error;
+        auto parsed_key = read_hex_value(input, error);
+        if (!parsed_key.has_value()) {
           return single_error(error);
         }
-        value = std::move(*parsed_value);
+        key = std::move(*parsed_key);
+
+        if (has_value) {
+          auto parsed_value = read_hex_value(input, error);
+          if (!parsed_value.has_value()) {
+            return single_error(error);
+          }
+          value = std::move(*parsed_value);
+        }
       }
 
       Event event;
@@ -790,7 +1067,7 @@ Result<Trace> read_binary_trace_stream(std::istream &input,
       event.txn_id    = txn.id;
       event.seq       = seq;
       event.op        = *op;
-      event.key       = std::move(*key);
+      event.key       = std::move(key);
       event.value     = std::move(value);
       event.is_delete = (event_flags & kEventDelete) != 0;
       event.is_miss   = (event_flags & kEventMiss) != 0;
@@ -804,14 +1081,14 @@ Result<Trace> read_binary_trace_stream(std::istream &input,
       }
       previous_seq = event.seq;
 
-      if (event.is_miss && event.value.has_value()) {
+      if (event.is_miss && has_value) {
         diagnostics.push_back(binary_error(
             "read event cannot have both miss and value at transaction " +
             std::to_string(txn_index) + ", event " +
             std::to_string(event_index)));
         return Result<Trace>::err(std::move(diagnostics));
       }
-      if (event.is_delete && event.value.has_value()) {
+      if (event.is_delete && has_value) {
         diagnostics.push_back(binary_error(
             "write event cannot have both delete and value at transaction " +
             std::to_string(txn_index) + ", event " +
@@ -835,21 +1112,27 @@ Result<Trace> read_binary_trace_stream(std::istream &input,
 
       trace.events.push_back(std::move(event));
       const auto &stored_event = trace.events.back();
-      const auto key_id        = key_interner.intern(stored_event.key);
-      if (!key_id.has_value()) {
-        return single_error("binary trace exceeds the dense key ID range");
-      }
-      ValueId value_id = kNullValueId;
-      if (stored_event.value.has_value()) {
-        const auto interned_value = value_interner.intern(*stored_event.value);
-        if (!interned_value.has_value()) {
-          return single_error("binary trace exceeds the dense value ID range");
+      KeyId key_id       = dense_key_id;
+      ValueId value_id   = dense_value_id;
+      if (!has_dense_ids) {
+        const auto interned_key = key_interner.intern(stored_event.key);
+        if (!interned_key.has_value()) {
+          return single_error("binary trace exceeds the dense key ID range");
         }
-        value_id = *interned_value;
+        key_id = *interned_key;
+        if (stored_event.value.has_value()) {
+          const auto interned_value =
+              value_interner.intern(*stored_event.value);
+          if (!interned_value.has_value()) {
+            return single_error(
+                "binary trace exceeds the dense value ID range");
+          }
+          value_id = *interned_value;
+        }
       }
 
       txn.event_ids.push_back(stored_event.id);
-      trace.event_key_ids.push_back(*key_id);
+      trace.event_key_ids.push_back(key_id);
       trace.event_value_ids.push_back(value_id);
     }
 
@@ -860,9 +1143,17 @@ Result<Trace> read_binary_trace_stream(std::istream &input,
   if (trace.events.size() != event_count) {
     return single_error("binary trace event count does not match header");
   }
+  if (input.peek() != std::char_traits<char>::eof()) {
+    return single_error("binary trace has trailing data after declared records");
+  }
+  if (input.bad()) {
+    return single_error("failed while checking the end of the binary trace");
+  }
 
-  trace.key_count   = key_interner.size();
-  trace.value_count = value_interner.size();
+  trace.key_count = has_dense_ids ? static_cast<std::size_t>(next_key_id)
+                                  : key_interner.size();
+  trace.value_count = has_dense_ids ? static_cast<std::size_t>(next_value_id)
+                                    : value_interner.size();
 
   return Result<Trace>::ok(std::move(trace));
 }
@@ -879,10 +1170,16 @@ Result<Trace> read_binary_trace_file(std::string_view path,
 
 bool write_binary_trace_stream(std::ostream &output, const Trace &trace,
                                std::string *error) {
+  if (!trace.has_raw_payload) {
+    if (error != nullptr) {
+      *error = "cannot write a raw binary trace without raw key/value data";
+    }
+    return false;
+  }
   if (!write_exact(output, kBinaryTraceMagic.data(),
                    kBinaryTraceMagic.size()) ||
       !write_u32(output, kBinaryTraceVersion) ||
-      !write_u32(output, kBinaryTraceFlags) ||
+      !write_u32(output, kBinaryTraceRawFlags) ||
       !write_u64(output,
                  static_cast<std::uint64_t>(trace.transactions.size())) ||
       !write_u64(output, static_cast<std::uint64_t>(trace.events.size()))) {

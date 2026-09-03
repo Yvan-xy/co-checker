@@ -1,12 +1,37 @@
 #include "test_harness.h"
 
+#include <cstdlib>
 #include <filesystem>
+#include <sstream>
+#include <string>
 
 #include "common/trace/trace_parser.h"
+#include "common/trace/trace_binary.h"
 #include "common/util/check_result.h"
 
 namespace test {
 namespace {
+
+common::Trace dense_trace_or_die(const common::Trace &raw_trace) {
+  std::ostringstream raw_output;
+  std::string error;
+  if (!common::write_binary_trace_stream(raw_output, raw_trace, &error)) {
+    std::abort();
+  }
+  std::istringstream raw_input(raw_output.str());
+  std::ostringstream dense_output;
+  auto converted =
+      common::write_dense_binary_trace(raw_input, dense_output);
+  if (!converted) {
+    std::abort();
+  }
+  std::istringstream dense_input(dense_output.str());
+  auto loaded = common::read_binary_trace_stream(dense_input);
+  if (!loaded) {
+    std::abort();
+  }
+  return std::move(loaded.value());
+}
 
 void test_co_snapshot_checker_passes() {
   auto trace = parse_or_die(R"yaml(
@@ -317,6 +342,10 @@ events:
   auto result = run_so_ww_checker(trace);
   CHECK(result.status == checker::CheckStatus::Pass);
   CHECK(result.diagnostics.empty());
+
+  auto dense_result = run_so_ww_checker(dense_trace_or_die(trace));
+  CHECK(dense_result.status == result.status);
+  CHECK(dense_result.diagnostics.empty());
 }
 
 void test_so_ww_checker_does_not_rollback_before_ww_bound() {
@@ -359,6 +388,14 @@ events:
   CHECK(!result.diagnostics.empty());
   CHECK(result.diagnostics[0].key.has_value());
   CHECK(result.diagnostics[0].key->to_hex() == "01");
+
+  auto dense_result = run_so_ww_checker(dense_trace_or_die(trace));
+  CHECK(dense_result.status == result.status);
+  CHECK(!dense_result.diagnostics.empty());
+  if (!dense_result.diagnostics.empty()) {
+    CHECK(!dense_result.diagnostics[0].key.has_value());
+    CHECK(dense_result.diagnostics[0].key_id == 0);
+  }
 }
 
 void test_so_ww_checker_requires_dense_ids() {

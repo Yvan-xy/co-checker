@@ -179,6 +179,20 @@ target_compile_options(cotrace-to-timekiller
     -Wall -Wextra -Wpedantic
 )
 
+add_executable(cotrace-densify
+  src/cli/cotrace_densify.cpp
+)
+
+target_link_libraries(cotrace-densify
+  PRIVATE
+    checker
+)
+
+target_compile_options(cotrace-densify
+  PRIVATE
+    -Wall -Wextra -Wpedantic
+)
+
 include(CTest)
 if(BUILD_TESTING)
   add_executable(checker_tests

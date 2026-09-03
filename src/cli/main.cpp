@@ -168,6 +168,18 @@ int main(int argc, char **argv) {
     return 2;
   }
 
+  if (!trace.value().has_raw_payload) {
+    if (!config.dump.empty()) {
+      std::cerr << "dense-ID traces do not contain the raw data required by "
+                   "--dump\n";
+      return 3;
+    }
+    if (config.checker != "none" && config.checker != "snapshot-so-ww") {
+      std::cerr << "dense-ID traces support only --checker snapshot-so-ww\n";
+      return 3;
+    }
+  }
+
   if (!config.dump.empty() && config.dump != "parsed" &&
       config.dump != "versions" && config.dump != "all") {
     std::cerr << "unknown dump kind: " << config.dump << '\n';

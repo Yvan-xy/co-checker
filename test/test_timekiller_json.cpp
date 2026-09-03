@@ -19,6 +19,14 @@ std::string binary_trace(const common::Trace &trace) {
   return output.str();
 }
 
+std::string dense_binary_trace(const std::string &raw_binary) {
+  std::istringstream input(raw_binary);
+  std::ostringstream output;
+  auto result = common::write_dense_binary_trace(input, output);
+  CHECK(result.has_value());
+  return output.str();
+}
+
 void test_timekiller_json_mapping_and_determinism() {
   const auto trace = parse_or_die(R"yaml(
 ---
@@ -102,6 +110,21 @@ events:
   auto second = common::write_timekiller_json(second_input, second_output);
   CHECK(second.has_value());
   CHECK(second_output.str() == first_output.str());
+
+  const auto dense = dense_binary_trace(binary);
+  std::istringstream dense_input(dense);
+  std::ostringstream dense_output;
+  auto dense_result =
+      common::write_timekiller_json(dense_input, dense_output);
+  CHECK(dense_result.has_value());
+  if (dense_result) {
+    CHECK(dense_output.str() == first_output.str());
+    CHECK(dense_result.value().transactions == first.value().transactions);
+    CHECK(dense_result.value().events == first.value().events);
+    CHECK(dense_result.value().keys == first.value().keys);
+    CHECK(dense_result.value().values == first.value().values);
+    CHECK(dense_result.value().output_bytes == first.value().output_bytes);
+  }
 }
 
 void test_timekiller_json_rejects_java_long_timestamp_overflow() {

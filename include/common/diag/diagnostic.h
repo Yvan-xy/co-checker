@@ -22,6 +22,7 @@ struct Diagnostic {
   std::optional<EventId> event_id;
   std::optional<EventSeq> event_seq;
   std::optional<Key> key;
+  std::optional<KeyId> key_id;
 };
 
 using DiagnosticList = std::vector<Diagnostic>;

@@ -19,6 +19,29 @@ struct ConstantHexValueHash {
   }
 };
 
+std::string raw_binary_trace(const common::Trace &trace) {
+  std::ostringstream output;
+  std::string error;
+  CHECK(common::write_binary_trace_stream(output, trace, &error));
+  CHECK(error.empty());
+  return output.str();
+}
+
+std::string dense_binary_trace(const common::Trace &trace,
+                               common::DenseBinaryTraceStats *stats = nullptr) {
+  std::istringstream input(raw_binary_trace(trace));
+  std::ostringstream output;
+  auto result = common::write_dense_binary_trace(input, output);
+  CHECK(result.has_value());
+  if (!result) {
+    return {};
+  }
+  if (stats != nullptr) {
+    *stats = result.value();
+  }
+  return output.str();
+}
+
 void test_hex_value() {
   std::string error;
   auto value = common::HexValue::from_hex("80000100000002010064", &error);
@@ -221,6 +244,137 @@ events:
   CHECK(parsed.value().value_count == trace.value_count);
 }
 
+void test_dense_binary_trace_round_trip() {
+  auto trace = parse_or_die(R"yaml(
+---
+session_id: 7
+start_ts: 10
+commit_ts: 20
+events:
+  - seq: 1
+    op: W
+    key_hex: 02
+    value_hex: 0a
+  - seq: 2
+    op: W
+    key_hex: 01
+    value_hex: 0a
+  - seq: 3
+    op: W
+    key_hex: 02
+    value_hex: 0b
+  - seq: 4
+    op: W
+    key_hex: 03
+    delete: true
+  - seq: 5
+    op: R
+    key_hex: 04
+    miss: true
+)yaml");
+
+  common::DenseBinaryTraceStats stats;
+  const auto dense = dense_binary_trace(trace, &stats);
+  CHECK(dense.size() == 32U + 24U + 5U * 16U);
+  CHECK(static_cast<unsigned char>(dense[12]) ==
+        common::kBinaryTraceDenseIdsFlag);
+  CHECK(stats.transactions == 1);
+  CHECK(stats.events == 5);
+  CHECK(stats.keys == 4);
+  CHECK(stats.values == 2);
+  CHECK(stats.output_bytes == dense.size());
+
+  std::istringstream input(dense);
+  auto parsed = common::read_binary_trace_stream(input);
+  CHECK(parsed.has_value());
+  if (!parsed) {
+    return;
+  }
+  const auto &loaded = parsed.value();
+  CHECK(!loaded.has_raw_payload);
+  CHECK(loaded.transactions.size() == 1);
+  CHECK(loaded.transactions[0].session_id == 7);
+  CHECK(loaded.transactions[0].start_ts == 10);
+  CHECK(loaded.transactions[0].commit_ts == 20);
+  CHECK(loaded.events.size() == 5);
+  CHECK(loaded.events[3].is_delete);
+  CHECK(loaded.events[4].is_miss);
+  CHECK(loaded.events[0].key.byte_len == 0);
+  CHECK(!loaded.events[0].value.has_value());
+  CHECK(loaded.event_key_ids ==
+        std::vector<common::KeyId>({0, 1, 0, 2, 3}));
+  CHECK(loaded.event_value_ids ==
+        std::vector<common::ValueId>(
+            {0, 0, 1, common::kNullValueId, common::kNullValueId}));
+  CHECK(loaded.key_count == 4);
+  CHECK(loaded.value_count == 2);
+
+  std::ostringstream raw_output;
+  std::string error;
+  CHECK(!common::write_binary_trace_stream(raw_output, loaded, &error));
+  CHECK(error.find("without raw key/value data") != std::string::npos);
+}
+
+void test_dense_binary_trace_rejects_invalid_ids() {
+  auto trace = parse_or_die(R"yaml(
+---
+session_id: 1
+start_ts: 10
+commit_ts: 20
+events:
+  - seq: 1
+    op: W
+    key_hex: 01
+    value_hex: 0a
+  - seq: 2
+    op: W
+    key_hex: 02
+    delete: true
+)yaml");
+  const auto dense = dense_binary_trace(trace);
+
+  auto skipped_key_id = dense;
+  skipped_key_id[64] = 1;
+  std::istringstream skipped_key_input(skipped_key_id);
+  auto skipped_key = common::read_binary_trace_stream(skipped_key_input);
+  CHECK(!skipped_key);
+  if (!skipped_key) {
+    CHECK(skipped_key.error()[0].message.find("contiguous") !=
+          std::string::npos);
+  }
+
+  auto non_null_absent_value = dense;
+  // Header (32) + transaction (24) + first event (16) + value ID offset (12).
+  non_null_absent_value[84] = 0;
+  std::istringstream non_null_input(non_null_absent_value);
+  auto non_null = common::read_binary_trace_stream(non_null_input);
+  CHECK(!non_null);
+  if (!non_null) {
+    CHECK(non_null.error()[0].message.find("null value ID") !=
+          std::string::npos);
+  }
+
+  auto trailing_data = dense;
+  trailing_data.push_back('x');
+  std::istringstream trailing_input(trailing_data);
+  auto trailing = common::read_binary_trace_stream(trailing_input);
+  CHECK(!trailing);
+  if (!trailing) {
+    CHECK(trailing.error()[0].message.find("trailing data") !=
+          std::string::npos);
+  }
+
+  std::istringstream dense_input(dense);
+  std::ostringstream second_output;
+  auto second_densify =
+      common::write_dense_binary_trace(dense_input, second_output);
+  CHECK(!second_densify);
+  if (!second_densify) {
+    CHECK(second_densify.error()[0].message.find("already densified") !=
+          std::string::npos);
+  }
+}
+
 void test_parser_rejects_bad_hex() {
   std::istringstream input(R"yaml(
 ---
@@ -288,6 +442,8 @@ void run_trace_tests() {
   test_dense_interner_resolves_hash_collisions();
   test_trace_print_helpers();
   test_binary_trace_round_trip();
+  test_dense_binary_trace_round_trip();
+  test_dense_binary_trace_rejects_invalid_ids();
   test_parser_rejects_bad_hex();
   test_parser_rejects_duplicate_commit_ts();
   test_generated_trace_parses();

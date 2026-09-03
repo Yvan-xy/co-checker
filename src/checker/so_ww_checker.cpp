@@ -116,6 +116,15 @@ CheckResult missingDenseIdsResult() {
   return result;
 }
 
+void useDenseKeyDiagnostic(Diagnostic &diagnostic, const Trace &trace,
+                           const KeyId key_id) {
+  if (trace.has_raw_payload) {
+    return;
+  }
+  diagnostic.key.reset();
+  diagnostic.key_id = key_id;
+}
+
 } // namespace
 
 std::string_view SnapshotSOWWChecker::name() const { return "snapshot-so-ww"; }
@@ -185,6 +194,7 @@ CheckResult SnapshotSOWWChecker::run(const CheckerContext &ctx_) const {
           auto diagnostic = make_diagnostic(
               "inconsistent read of the same key in the same transaction", txn,
               event);
+          useDenseKeyDiagnostic(diagnostic, ctx.trace, key_id);
           pending_read_diagnostics.push_back(std::move(diagnostic));
         }
         const auto expected_id        = ctx.cur_snapshot[key_id];
@@ -257,7 +267,12 @@ CheckResult SnapshotSOWWChecker::run(const CheckerContext &ctx_) const {
         }
         auto diagnostic = make_diagnostic("Violation detected ", txn,
                                           ctx.trace.getEvent(txn.event_ids[0]));
-        diagnostic.key  = ctx.trace.getEvent(read_events[key_id]).key;
+        if (ctx.trace.has_raw_payload) {
+          diagnostic.key = ctx.trace.getEvent(read_events[key_id]).key;
+        } else {
+          diagnostic.key.reset();
+          diagnostic.key_id = key_id;
+        }
         result.diagnostics.push_back(diagnostic);
       }
     }

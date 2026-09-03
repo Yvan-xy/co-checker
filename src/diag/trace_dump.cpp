@@ -41,6 +41,9 @@ void print_diagnostic(std::ostream &os, const Diagnostic &diagnostic) {
   if (diagnostic.key.has_value()) {
     os << " key=" << diagnostic.key->to_hex();
   }
+  if (diagnostic.key_id.has_value()) {
+    os << " key_id=" << *diagnostic.key_id;
+  }
   os << '\n';
 }
 
