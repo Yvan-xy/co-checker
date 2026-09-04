@@ -91,10 +91,12 @@ def parse_args():
     parser.add_argument(
         "--stat",
         action="store_true",
-        help=(
-            "forward --stat to co-checker and write a CSV summary with "
-            "checker timings, statuses, and numeric statistic lines"
-        ),
+        help="forward --stat to co-checker and write its numeric statistics to CSV",
+    )
+    parser.add_argument(
+        "--stat-average-only",
+        action="store_true",
+        help="write only statistic names beginning with average_ to the stat CSV",
     )
     parser.add_argument(
         "--stat-output",
@@ -109,6 +111,8 @@ def parse_args():
     args, co_checker_args = parser.parse_known_args()
     if co_checker_args and co_checker_args[0] == "--":
         co_checker_args = co_checker_args[1:]
+    if args.stat_average_only and not args.stat:
+        parser.error("--stat-average-only requires --stat")
     args.co_checker_args = co_checker_args
     return args
 
@@ -340,7 +344,24 @@ def record_stat_metrics(
             stored["stats"][stat_name] = stat_value
 
 
-def write_stat_csv(stat_results, trace_order, checker_order, stat_order, path):
+def write_stat_csv(
+    stat_results,
+    trace_order,
+    checker_order,
+    stat_order,
+    path,
+    average_only=False,
+):
+    if average_only:
+        stat_order = [
+            item for item in stat_order if item[1].startswith("average_")
+        ]
+
+    def stat_column(checker_name, stat_name):
+        if len(checker_order) == 1:
+            return stat_name
+        return f"{checker_name}-{stat_name}"
+
     fieldnames = [
         "trace",
         "sessions",
@@ -348,7 +369,7 @@ def write_stat_csv(stat_results, trace_order, checker_order, stat_order, path):
         "events",
         "average_event_per_txn",
     ]
-    fieldnames.extend(f"{checker}-{stat}" for checker, stat in stat_order)
+    fieldnames.extend(stat_column(checker, stat) for checker, stat in stat_order)
 
     with Path(path).open("w", encoding="utf-8", newline="") as output:
         writer = csv.DictWriter(output, fieldnames=fieldnames)
@@ -356,12 +377,12 @@ def write_stat_csv(stat_results, trace_order, checker_order, stat_order, path):
         for trace in sorted(trace_order, key=trace_sort_key):
             trace_result = stat_results[trace]
             row = {
-                "trace": trace,
+                "trace": Path(trace).name,
             }
             row.update(trace_size_fields(trace))
             for checker_name, stat_name in stat_order:
                 checker_metrics = trace_result["checkers"].get(checker_name, {})
-                row[f"{checker_name}-{stat_name}"] = checker_metrics.get(
+                row[stat_column(checker_name, stat_name)] = checker_metrics.get(
                     "stats", {}
                 ).get(stat_name, "")
             writer.writerow(row)
@@ -498,6 +519,7 @@ def main():
             stat_checker_order,
             stat_order,
             args.stat_output,
+            args.stat_average_only,
         )
         print(f"stat csv: {args.stat_output}")
 

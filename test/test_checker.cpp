@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <iostream>
 #include <sstream>
 #include <string>
 
@@ -398,6 +399,57 @@ events:
   }
 }
 
+void test_so_ww_checker_counts_snapshot_event_distance() {
+  auto trace = parse_or_die(R"yaml(
+---
+session_id: 1
+start_ts: 10
+commit_ts: 20
+events:
+  - seq: 1
+    op: W
+    key_hex: 01
+    value_hex: 0a
+---
+session_id: 2
+start_ts: 21
+commit_ts: 30
+events:
+  - seq: 1
+    op: W
+    key_hex: 02
+    value_hex: 0b
+  - seq: 2
+    op: R
+    key_hex: 03
+    miss: true
+---
+session_id: 3
+start_ts: 31
+commit_ts: 40
+events:
+  - seq: 1
+    op: R
+    key_hex: 02
+    miss: true
+  - seq: 2
+    op: W
+    key_hex: 01
+    value_hex: 0c
+)yaml");
+
+  std::ostringstream output;
+  auto *original_output = std::cout.rdbuf(output.rdbuf());
+  auto result           = run_so_ww_checker(trace, true);
+  std::cout.rdbuf(original_output);
+
+  CHECK(result.status == checker::CheckStatus::Pass);
+  CHECK(output.str().find("snp_distance: 1\n") != std::string::npos);
+  CHECK(output.str().find("snp_event_distance: 2\n") != std::string::npos);
+  CHECK(output.str().find("average_snp_event_dist: 0.666667\n") !=
+        std::string::npos);
+}
+
 void test_so_ww_checker_requires_dense_ids() {
   auto trace = parse_or_die(R"yaml(
 ---
@@ -559,6 +611,7 @@ void run_checker_tests() {
   test_so_cl_checker_passes_overwrite_chain_trace();
   test_so_ww_checker_rolls_back_unrelated_writes_before_ww_bound();
   test_so_ww_checker_does_not_rollback_before_ww_bound();
+  test_so_ww_checker_counts_snapshot_event_distance();
   test_so_ww_checker_requires_dense_ids();
   test_serializable_checker_allows_read_own_write();
   test_serializable_checker_requires_explicit_miss_for_absent_key();

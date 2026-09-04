@@ -79,12 +79,14 @@ checker::CheckResult run_so_cl_checker(const common::Trace &trace) {
   return checker.run(context);
 }
 
-checker::CheckResult run_so_ww_checker(const common::Trace &trace) {
+checker::CheckResult run_so_ww_checker(const common::Trace &trace,
+                                       const bool stat) {
   checker::SnapshotSOWWChecker checker;
   common::NullLogger logger;
   checker::CheckerContext context{
       .trace  = trace,
       .logger = &logger,
+      .stat   = stat,
   };
   return checker.run(context);
 }

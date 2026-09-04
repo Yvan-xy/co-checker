@@ -9,6 +9,7 @@
 #ifdef STAT
 #include <iostream>
 static uint64_t snp_distantce;
+static uint64_t snp_event_distance;
 static uint64_t t_tmax_distance;
 #endif
 
@@ -18,12 +19,17 @@ namespace {
 
 inline void printStat(uint64_t txn_num) {
 #ifdef STAT
-  double average_snp_dist    = (double)snp_distantce / txn_num;
+  double average_snp_dist = (double)snp_distantce / txn_num;
+  double average_snp_event_dist =
+      (double)snp_event_distance / txn_num;
   double average_t_tmax_dist = (double)t_tmax_distance / txn_num;
   std::cout << "snp_distance: " << snp_distantce << std::endl;
+  std::cout << "snp_event_distance: " << snp_event_distance << std::endl;
   std::cout << "t_tmax_distance: " << t_tmax_distance << std::endl;
   std::cout << "txn_num: " << txn_num << std::endl;
   std::cout << "average_snp_dist: " << average_snp_dist << std::endl;
+  std::cout << "average_snp_event_dist: " << average_snp_event_dist
+            << std::endl;
   std::cout << "average_t_tmax_dist: " << average_t_tmax_dist << std::endl;
 #endif
 }
@@ -156,6 +162,14 @@ CheckResult SnapshotSOWWChecker::run(const CheckerContext &ctx_) const {
   std::vector<EventId> read_events(ctx.trace.key_count, 0);
   std::vector<KeyId> touched_read_keys;
 
+#ifdef STAT
+  if (ctx.stat) {
+    snp_distantce      = 0;
+    snp_event_distance = 0;
+    t_tmax_distance    = 0;
+  }
+#endif
+
   for (const auto &txn : ctx.trace.transactions) {
     const auto epoch = static_cast<std::uint32_t>(txn.id + 1U);
     collectFinalWrites(ctx.trace, txn, writes, seen_write_epochs, epoch);
@@ -235,7 +249,11 @@ CheckResult SnapshotSOWWChecker::run(const CheckerContext &ctx_) const {
       }
 
 #ifdef STAT
-      snp_distantce++;
+      if (ctx.stat) {
+        snp_distantce++;
+        snp_event_distance += static_cast<uint64_t>(
+            ctx.trace.getTxn(rollback_txn_id).event_ids.size());
+      }
 #endif
 
       id--;
