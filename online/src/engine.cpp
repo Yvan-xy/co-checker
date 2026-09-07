@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -73,17 +74,55 @@ public:
   }
 
   [[nodiscard]] Id insert_new(const ByteView bytes, const std::uint64_t hash) {
-    if (values_.size() >=
+    if (free_ids_.empty() && values_.size() >=
         static_cast<std::size_t>(std::numeric_limits<Id>::max())) {
       throw std::length_error("byte interner identity space exhausted");
     }
-    ensure_index_capacity();
-    const auto id = static_cast<Id>(values_.size());
     OwnedBytes owned(bytes.begin(), bytes.end());
-    values_.push_back(std::move(owned));
+    ensure_index_capacity();
+    Id id;
+    if (free_ids_.empty()) {
+      id = static_cast<Id>(values_.size());
+      values_.push_back(std::move(owned));
+    } else {
+      id = free_ids_.back();
+      values_[id] = std::move(owned);
+      free_ids_.pop_back();
+    }
     insert_index(IndexEntry{hash, id, true});
     byte_count_ += bytes.size();
     return id;
+  }
+
+  // The caller must first prove that no snapshot/delta references this ID.
+  // Preserve other IDs and repair the linear-probing chain without tombstones.
+  [[nodiscard]] std::size_t erase(const Id id) {
+    const auto &value = values_.at(static_cast<std::size_t>(id));
+    if (index_.empty()) throw std::logic_error("erasing an unknown interned value");
+    const auto mask = index_.size() - 1U;
+    auto hole = static_cast<std::size_t>(repeated_read_hash(ByteView(value))) & mask;
+    while (index_[hole].occupied && index_[hole].id != id) {
+      hole = (hole + 1U) & mask;
+    }
+    if (!index_[hole].occupied) {
+      throw std::logic_error("erasing an unknown interned value");
+    }
+    // Reserve the reusable ID before changing any index or payload state.
+    free_ids_.push_back(id);
+    const auto bytes = value.size();
+    for (auto scan = (hole + 1U) & mask; index_[scan].occupied;
+         scan = (scan + 1U) & mask) {
+      const auto home = static_cast<std::size_t>(index_[scan].hash) & mask;
+      if (((hole - home) & mask) < ((scan - home) & mask)) {
+        index_[hole] = index_[scan];
+        hole = scan;
+      }
+    }
+    index_[hole] = IndexEntry{};
+    --index_size_;
+    byte_count_ -= bytes;
+    OwnedBytes{}.swap(values_[id]);
+    return bytes;
   }
 
   [[nodiscard]] const OwnedBytes &at(const Id id) const {
@@ -92,13 +131,37 @@ public:
 
   void clear() {
     values_.clear();
+    free_ids_.clear();
     std::fill(index_.begin(), index_.end(), IndexEntry{});
     index_size_ = 0;
     byte_count_ = 0;
   }
 
-  [[nodiscard]] std::size_t size() const noexcept { return values_.size(); }
+  [[nodiscard]] std::size_t size() const noexcept { return index_size_; }
+  [[nodiscard]] std::size_t slot_count() const noexcept { return values_.size(); }
   [[nodiscard]] std::size_t byte_count() const noexcept { return byte_count_; }
+
+  template <typename Visitor> void for_each_value(Visitor &&visit) const {
+    for (const auto &entry : index_) {
+      if (entry.occupied) visit(entry.id, ByteView(values_[entry.id]));
+    }
+  }
+
+  [[nodiscard]] std::size_t free_id_capacity_bytes() const noexcept {
+    return free_ids_.capacity() * sizeof(Id);
+  }
+
+  [[nodiscard]] std::size_t index_capacity_bytes() const noexcept {
+    return index_.capacity() * sizeof(IndexEntry);
+  }
+  [[nodiscard]] std::size_t descriptor_capacity_bytes() const noexcept {
+    return values_.capacity() * sizeof(OwnedBytes);
+  }
+  [[nodiscard]] std::size_t payload_capacity_bytes() const noexcept {
+    std::size_t result = 0;
+    for (const auto &value : values_) result += value.capacity();
+    return result;
+  }
 
 private:
   struct IndexEntry {
@@ -134,6 +197,7 @@ private:
   std::vector<IndexEntry> index_;
   std::size_t index_size_ = 0;
   std::vector<OwnedBytes> values_;
+  std::vector<Id> free_ids_;
   std::size_t byte_count_ = 0;
 };
 
@@ -450,6 +514,14 @@ private:
     const auto effective_lower_bound =
         max_bound(session_lower_bound, write_write_lower_bound);
 
+    if (retained_floor_.has_value() &&
+        (!effective_lower_bound.has_value() ||
+         *effective_lower_bound < *retained_floor_)) {
+      return fail(EngineErrorCode::HistoryUnavailable,
+                  "transaction lower bound precedes retained history",
+                  meta.commit_seq, std::nullopt);
+    }
+
     std::optional<Violation> transaction_violation;
     if (repeated_read_violation.has_value()) {
       repeated_read_violation->session_lower_bound = session_lower_bound;
@@ -502,7 +574,45 @@ private:
   }
 
 public:
+  [[nodiscard]] std::optional<EngineError>
+  pruneHistoryThrough(const CommitSeq frontier) {
+    const auto result = guarded_consume(frontier, [&] {
+      if (sticky_error_.has_value()) {
+        return error_result();
+      }
+      if (frontier >= next_expected_commit_seq_ ||
+          (retained_floor_.has_value() && frontier < *retained_floor_)) {
+        return fail(EngineErrorCode::InvalidHistoryFrontier,
+                    "history frontier must be monotone and already consumed",
+                    frontier, std::nullopt);
+      }
+      // Delta F restores the snapshot BEFORE F. Keeping the snapshot
+      // AFTER F as the oldest candidate requires only deltas with
+      // sequence > F.
+      while (!history_.empty() && history_.front().commit_seq <= frontier) {
+        const auto count = history_.front().delta.size();
+        const auto bytes = sizeof(HistoryEntry) + count * sizeof(DeltaEntry);
+        for (const auto &delta : history_.front().delta) {
+          if (delta.old_value) release_value(*delta.old_value);
+        }
+        history_.pop_front();
+        history_deltas_ -= count;
+        history_logical_bytes_ -= bytes;
+        retained_state_bytes_ -= bytes;
+        ++reclaimed_history_entries_;
+        reclaimed_history_deltas_ += count;
+        reclaimed_history_bytes_ += bytes;
+      }
+      retained_floor_ = frontier;
+      return ConsumeResult{};
+    });
+    return result.error;
+  }
+
   void reset() {
+    value_references_.clear();
+    reclaimed_value_count_ = 0;
+    reclaimed_value_bytes_ = 0;
     next_expected_commit_seq_ = 0;
     current_snapshot_.clear();
     latest_by_session_.clear();
@@ -516,6 +626,10 @@ public:
     current_snapshot_keys_     = 0;
     history_deltas_            = 0;
     history_logical_bytes_     = 0;
+    retained_floor_.reset();
+    reclaimed_history_entries_ = 0;
+    reclaimed_history_deltas_  = 0;
+    reclaimed_history_bytes_   = 0;
     first_violation_.reset();
     sticky_error_.reset();
   }
@@ -535,7 +649,50 @@ public:
     return sticky_error_;
   }
 
-  [[nodiscard]] SnapshotSOWWMetrics metrics() const {
+  [[nodiscard]] SnapshotSOWWMemoryProfile memoryProfile() const {
+    SnapshotSOWWMemoryProfile result;
+    result.snapshot_size_bytes = current_snapshot_.size() * sizeof(Snapshot::value_type);
+    result.snapshot_capacity_bytes = current_snapshot_.capacity() * sizeof(Snapshot::value_type);
+    result.latest_writer_size_bytes = latest_writer_by_key_.size() * sizeof(LastWriterMap::value_type);
+    result.latest_writer_capacity_bytes = latest_writer_by_key_.capacity() * sizeof(LastWriterMap::value_type);
+    result.key_index_capacity_bytes = keys_.index_capacity_bytes();
+    result.key_descriptor_capacity_bytes = keys_.descriptor_capacity_bytes();
+    result.key_payload_capacity_bytes = keys_.payload_capacity_bytes();
+    result.value_index_capacity_bytes = values_.index_capacity_bytes();
+    result.value_descriptor_capacity_bytes = values_.descriptor_capacity_bytes();
+    result.value_payload_capacity_bytes = values_.payload_capacity_bytes();
+    result.value_reference_capacity_bytes = value_references_.capacity() * sizeof(std::size_t);
+    result.value_free_id_capacity_bytes = values_.free_id_capacity_bytes();
+    result.session_value_bytes = latest_by_session_.size() * sizeof(SessionMap::value_type);
+    result.session_bucket_bytes = latest_by_session_.bucket_count() * sizeof(void *);
+    // This temporary bitmap is allocated only for the requested census.
+    std::vector<std::uint8_t> references(values_.slot_count(), 0);
+    for (const auto &value : current_snapshot_) {
+      if (value) references.at(*value) |= 1U;
+    }
+    for (const auto &entry : history_) {
+      result.history_delta_capacity_bytes += entry.delta.capacity() * sizeof(DeltaEntry);
+      for (const auto &delta : entry.delta) {
+        if (delta.old_value) references.at(*delta.old_value) |= 2U;
+      }
+    }
+    values_.for_each_value([&](const ValueId id, const ByteView value) {
+      const auto bytes = value.size();
+      if ((references[id] & 1U) != 0U) {
+        ++result.snapshot_value_count;
+        result.snapshot_value_bytes += bytes;
+      } else if ((references[id] & 2U) != 0U) {
+        ++result.history_only_value_count;
+        result.history_only_value_bytes += bytes;
+      } else {
+        ++result.unreferenced_value_count;
+        result.unreferenced_value_bytes += bytes;
+      }
+    });
+    return result;
+  }
+
+  [[nodiscard]] SnapshotSOWWMetrics metrics(const bool include_memory_profile = false) const {
     return SnapshotSOWWMetrics{
         .retained_state_capacity_bytes = options_.retained_state_capacity_bytes,
         .retained_state_bytes          = retained_state_bytes_,
@@ -548,6 +705,10 @@ public:
         .history_entries               = history_.size(),
         .history_deltas                = history_deltas_,
         .history_logical_bytes         = history_logical_bytes_,
+        .retained_floor                = retained_floor_,
+        .reclaimed_history_entries     = reclaimed_history_entries_,
+        .reclaimed_history_deltas      = reclaimed_history_deltas_,
+        .reclaimed_history_bytes       = reclaimed_history_bytes_,
         .snapshot_read_events          = snapshot_read_events_,
         .unique_snapshot_reads         = unique_snapshot_reads_,
         .identical_snapshot_repeats    = identical_snapshot_repeats_,
@@ -565,7 +726,11 @@ public:
         .history_relevant_deltas_visited = history_relevant_deltas_visited_,
         .max_history_entries_visited     = max_history_entries_visited_,
         .max_history_deltas_visited      = max_history_deltas_visited_,
-        .repeated_reads                = repeated_reads_.metrics(),
+        .repeated_reads                  = repeated_reads_.metrics(),
+        .memory_profile = include_memory_profile
+            ? std::optional<SnapshotSOWWMemoryProfile>{memoryProfile()} : std::nullopt,
+        .reclaimed_value_count = reclaimed_value_count_,
+        .reclaimed_value_bytes = reclaimed_value_bytes_,
     };
   }
 
@@ -763,8 +928,12 @@ private:
       delta.old_value = current_snapshot_[index];
       history_entry.delta.push_back(std::move(delta));
 
+      // The old snapshot reference transfers to the delta, so its count does
+      // not change. The new snapshot owns an additional reference, including
+      // when it holds the same ValueId as the old value.
       const auto was_present = current_snapshot_[index].has_value();
       if (write.state == ValueState::Present) {
+        ++value_references_.at(*write.value);
         current_snapshot_[index] = write.value;
         if (!was_present) {
           ++current_snapshot_keys_;
@@ -804,8 +973,25 @@ private:
     }
     ensure_retained_capacity(bytes.size());
     const auto id = values_.insert_new(bytes, lookup.hash);
+    value_references_.resize(values_.slot_count(), 0U);
     charge_retained(bytes.size());
     return id;
+  }
+
+  void release_value(const ValueId id) {
+    auto &references = value_references_.at(id);
+    if (references == 0U) {
+      throw std::logic_error("interned value reference count underflow");
+    }
+    if (references > 1U) {
+      --references;
+      return;
+    }
+    const auto bytes = values_.erase(id);
+    references = 0U;
+    retained_state_bytes_ -= bytes;
+    ++reclaimed_value_count_;
+    reclaimed_value_bytes_ += bytes;
   }
 
   void ensure_retained_capacity(const std::size_t additional) const {
@@ -856,9 +1042,16 @@ private:
   SnapshotSOWWOptions options_;
   CommitSeq next_expected_commit_seq_ = 0;
   Snapshot current_snapshot_;
+  std::vector<std::size_t> value_references_;
+  std::uint64_t reclaimed_value_count_ = 0;
+  std::uint64_t reclaimed_value_bytes_ = 0;
   SessionMap latest_by_session_;
   LastWriterMap latest_writer_by_key_;
-  std::vector<HistoryEntry> history_;
+  std::deque<HistoryEntry> history_;
+  std::optional<CommitSeq> retained_floor_;
+  std::uint64_t reclaimed_history_entries_ = 0;
+  std::uint64_t reclaimed_history_deltas_  = 0;
+  std::uint64_t reclaimed_history_bytes_   = 0;
   ByteInterner<KeyId> keys_;
   ByteInterner<ValueId> values_;
   RepeatedReadTable repeated_reads_;
@@ -908,6 +1101,11 @@ ConsumeResult SnapshotSOWWEngine::consume(const ValidatedTxnView &transaction) {
 
 void SnapshotSOWWEngine::reset() { impl_->reset(); }
 
+std::optional<EngineError>
+SnapshotSOWWEngine::pruneHistoryThrough(const CommitSeq frontier) {
+  return impl_->pruneHistoryThrough(frontier);
+}
+
 CommitSeq SnapshotSOWWEngine::next_expected_commit_seq() const noexcept {
   return impl_->next_expected_commit_seq();
 }
@@ -920,8 +1118,8 @@ std::optional<EngineError> SnapshotSOWWEngine::error() const {
   return impl_->error();
 }
 
-SnapshotSOWWMetrics SnapshotSOWWEngine::metrics() const {
-  return impl_->metrics();
+SnapshotSOWWMetrics SnapshotSOWWEngine::metrics(const bool include_memory_profile) const {
+  return impl_->metrics(include_memory_profile);
 }
 
 } // namespace co_checker::online

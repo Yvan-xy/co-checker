@@ -56,6 +56,8 @@ enum class EngineErrorCode : std::uint8_t {
   AbsentValueHasPayload,
   RetainedStateLimitExceeded,
   ResourceExhausted,
+  InvalidHistoryFrontier,
+  HistoryUnavailable,
 };
 
 struct EngineError {

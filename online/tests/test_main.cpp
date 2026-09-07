@@ -620,6 +620,290 @@ void test_interned_state_metrics_and_hard_limit() {
   CHECK(reset_metrics.history_entries == 0U);
 }
 
+void test_history_pruning_preserves_boundary_snapshot() {
+  SnapshotSOWWEngine engine;
+  const auto x = bytes({1});
+  const auto y = bytes({2});
+  expect_transaction_pass(consume(engine, meta(0, session(9), 1),
+                                  {write(1, x, present(bytes({})))}));
+  expect_transaction_pass(consume(engine, meta(1, session(1), 0), {}));
+  expect_transaction_pass(consume(engine, meta(2, session(2), 0), {}));
+  const auto before = engine.metrics();
+  CHECK(!engine.pruneHistoryThrough(1).has_value());
+  auto metrics = engine.metrics();
+  CHECK(metrics.retained_floor == 1U);
+  CHECK(metrics.history_entries == 0U);
+  CHECK(metrics.reclaimed_history_entries == 1U);
+  CHECK(metrics.reclaimed_history_deltas == 1U);
+  CHECK(metrics.reclaimed_history_bytes == before.history_logical_bytes);
+  CHECK(metrics.retained_state_bytes + metrics.reclaimed_history_bytes ==
+        before.retained_state_bytes);
+  CHECK(metrics.peak_retained_state_bytes == before.peak_retained_state_bytes);
+  CHECK(metrics.interned_value_bytes == before.interned_value_bytes);
+  CHECK(metrics.current_snapshot_keys == 1U);
+
+  expect_transaction_pass(consume(
+      engine, meta(3, session(2), 1),
+      {write(1, x, present(bytes({7}))), write(2, y, present(bytes({8})))}));
+  expect_transaction_pass(consume(engine, meta(4, session(2), 2), {}));
+  CHECK(!engine.pruneHistoryThrough(1).has_value());
+  CHECK(engine.metrics().history_entries == 1U);
+  // The slow read-only session still needs the snapshot before commit 3.
+  expect_transaction_pass(
+      consume(engine, meta(5, session(1), 1),
+              {read(1, x, present(bytes({}))), read(2, y, absent())}));
+  CHECK(!engine.pruneHistoryThrough(4).has_value());
+  CHECK(engine.metrics().history_entries == 0U);
+
+  expect_transaction_pass(
+      consume(engine, meta(6, session(2), 3), {write(1, x, absent())}));
+  CHECK(!engine.pruneHistoryThrough(5).has_value());
+  expect_transaction_pass(consume(
+      engine, meta(7, session(1), 2),
+      {read(1, x, present(bytes({7}))), read(2, y, present(bytes({8})))}));
+  CHECK(!engine.pruneHistoryThrough(6).has_value());
+  CHECK(engine.metrics().history_entries == 0U);
+  CHECK(!engine.pruneHistoryThrough(6).has_value());
+  CHECK(engine.metrics().reclaimed_history_entries == 3U);
+  CHECK(engine.next_expected_commit_seq() == 8U);
+  engine.reset();
+  metrics = engine.metrics();
+  CHECK(!metrics.retained_floor.has_value());
+  CHECK(metrics.reclaimed_history_entries == 0U);
+  CHECK(metrics.reclaimed_history_deltas == 0U);
+  CHECK(metrics.reclaimed_history_bytes == 0U);
+}
+
+void test_history_pruning_preserves_ww_and_violation_continuation() {
+  SnapshotSOWWEngine engine;
+  const auto x = bytes({1});
+  expect_transaction_pass(consume(engine, meta(0, session(1), 1),
+                                  {write(1, x, present(bytes({7})))}));
+  CHECK(!engine.pruneHistoryThrough(0).has_value());
+  const auto result =
+      consume(engine, meta(1, session(2), 1),
+              {read(1, x, absent()), write(2, x, present(bytes({8})))});
+  expect_transaction_violation(result, ViolationKind::NoCompatibleSnapshot);
+  CHECK(result.transaction_violation->write_write_lower_bound == 0U);
+  CHECK(!engine.pruneHistoryThrough(1).has_value());
+  const auto next = consume(engine, meta(2, session(2), 2),
+                            {read(1, x, present(bytes({8})))});
+  expect_transaction_pass(next);
+  CHECK(next.verdict->status == ConsistencyStatus::Violation);
+}
+
+void test_history_pruning_rejects_invalid_frontiers_and_old_bounds() {
+  SnapshotSOWWEngine engine;
+  CHECK(engine.pruneHistoryThrough(0)->code ==
+        EngineErrorCode::InvalidHistoryFrontier);
+  CHECK(!engine.verdict().has_value());
+  expect_error(consume(engine, meta(0, session(1), 1), {}),
+               EngineErrorCode::InvalidHistoryFrontier);
+  engine.reset();
+  expect_transaction_pass(consume(engine, meta(0, session(1), 1), {}));
+  CHECK(engine.pruneHistoryThrough(1)->code ==
+        EngineErrorCode::InvalidHistoryFrontier);
+  engine.reset();
+  expect_transaction_pass(consume(engine, meta(0, session(1), 1), {}));
+  expect_transaction_pass(consume(engine, meta(1, session(2), 1), {}));
+  CHECK(!engine.pruneHistoryThrough(1).has_value());
+  CHECK(engine.pruneHistoryThrough(0)->code ==
+        EngineErrorCode::InvalidHistoryFrontier);
+
+  for (const bool known_session : {false, true}) {
+    engine.reset();
+    expect_transaction_pass(consume(engine, meta(0, session(1), 1), {}));
+    expect_transaction_pass(consume(engine, meta(1, session(2), 1), {}));
+    CHECK(!engine.pruneHistoryThrough(1).has_value());
+    // Even if the latest snapshot matches, missing history is a protocol error.
+    expect_error(
+        consume(engine, meta(2, session(known_session ? 1 : 3), 2), {}),
+        EngineErrorCode::HistoryUnavailable);
+    CHECK(!engine.verdict().has_value());
+    CHECK(engine.next_expected_commit_seq() == 2U);
+    CHECK(engine.pruneHistoryThrough(1)->code ==
+          EngineErrorCode::HistoryUnavailable);
+  }
+}
+
+void test_history_pruning_reuses_byte_budget() {
+  const std::vector<OwnedEvent> writes{
+      write(1, bytes({1}), present(bytes({2})))};
+  SnapshotSOWWEngine measured;
+  expect_transaction_pass(consume(measured, meta(0, session(1), 1), writes));
+  const auto capacity = measured.metrics().retained_state_bytes;
+  SnapshotSOWWEngine bounded(
+      SnapshotSOWWOptions{.retained_state_capacity_bytes = capacity});
+  for (CommitSeq seq = 0; seq < 10000; ++seq) {
+    expect_transaction_pass(
+        consume(bounded, meta(seq, session(1), seq + 1), writes));
+    CHECK(!bounded.pruneHistoryThrough(seq).has_value());
+    CHECK(bounded.metrics().history_logical_bytes == 0U);
+  }
+  CHECK(bounded.metrics().peak_retained_state_bytes == capacity);
+  CHECK(bounded.metrics().retained_state_bytes == 2U);
+  CHECK(bounded.metrics().reclaimed_history_entries == 10000U);
+}
+
+void test_value_gc_shared_empty_and_bootstrap_values() {
+  SnapshotSOWWEngine engine;
+  const auto x = bytes({1});
+  const auto y = bytes({2});
+  const auto a = bytes({7, 8, 9});
+  const auto b = bytes({4, 5});
+  expect_transaction_pass(consume(engine, meta(0, session(1), 1),
+      {write(1, x, present(a)), write(2, y, present(a))}));
+  CHECK(!engine.pruneHistoryThrough(0).has_value());
+  CHECK(engine.metrics().interned_value_count == 1U);
+  CHECK(engine.metrics().reclaimed_value_count == 0U);
+
+  expect_transaction_pass(consume(engine, meta(1, session(1), 2),
+      {write(1, x, present(b))}));
+  CHECK(!engine.pruneHistoryThrough(1).has_value());
+  CHECK(engine.metrics().interned_value_count == 2U);
+  CHECK(engine.metrics().reclaimed_value_count == 0U); // y still owns a.
+
+  expect_transaction_pass(consume(engine, meta(2, session(1), 3),
+      {write(1, y, present(a))})); // Same-value overwrite adds a delta reference.
+  CHECK(!engine.pruneHistoryThrough(2).has_value());
+  CHECK(engine.metrics().interned_value_count == 2U);
+  expect_transaction_pass(consume(engine, meta(3, session(1), 4),
+      {read(1, y, present(a)), write(2, y, absent())}));
+  CHECK(engine.metrics(true).memory_profile->history_only_value_bytes == 3U);
+  CHECK(!engine.pruneHistoryThrough(3).has_value());
+  CHECK(engine.metrics().interned_value_count == 1U);
+  CHECK(engine.metrics().reclaimed_value_count == 1U);
+  CHECK(engine.metrics().reclaimed_value_bytes == 3U);
+
+  expect_transaction_pass(consume(engine, meta(4, session(1), 5),
+      {read(1, x, present(b)), write(2, x, present(bytes({})))}));
+  CHECK(!engine.pruneHistoryThrough(4).has_value());
+  CHECK(engine.metrics().interned_value_count == 1U); // Present empty value.
+  CHECK(engine.metrics().interned_value_bytes == 0U);
+  expect_transaction_pass(consume(engine, meta(5, session(1), 6),
+      {read(1, x, present(bytes({}))), write(2, x, absent())}));
+  CHECK(!engine.pruneHistoryThrough(5).has_value());
+  CHECK(engine.metrics().interned_value_count == 0U);
+  CHECK(engine.metrics().reclaimed_value_count == 3U);
+  CHECK(engine.metrics().reclaimed_value_bytes == 5U);
+  CHECK(engine.metrics(true).memory_profile->unreferenced_value_count == 0U);
+
+  // A reclaimed bootstrap value can be interned again, including ID reuse.
+  expect_transaction_pass(consume(engine, meta(6, session(1), 7),
+      {read(1, x, absent()), write(2, x, present(a))}));
+  CHECK(!engine.pruneHistoryThrough(6).has_value());
+  expect_transaction_pass(consume(engine, meta(7, session(1), 8),
+      {read(1, x, present(a))}));
+  engine.reset();
+  CHECK(engine.metrics().reclaimed_value_count == 0U);
+  CHECK(engine.metrics().reclaimed_value_bytes == 0U);
+  CHECK(engine.metrics().interned_value_count == 0U);
+  expect_transaction_pass(consume(engine, meta(0, session(1), 1),
+      {read(1, x, absent()), write(2, x, present(bytes({})))}));
+  CHECK(!engine.pruneHistoryThrough(0).has_value());
+  CHECK(engine.metrics().interned_value_count == 1U);
+}
+
+void test_value_gc_bounds_slots_and_reuses_payload_budget() {
+  const auto x = bytes({1});
+  SnapshotSOWWEngine measured;
+  expect_transaction_pass(consume(measured, meta(0, session(1), 1),
+      {write(1, x, present(bytes({0, 0})))}));
+  CHECK(!measured.pruneHistoryThrough(0).has_value());
+  expect_transaction_pass(consume(measured, meta(1, session(1), 2),
+      {write(1, x, present(bytes({1, 0})))}));
+  const auto budget = measured.metrics().peak_retained_state_bytes;
+  SnapshotSOWWEngine engine(SnapshotSOWWOptions{.retained_state_capacity_bytes = budget});
+  std::optional<SnapshotSOWWMemoryProfile> initial_capacity;
+  for (CommitSeq seq = 0; seq < 2048; ++seq) {
+    const auto value = bytes({static_cast<unsigned int>(seq & 255U),
+                              static_cast<unsigned int>((seq >> 8U) & 255U)});
+    expect_transaction_pass(consume(engine, meta(seq, session(1), seq + 1),
+        {write(1, x, present(value))}));
+    CHECK(!engine.pruneHistoryThrough(seq).has_value());
+    CHECK(engine.metrics().interned_value_count == 1U);
+    CHECK(engine.metrics().retained_state_bytes == 3U);
+    if (seq == 1U) initial_capacity = engine.metrics(true).memory_profile;
+  }
+  const auto metrics = engine.metrics(true);
+  CHECK(metrics.reclaimed_value_count == 2047U);
+  CHECK(metrics.reclaimed_value_bytes == 4094U);
+  CHECK(metrics.memory_profile->unreferenced_value_count == 0U);
+  CHECK(metrics.memory_profile->value_descriptor_capacity_bytes ==
+        initial_capacity->value_descriptor_capacity_bytes);
+  CHECK(metrics.memory_profile->value_index_capacity_bytes ==
+        initial_capacity->value_index_capacity_bytes);
+  CHECK(metrics.memory_profile->value_reference_capacity_bytes ==
+        initial_capacity->value_reference_capacity_bytes);
+}
+
+void test_value_gc_collision_chain_wraparound_and_id_reuse() {
+  // All payloads hash to the final bucket for tables of up to 128 slots.
+  // Deleting arbitrary members must preserve chains that wrap through slot 0.
+  std::vector<OwnedBytes> colliding;
+  for (std::uint32_t candidate = 0; candidate < 100000U && colliding.size() < 48U;
+       ++candidate) {
+    auto value = bytes({candidate & 255U, (candidate >> 8U) & 255U,
+                        (candidate >> 16U) & 255U});
+    if ((repeated_read_hash(ByteView(value)) & 127U) == 127U) {
+      colliding.push_back(std::move(value));
+    }
+  }
+  CHECK(colliding.size() == 48U);
+  if (colliding.size() != 48U) return;
+  std::array<std::optional<OwnedBytes>, 24> state;
+  SnapshotSOWWEngine engine;
+  CommitSeq seq = 0;
+  std::vector<OwnedEvent> events;
+  for (std::size_t key = 0; key < state.size(); ++key) {
+    state[key] = colliding[key];
+    events.push_back(write(events.size() + 1U,
+        bytes({static_cast<unsigned int>(key)}), present(*state[key])));
+  }
+  expect_transaction_pass(consume(engine, meta(seq, session(1), seq + 1), events));
+  CHECK(!engine.pruneHistoryThrough(seq++).has_value());
+  const auto capacity = engine.metrics(true).memory_profile;
+  const auto read_all = [&] {
+    std::vector<OwnedEvent> reads;
+    for (std::size_t key = 0; key < state.size(); ++key) {
+      reads.push_back(read(reads.size() + 1U,
+          bytes({static_cast<unsigned int>(key)}),
+          state[key] ? present(*state[key]) : absent()));
+    }
+    return reads;
+  };
+  for (std::size_t round = 0; round < 24U; ++round) {
+    events = read_all();
+    for (std::size_t key = round % 3U; key < state.size(); key += 3U) {
+      events.push_back(write(events.size() + 1U,
+          bytes({static_cast<unsigned int>(key)}), absent()));
+      state[key].reset();
+    }
+    expect_transaction_pass(consume(engine, meta(seq, session(1), seq + 1), events));
+    CHECK(!engine.pruneHistoryThrough(seq++).has_value());
+    CHECK(engine.metrics().interned_value_count == 16U);
+    events = read_all();
+    for (std::size_t key = round % 3U; key < state.size(); key += 3U) {
+      state[key] = colliding[key + (round % 2U == 0U ? 24U : 0U)];
+      events.push_back(write(events.size() + 1U,
+          bytes({static_cast<unsigned int>(key)}), present(*state[key])));
+    }
+    expect_transaction_pass(consume(engine, meta(seq, session(1), seq + 1), events));
+    CHECK(!engine.pruneHistoryThrough(seq++).has_value());
+    CHECK(engine.metrics().interned_value_count == 24U);
+  }
+  expect_transaction_pass(consume(engine, meta(seq, session(1), seq + 1), read_all()));
+  const auto metrics = engine.metrics(true);
+  CHECK(metrics.reclaimed_value_count == 192U);
+  CHECK(metrics.memory_profile->snapshot_value_count == 24U);
+  CHECK(metrics.memory_profile->history_only_value_count == 0U);
+  CHECK(metrics.memory_profile->unreferenced_value_count == 0U);
+  CHECK(metrics.memory_profile->value_descriptor_capacity_bytes ==
+        capacity->value_descriptor_capacity_bytes);
+  CHECK(metrics.memory_profile->value_index_capacity_bytes ==
+        capacity->value_index_capacity_bytes);
+}
+
 [[nodiscard]] TaggedInput random_tagged_value(std::mt19937_64 &random) {
   switch (random() % 5U) {
   case 0:
@@ -646,8 +930,10 @@ void test_randomized_differential_against_materialized_reference() {
   for (std::size_t history_index = 0; history_index < history_count;
        ++history_index) {
     SnapshotSOWWEngine engine;
+    SnapshotSOWWEngine gc_engine;
     ReferenceSOWWModel reference;
     std::array<std::uint64_t, session_count> session_sequences{};
+    std::array<std::optional<CommitSeq>, session_count> latest{};
 
     for (std::size_t txn_index = 0; txn_index < transactions_per_history;
          ++txn_index) {
@@ -686,6 +972,16 @@ void test_randomized_differential_against_materialized_reference() {
       const auto views    = make_views(events);
       const auto expected = reference.consume(metadata, views);
       const auto actual   = engine.consume(metadata, views);
+      const auto pruned   = gc_engine.consume(metadata, views);
+      CHECK(pruned.error == actual.error);
+      CHECK(pruned.verdict == actual.verdict);
+      CHECK(pruned.transaction_violation == actual.transaction_violation);
+      latest[session_index] = metadata.commit_seq;
+      if (std::all_of(latest.begin(), latest.end(),
+                      [](const auto &seq) { return seq.has_value(); })) {
+        const auto frontier = **std::min_element(latest.begin(), latest.end());
+        CHECK(!gc_engine.pruneHistoryThrough(frontier).has_value());
+      }
       CHECK(actual.ok());
       CHECK(actual.transaction_violation.has_value() ==
             expected.transaction_violation.has_value());
@@ -729,6 +1025,13 @@ int main() {
   test_protocol_errors_are_sticky();
   test_malformed_events_stop_the_engine();
   test_interned_state_metrics_and_hard_limit();
+  test_history_pruning_preserves_boundary_snapshot();
+  test_history_pruning_preserves_ww_and_violation_continuation();
+  test_history_pruning_rejects_invalid_frontiers_and_old_bounds();
+  test_history_pruning_reuses_byte_budget();
+  test_value_gc_shared_empty_and_bootstrap_values();
+  test_value_gc_bounds_slots_and_reuses_payload_budget();
+  test_value_gc_collision_chain_wraparound_and_id_reuse();
   test_randomized_differential_against_materialized_reference();
   failures += run_bounded_queue_tests();
   failures += run_byte_budget_tests();
