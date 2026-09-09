@@ -30,6 +30,8 @@ struct SnapshotSOWWMemoryProfile {
   std::size_t key_index_capacity_bytes = 0;
   std::size_t key_descriptor_capacity_bytes = 0;
   std::size_t key_payload_capacity_bytes = 0;
+  std::size_t key_free_id_capacity_bytes = 0;
+  std::size_t deferred_deleted_key_capacity_bytes = 0;
   std::size_t value_index_capacity_bytes = 0;
   std::size_t value_descriptor_capacity_bytes = 0;
   std::size_t value_payload_capacity_bytes = 0;
@@ -80,6 +82,8 @@ struct SnapshotSOWWMetrics {
   std::optional<SnapshotSOWWMemoryProfile> memory_profile;
   std::uint64_t reclaimed_value_count = 0;
   std::uint64_t reclaimed_value_bytes = 0;
+  std::uint64_t reclaimed_key_count = 0;
+  std::uint64_t reclaimed_key_bytes = 0;
 };
 
 class SnapshotSOWWEngine {
@@ -105,6 +109,11 @@ public:
   // after it. Frontier must be monotone and already consumed. Errors are
   // sticky. Serialized with consume(); never called automatically by the
   // engine.
+  // Also recycles absent keys whose last writer is strictly before frontier.
+  // Their historical WW diagnostic bound is forgotten; the effective SO/WW
+  // bound and verdict of an admitted transaction are unchanged. Keys deleted
+  // exactly at frontier are retained until it advances. Interner/vector slots
+  // are reused, not compacted or proactively shrunk.
   [[nodiscard]] std::optional<EngineError>
   pruneHistoryThrough(CommitSeq frontier);
 

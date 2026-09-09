@@ -532,7 +532,8 @@ private:
     } else {
       WrongKeySet wrong_keys;
       const auto persistent_compatible =
-          has_compatible_snapshot(reads, effective_lower_bound, wrong_keys);
+          has_compatible_snapshot(reads, effective_lower_bound, wrong_keys,
+                                  !permanently_wrong_keys.empty());
       const bool compatible =
           persistent_compatible && permanently_wrong_keys.empty();
       if (!compatible) {
@@ -589,11 +590,28 @@ public:
       // Delta F restores the snapshot BEFORE F. Keeping the snapshot
       // AFTER F as the oldest candidate requires only deltas with
       // sequence > F.
+      if (retained_floor_ && frontier > *retained_floor_) {
+        for (const auto key : deferred_deleted_keys_) {
+          reclaim_deleted_key(key, frontier);
+        }
+        deferred_deleted_keys_.clear();
+      }
       while (!history_.empty() && history_.front().commit_seq <= frontier) {
+        const auto entry_seq = history_.front().commit_seq;
         const auto count = history_.front().delta.size();
         const auto bytes = sizeof(HistoryEntry) + count * sizeof(DeltaEntry);
         for (const auto &delta : history_.front().delta) {
           if (delta.old_value) release_value(*delta.old_value);
+          if (!current_snapshot_[delta.key] &&
+              latest_writer_by_key_[delta.key] == entry_seq) {
+            if (entry_seq < frontier) {
+              reclaim_deleted_key(delta.key, frontier);
+            } else {
+              // A writer exactly at F may still supply a future WW lower
+              // bound of F. Revisit only this boundary's keys when F advances.
+              deferred_deleted_keys_.push_back(delta.key);
+            }
+          }
         }
         history_.pop_front();
         history_deltas_ -= count;
@@ -613,6 +631,9 @@ public:
     value_references_.clear();
     reclaimed_value_count_ = 0;
     reclaimed_value_bytes_ = 0;
+    reclaimed_key_count_ = 0;
+    reclaimed_key_bytes_ = 0;
+    deferred_deleted_keys_.clear();
     next_expected_commit_seq_ = 0;
     current_snapshot_.clear();
     latest_by_session_.clear();
@@ -658,6 +679,9 @@ public:
     result.key_index_capacity_bytes = keys_.index_capacity_bytes();
     result.key_descriptor_capacity_bytes = keys_.descriptor_capacity_bytes();
     result.key_payload_capacity_bytes = keys_.payload_capacity_bytes();
+    result.key_free_id_capacity_bytes = keys_.free_id_capacity_bytes();
+    result.deferred_deleted_key_capacity_bytes =
+        deferred_deleted_keys_.capacity() * sizeof(KeyId);
     result.value_index_capacity_bytes = values_.index_capacity_bytes();
     result.value_descriptor_capacity_bytes = values_.descriptor_capacity_bytes();
     result.value_payload_capacity_bytes = values_.payload_capacity_bytes();
@@ -731,6 +755,8 @@ public:
             ? std::optional<SnapshotSOWWMemoryProfile>{memoryProfile()} : std::nullopt,
         .reclaimed_value_count = reclaimed_value_count_,
         .reclaimed_value_bytes = reclaimed_value_bytes_,
+        .reclaimed_key_count = reclaimed_key_count_,
+        .reclaimed_key_bytes = reclaimed_key_bytes_,
     };
   }
 
@@ -813,7 +839,8 @@ private:
   [[nodiscard]] bool
   has_compatible_snapshot(const ReadMap &reads,
                           const std::optional<CommitSeq> lower_bound,
-                          WrongKeySet &wrong_keys) {
+                          WrongKeySet &wrong_keys,
+                          const bool has_permanent_mismatch) {
 #if CO_CHECKER_ENABLE_DETAILED_PROFILING
     ++compatible_snapshot_checks_;
     std::uint64_t entries_visited = 0;
@@ -837,7 +864,10 @@ private:
         wrong_keys.insert(key);
       }
     }
-    if (wrong_keys.empty()) {
+    // An impossible read of a retired/unknown key prevents any prefix from
+    // matching. Still roll other reads back to the bound so violation keys
+    // do not depend on whether that absent key's ID has been reclaimed.
+    if (wrong_keys.empty() && !has_permanent_mismatch) {
 #if CO_CHECKER_ENABLE_DETAILED_PROFILING
       record_traversal();
 #endif
@@ -874,7 +904,7 @@ private:
           wrong_keys.insert(delta.key);
         }
       }
-      if (wrong_keys.empty()) {
+      if (wrong_keys.empty() && !has_permanent_mismatch) {
 #if CO_CHECKER_ENABLE_DETAILED_PROFILING
         record_traversal();
 #endif
@@ -961,9 +991,25 @@ private:
     const auto id = keys_.insert_new(bytes, lookup.hash);
     charge_retained(bytes.size());
     const auto required = static_cast<std::size_t>(id) + 1U;
-    current_snapshot_.resize(required);
-    latest_writer_by_key_.resize(required);
+    // Reusing a hole must not truncate live slots with larger IDs.
+    if (required > current_snapshot_.size()) {
+      current_snapshot_.resize(required);
+      latest_writer_by_key_.resize(required);
+    }
     return id;
+  }
+
+  void reclaim_deleted_key(const KeyId key, const CommitSeq frontier) {
+    const auto writer = latest_writer_by_key_[key];
+    if (current_snapshot_[key] || !writer || *writer >= frontier) return;
+    // All deltas for this key end at its last writer, strictly before F.
+    // Future admitted transactions have an SO/WW lower bound >= F, so this
+    // writer can no longer strengthen that bound. No surviving delta uses ID.
+    const auto bytes = keys_.erase(key);
+    latest_writer_by_key_[key].reset();
+    retained_state_bytes_ -= bytes;
+    ++reclaimed_key_count_;
+    reclaimed_key_bytes_ += bytes;
   }
 
   [[nodiscard]] ValueId intern_value(const ByteView bytes) {
@@ -1045,6 +1091,9 @@ private:
   std::vector<std::size_t> value_references_;
   std::uint64_t reclaimed_value_count_ = 0;
   std::uint64_t reclaimed_value_bytes_ = 0;
+  std::uint64_t reclaimed_key_count_ = 0;
+  std::uint64_t reclaimed_key_bytes_ = 0;
+  std::vector<KeyId> deferred_deleted_keys_;
   SessionMap latest_by_session_;
   LastWriterMap latest_writer_by_key_;
   std::deque<HistoryEntry> history_;

@@ -904,6 +904,161 @@ void test_value_gc_collision_chain_wraparound_and_id_reuse() {
         capacity->value_index_capacity_bytes);
 }
 
+void test_key_gc_preserves_boundary_ww_and_reinsertion() {
+  SnapshotSOWWEngine engine;
+  const auto x = bytes({1});
+  expect_transaction_pass(consume(engine, meta(0, session(1), 1),
+      {write(1, x, present(bytes({7})))}));
+  expect_transaction_pass(consume(engine, meta(1, session(1), 2),
+      {write(1, x, absent())}));
+  CHECK(!engine.pruneHistoryThrough(1).has_value());
+  CHECK(!engine.pruneHistoryThrough(1).has_value());
+  CHECK(engine.metrics().history_entries == 0U);
+  CHECK(engine.metrics().interned_key_count == 1U);
+  // This new session has no SO bound: the deletion at F supplies WW = F.
+  expect_transaction_pass(consume(engine, meta(2, session(2), 1),
+      {read(1, x, absent()), write(2, x, present(bytes({8})))}));
+  CHECK(!engine.pruneHistoryThrough(2).has_value());
+  CHECK(engine.metrics().reclaimed_key_count == 0U);
+  expect_transaction_pass(consume(engine, meta(3, session(2), 2),
+      {write(1, x, absent())}));
+  expect_transaction_pass(consume(engine, meta(4, session(2), 3), {}));
+  CHECK(!engine.pruneHistoryThrough(4).has_value());
+  CHECK(engine.metrics().interned_key_count == 0U);
+  CHECK(engine.metrics().reclaimed_key_count == 1U);
+  CHECK(engine.metrics().reclaimed_key_bytes == x.size());
+  expect_transaction_violation(consume(engine, meta(5, session(2), 4),
+      {read(1, x, present(bytes({8})))}), ViolationKind::NoCompatibleSnapshot);
+  expect_transaction_pass(consume(engine, meta(6, session(2), 5),
+      {read(1, x, absent()), write(2, x, present(bytes({})))}));
+  CHECK(engine.metrics().current_snapshot_keys == 1U);
+  CHECK(engine.metrics().interned_key_count == 1U);
+  engine.reset();
+  CHECK(engine.metrics().reclaimed_key_count == 0U);
+  CHECK(engine.metrics().reclaimed_key_bytes == 0U);
+  expect_transaction_pass(consume(engine, meta(0, session(1), 1),
+      {write(1, x, present(bytes({9})))}));
+  CHECK(!engine.pruneHistoryThrough(0).has_value());
+}
+
+void test_key_gc_keeps_pinned_history_and_higher_live_slots() {
+  SnapshotSOWWEngine engine;
+  const auto x = bytes({1}), y = bytes({2}), z = bytes({3});
+  expect_transaction_pass(consume(engine, meta(0, session(1), 1),
+      {write(1, x, present(bytes({7}))), write(2, y, present(bytes({8})))}));
+  expect_transaction_pass(consume(engine, meta(1, session(1), 2),
+      {write(1, x, absent())}));
+  CHECK(!engine.pruneHistoryThrough(0).has_value());
+  CHECK(engine.metrics().interned_key_count == 2U);
+  // WW(y)=0 admits this new session; x's pre-delete value is still needed.
+  expect_transaction_pass(consume(engine, meta(2, session(2), 1),
+      {read(1, x, present(bytes({7}))), write(2, y, present(bytes({8})))}));
+  CHECK(!engine.pruneHistoryThrough(2).has_value());
+  CHECK(engine.metrics().interned_key_count == 1U);
+  const auto profile = engine.metrics(true).memory_profile;
+  // z reuses x's low ID. y's higher snapshot/last-writer slot must survive.
+  expect_transaction_pass(consume(engine, meta(3, session(2), 2),
+      {write(1, z, present(bytes({9})))}));
+  expect_transaction_pass(consume(engine, meta(4, session(2), 3),
+      {read(1, x, absent()), read(2, y, present(bytes({8}))),
+       read(3, z, present(bytes({9})))}));
+  CHECK(engine.metrics().interned_key_count == 2U);
+  CHECK(engine.metrics(true).memory_profile->snapshot_capacity_bytes ==
+        profile->snapshot_capacity_bytes);
+  // y must still impose WW=2, not look like an unwritten key after ID reuse.
+  const auto result = consume(engine, meta(5, session(3), 1),
+      {read(1, y, absent()), write(2, y, present(bytes({10})))});
+  expect_transaction_violation(result, ViolationKind::NoCompatibleSnapshot);
+  CHECK(result.transaction_violation->write_write_lower_bound == 2U);
+}
+
+void test_key_gc_rechecks_deferred_deletion_and_rejects_old_bounds() {
+  const auto x = bytes({1});
+  for (const bool rewrite_present : {false, true}) {
+    SnapshotSOWWEngine engine;
+    expect_transaction_pass(consume(engine, meta(0, session(1), 1),
+        {write(1, x, absent())}));
+    CHECK(!engine.pruneHistoryThrough(0).has_value());
+    expect_transaction_pass(consume(engine, meta(1, session(1), 2),
+        {write(1, x, rewrite_present ? present(bytes({7})) : absent())}));
+    expect_transaction_pass(consume(engine, meta(2, session(1), 3), {}));
+    CHECK(!engine.pruneHistoryThrough(2).has_value());
+    CHECK(engine.metrics().interned_key_count == (rewrite_present ? 1U : 0U));
+    CHECK(engine.metrics().reclaimed_key_count == (rewrite_present ? 0U : 1U));
+  }
+  SnapshotSOWWEngine engine;
+  expect_transaction_pass(consume(engine, meta(0, session(1), 1),
+      {write(1, x, present(bytes({7})))}));
+  expect_transaction_pass(consume(engine, meta(1, session(2), 1), {}));
+  expect_transaction_pass(consume(engine, meta(2, session(1), 2),
+      {write(1, x, absent())}));
+  expect_transaction_pass(consume(engine, meta(3, session(1), 3), {}));
+  CHECK(!engine.pruneHistoryThrough(3).has_value());
+  CHECK(engine.metrics().interned_key_count == 0U);
+  expect_error(consume(engine, meta(4, session(2), 2),
+      {write(1, x, present(bytes({8})))}), EngineErrorCode::HistoryUnavailable);
+}
+
+void test_key_gc_bounds_unique_key_churn_and_reuses_budget() {
+  SnapshotSOWWEngine engine(SnapshotSOWWOptions{.retained_state_capacity_bytes = 256U});
+  CommitSeq seq = 0;
+  std::optional<SnapshotSOWWMemoryProfile> initial_capacity;
+  for (unsigned int round = 0; round < 4096U; ++round) {
+    const auto key = bytes({round & 255U, (round >> 8U) & 255U});
+    expect_transaction_pass(consume(engine, meta(seq, session(1), seq + 1),
+        {write(1, key, present(bytes({7})))}));
+    CHECK(!engine.pruneHistoryThrough(seq++).has_value());
+    expect_transaction_pass(consume(engine, meta(seq, session(1), seq + 1),
+        {write(1, key, absent())}));
+    CHECK(!engine.pruneHistoryThrough(seq++).has_value());
+    CHECK(engine.metrics().interned_key_count == 1U);
+    expect_transaction_pass(consume(engine, meta(seq, session(1), seq + 1), {}));
+    CHECK(!engine.pruneHistoryThrough(seq++).has_value());
+    CHECK(engine.metrics().interned_key_count == 0U);
+    CHECK(engine.metrics().retained_state_bytes == 0U);
+    if (round == 0U) initial_capacity = engine.metrics(true).memory_profile;
+  }
+  const auto metrics = engine.metrics(true);
+  CHECK(metrics.reclaimed_key_count == 4096U);
+  CHECK(metrics.reclaimed_key_bytes == 8192U);
+  CHECK(metrics.memory_profile->key_descriptor_capacity_bytes ==
+        initial_capacity->key_descriptor_capacity_bytes);
+  CHECK(metrics.memory_profile->key_index_capacity_bytes ==
+        initial_capacity->key_index_capacity_bytes);
+  CHECK(metrics.memory_profile->snapshot_capacity_bytes ==
+        initial_capacity->snapshot_capacity_bytes);
+  CHECK(metrics.memory_profile->latest_writer_capacity_bytes ==
+        initial_capacity->latest_writer_capacity_bytes);
+}
+
+void test_key_gc_preserves_mixed_impossible_read_diagnostics() {
+  SnapshotSOWWEngine baseline, pruned;
+  const auto x = bytes({1}), y = bytes({2});
+  const auto feed = [&](const OrderedTxnMeta &metadata,
+                        const std::vector<OwnedEvent> &events) {
+    const auto expected = consume(baseline, metadata, events);
+    const auto actual = consume(pruned, metadata, events);
+    CHECK(actual.error == expected.error);
+    CHECK(actual.verdict == expected.verdict);
+    CHECK(actual.transaction_violation == expected.transaction_violation);
+    return actual;
+  };
+  expect_transaction_pass(feed(meta(0, session(1), 1),
+      {write(1, x, present(bytes({7}))), write(2, y, present(bytes({8})))}));
+  expect_transaction_pass(feed(meta(1, session(1), 2), {write(1, x, absent())}));
+  expect_transaction_pass(feed(meta(2, session(1), 3), {}));
+  expect_transaction_pass(feed(meta(3, session(2), 1), {}));
+  CHECK(!pruned.pruneHistoryThrough(2).has_value());
+  CHECK(pruned.metrics().reclaimed_key_count == 1U);
+  expect_transaction_pass(feed(meta(4, session(1), 4), {write(1, y, absent())}));
+  // x cannot be present at any retained prefix. y is absent now, but was
+  // present at this session's bound: both mismatches belong in diagnostics.
+  const auto result = feed(meta(5, session(2), 2),
+      {read(1, x, present(bytes({7}))), read(2, y, absent())});
+  expect_transaction_violation(result, ViolationKind::NoCompatibleSnapshot);
+  CHECK(result.transaction_violation->keys == std::vector<OwnedBytes>({x, y}));
+}
+
 [[nodiscard]] TaggedInput random_tagged_value(std::mt19937_64 &random) {
   switch (random() % 5U) {
   case 0:
@@ -970,12 +1125,27 @@ void test_randomized_differential_against_materialized_reference() {
       }
 
       const auto views    = make_views(events);
+      const auto floor = gc_engine.metrics().retained_floor;
       const auto expected = reference.consume(metadata, views);
       const auto actual   = engine.consume(metadata, views);
       const auto pruned   = gc_engine.consume(metadata, views);
       CHECK(pruned.error == actual.error);
-      CHECK(pruned.verdict == actual.verdict);
-      CHECK(pruned.transaction_violation == actual.transaction_violation);
+      // Reclaimed tombstones may omit an old WW diagnostic bound strictly
+      // below F. Every effective bound, key, kind and verdict must still match.
+      const auto comparable = [floor](ConsumeResult result) {
+        const auto normalize = [floor](std::optional<Violation> &violation) {
+          if (violation && floor && violation->write_write_lower_bound &&
+              *violation->write_write_lower_bound < *floor) {
+            violation->write_write_lower_bound.reset();
+          }
+        };
+        normalize(result.transaction_violation);
+        if (result.verdict) normalize(result.verdict->first_violation);
+        return result;
+      };
+      CHECK(comparable(pruned).verdict == comparable(actual).verdict);
+      CHECK(comparable(pruned).transaction_violation ==
+            comparable(actual).transaction_violation);
       latest[session_index] = metadata.commit_seq;
       if (std::all_of(latest.begin(), latest.end(),
                       [](const auto &seq) { return seq.has_value(); })) {
@@ -1032,6 +1202,11 @@ int main() {
   test_value_gc_shared_empty_and_bootstrap_values();
   test_value_gc_bounds_slots_and_reuses_payload_budget();
   test_value_gc_collision_chain_wraparound_and_id_reuse();
+  test_key_gc_preserves_boundary_ww_and_reinsertion();
+  test_key_gc_keeps_pinned_history_and_higher_live_slots();
+  test_key_gc_rechecks_deferred_deletion_and_rejects_old_bounds();
+  test_key_gc_bounds_unique_key_churn_and_reuses_budget();
+  test_key_gc_preserves_mixed_impossible_read_diagnostics();
   test_randomized_differential_against_materialized_reference();
   failures += run_bounded_queue_tests();
   failures += run_byte_budget_tests();
